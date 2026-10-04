@@ -15,6 +15,7 @@ import { registerTask } from "./subagent/index.js";
 
 export * from "./shared/types.js";
 export { createClaudeCodeSession, type CreateClaudeCodeSessionOptions } from "./sdk.js";
+export { wrapStreamFnForToolSearch } from "./tools/tool-search.js";
 
 /**
  * Build a pi extension factory that installs Claude Code-compatible tools.

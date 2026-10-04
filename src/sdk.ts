@@ -7,6 +7,7 @@ import {
 } from "@mariozechner/pi-coding-agent";
 import { createClaudeCodeExtension } from "./index.js";
 import type { ClaudeCodeToolsOptions } from "./shared/types.js";
+import { wrapStreamFnForToolSearch } from "./tools/tool-search.js";
 
 type LoaderOptions = ConstructorParameters<typeof DefaultResourceLoader>[0];
 
@@ -33,5 +34,8 @@ export async function createClaudeCodeSession(opts: CreateClaudeCodeSessionOptio
 		extensionFactories: [createClaudeCodeExtension(claudeCode), ...(loaderOpts?.extensionFactories ?? [])],
 	});
 	await loader.reload();
-	return createAgentSession({ ...sessionOpts, cwd, agentDir, resourceLoader: loader, noTools: "builtin" });
+	const result = await createAgentSession({ ...sessionOpts, cwd, agentDir, resourceLoader: loader, noTools: "builtin" });
+	// ToolSearch: hide not-yet-loaded deferred tools per LLM call (pi freezes the tool list per run)
+	result.session.agent.streamFn = wrapStreamFnForToolSearch(result.session.agent.streamFn);
+	return result;
 }

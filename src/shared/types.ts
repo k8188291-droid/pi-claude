@@ -1,4 +1,5 @@
 import type { Model } from "@mariozechner/pi-ai";
+import type { ExtensionFactory } from "@mariozechner/pi-coding-agent";
 
 /** One question passed to AskUserQuestion (Claude Code-compatible shape). */
 export interface AskUserQuestionItem {
@@ -26,8 +27,11 @@ export interface AgentDefinition {
 	prompt: string;
 	/** Tool names the subagent may use. Omit to inherit all parent tools (except Task). */
 	tools?: string[];
-	/** Model override: a pi Model, or "inherit" (default). */
-	model?: Model<any> | "inherit";
+	/**
+	 * Model override: a pi Model, a model id ("provider/id" or bare id), an alias
+	 * ("sonnet" | "opus" | "haiku"), or "inherit" (default).
+	 */
+	model?: Model<any> | string;
 }
 
 /** Events pushed to the SDK host via `onEvent`. */
@@ -75,6 +79,11 @@ export interface ClaudeCodeToolsOptions {
 	agents?: Record<string, AgentDefinition>;
 	/** Load agent definitions from ~/.claude/agents and <cwd>/.claude/agents. Default true. */
 	loadAgentsFromDisk?: boolean;
+	/**
+	 * Extra extension factories installed in every subagent session (e.g. the host's custom or
+	 * MCP tools). The Claude Code tools themselves are always installed.
+	 */
+	subagentExtensions?: ExtensionFactory[];
 	/** Enable the Task tool. Default true. */
 	subagents?: boolean;
 	/**
