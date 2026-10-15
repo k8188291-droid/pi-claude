@@ -1,20 +1,24 @@
 /**
  * Minimal SDK usage: a pi session with Claude Code-compatible tools.
- * Run: ANTHROPIC_API_KEY=... [MODEL=claude-sonnet-4-6] npx tsx examples/sdk-basic.ts "your prompt"
+ * Run: ANTHROPIC_API_KEY=... [MODEL=claude-sonnet-5-5] npx tsx examples/sdk-basic.ts "your prompt"
  */
-import { getModel, type Model } from "@mariozechner/pi-ai";
-import { SessionManager } from "@mariozechner/pi-coding-agent";
+import { ModelRuntime, SessionManager } from "@earendil-works/pi-coding-agent";
 import { createClaudeCodeSession } from "../src/index.js";
 
-// pi-ai's built-in model list may lag behind the API; for unknown ids reuse a known Anthropic model's settings.
-const modelId = process.env.MODEL ?? "claude-sonnet-4-6";
-const model: Model<any> = getModel("anthropic", modelId as any) ?? { ...getModel("anthropic", "claude-sonnet-4-6"), id: modelId, name: modelId };
+// ModelRuntime reads ANTHROPIC_API_KEY (or stored credentials) and holds the model catalog.
+const modelRuntime = await ModelRuntime.create();
+const modelId = process.env.MODEL ?? "claude-sonnet-5-5";
+const model = modelRuntime.getModel("anthropic", modelId);
+if (!model) throw new Error(`Unknown Anthropic model: ${modelId}`);
 
 const { session } = await createClaudeCodeSession({
 	cwd: process.cwd(),
 	model,
+	modelRuntime,
 	sessionManager: SessionManager.inMemory(process.cwd()),
 	claudeCode: {
+		// Tools the model only sees after finding them with pi's built-in tool_search, e.g. DEFERRED_TOOLS=Glob,Grep
+		deferredTools: process.env.DEFERRED_TOOLS?.split(",").filter(Boolean),
 		// AskUserQuestion → your UI. Answers are keyed by question text.
 		onAskUserQuestion: async (questions) => {
 			const answers: Record<string, string> = {};

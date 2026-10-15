@@ -1,6 +1,6 @@
 import { mkdirSync, realpathSync, rmSync } from "node:fs";
 import { join } from "node:path";
-import type { ExtensionAPI, ToolDefinition } from "@mariozechner/pi-coding-agent";
+import type { ExtensionAPI, ToolDefinition } from "@earendil-works/pi-coding-agent";
 import { afterEach, describe, expect, it } from "vitest";
 import { createCCContext } from "../src/shared/context.js";
 import type { ClaudeCodeHostEvent, ClaudeCodeToolsOptions } from "../src/shared/types.js";

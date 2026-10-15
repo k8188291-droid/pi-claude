@@ -1,6 +1,6 @@
 # pi-claude-code-tools
 
-讓 [pi coding agent](https://github.com/badlogic/pi-mono)（`@mariozechner/pi-coding-agent` ≥ 0.73）透過 SDK 使用時，
+讓 [pi coding agent](https://github.com/earendil-works/pi)（`@earendil-works/pi-coding-agent` ≥ 1.2）透過 SDK 使用時，
 具備和 Claude Code 相同名稱、參數與行為的工具。只處理 SDK 情境，不含 TUI 呈現。
 
 ## 工具
@@ -17,26 +17,32 @@
 | `TodoWrite` | 待辦存在 session（跟著 fork / tree 分支走），長時間未更新會提醒模型 |
 | `AskUserQuestion` | 透過 host callback `onAskUserQuestion` 取得答案 |
 | `Task` | 同程序 subagent：`general-purpose`、`Explore`、`Plan`＋`.claude/agents/*.md`＋自訂；平行、背景、`resume` |
-| `ToolSearch` | `deferredTools` 列出的工具先只給名字，模型搜尋後才載入 schema（同一輪內即生效） |
+| `tool_search` | 使用 pi 內建的 tool search：`deferredTools` 列出的工具以 pi 原生 `exposure: "deferred"` 註冊，模型用 `tool_search` 找到後才載入（同一輪內即生效） |
 
 另外有**大輸出寫檔**：任何工具（含其他 extension、SDK customTools、Task）文字輸出超過 30000 字元時，
 完整內容寫到暫存檔，模型拿到預覽＋路徑，可再用 Read / Grep 查看（Read 本身除外）。
 
 ## 使用方式
 
-最簡單：用 `createClaudeCodeSession()`，它會關掉 pi 內建工具（read/bash/edit/write）並裝上本套件。
+最簡單：用 `createClaudeCodeSession()`，它會關掉 pi 內建工具（read/bash/edit/write）、裝上本套件，
+並加入 pi 的 `createToolSearchExtension()`（有延遲載入工具時自動啟用 `tool_search`）。
 
 ```ts
+import { ModelRuntime } from "@earendil-works/pi-coding-agent";
 import { createClaudeCodeSession } from "pi-claude-code-tools";
+
+const modelRuntime = await ModelRuntime.create();             // 讀 ANTHROPIC_API_KEY 等憑證
+const model = modelRuntime.getModel("anthropic", "claude-sonnet-5-5");
 
 const { session } = await createClaudeCodeSession({
   cwd: process.cwd(),
-  model,                       // pi Model
+  model,
+  modelRuntime,
   claudeCode: {
     onAskUserQuestion: async (questions) => ({ [questions[0].question]: "選項 A" }),
     onEvent: (e) => { /* todos_updated, background_shell_*, subagent_*, output_spilled, tools_activated */ },
     agents: { reviewer: { description: "...", prompt: "...", tools: ["Read", "Grep"] } },
-    deferredTools: ["SomeRarelyUsedTool"],
+    deferredTools: ["Glob", "Grep"],   // 先藏起來，模型用 tool_search 找到才載入
   },
 });
 await session.prompt("...");
@@ -47,14 +53,18 @@ await session.prompt("...");
 ### 自己組 session
 
 ```ts
-import { createAgentSession, DefaultResourceLoader } from "@mariozechner/pi-coding-agent";
-import { createClaudeCodeExtension, wrapStreamFnForToolSearch } from "pi-claude-code-tools";
+import { createAgentSession, createToolSearchExtension, DefaultResourceLoader } from "@earendil-works/pi-coding-agent";
+import { createClaudeCodeExtension } from "pi-claude-code-tools";
 
-const loader = new DefaultResourceLoader({ cwd, agentDir, extensionFactories: [createClaudeCodeExtension(opts)] });
+const loader = new DefaultResourceLoader({
+  cwd, agentDir,
+  extensionFactories: [
+    createClaudeCodeExtension({ ...opts, modelRuntime }),  // modelRuntime 給 subagent 共用
+    createToolSearchExtension(),                           // 用 deferredTools 時需要
+  ],
+});
 await loader.reload();
-const { session } = await createAgentSession({ cwd, resourceLoader: loader, noTools: "builtin" });
-// 有用 deferredTools 時建議加上，讓 ToolSearch 載入的工具在同一輪就生效（否則下一次 prompt 才生效）
-session.agent.streamFn = wrapStreamFnForToolSearch(session.agent.streamFn);
+const { session } = await createAgentSession({ cwd, modelRuntime, resourceLoader: loader, noTools: "builtin" });
 ```
 
 ## 選項（`ClaudeCodeToolsOptions`）
@@ -68,7 +78,8 @@ session.agent.streamFn = wrapStreamFnForToolSearch(session.agent.streamFn);
 | `loadAgentsFromDisk` | `true` | 讀 `~/.claude/agents`、`<cwd>/.claude/agents` |
 | `subagents` | `true` | 是否提供 `Task` |
 | `subagentExtensions` | — | 額外裝進每個 subagent session 的 extension（例如你的自訂工具或 MCP） |
-| `deferredTools` | `[]` | 延遲載入的工具名稱；空的時候不註冊 ToolSearch |
+| `deferredTools` | `[]` | 以 pi 原生 `exposure: "deferred"` 註冊的本套件工具；有任何延遲載入工具（含你自己或 MCP 的）時會自動啟用 `tool_search` |
+| `modelRuntime` | 由 `createClaudeCodeSession` 帶入 | subagent 使用的 ModelRuntime（憑證與模型目錄） |
 | `bash` | `{ defaultTimeoutMs: 120000, maxTimeoutMs: 600000 }` | Bash timeout |
 
 ## Hooks
@@ -83,8 +94,8 @@ session.agent.streamFn = wrapStreamFnForToolSearch(session.agent.streamFn);
 - Glob 不讀 `.gitignore`（但預設跳過 `node_modules`、`.git` 等）。
 - PDF 需要系統安裝 poppler（`pdftotext`、`pdfinfo`，掃描頁轉圖需 `pdftoppm`）。
 - 待辦提醒是暫時注入（只出現在該次 LLM 呼叫），不寫入 session。
-- Subagent 使用記憶體內預設設定與 `getAgentDir()`（拿不到父 session 的 settingsManager）。
-- 透過 `runtime.newSession()` 等替換出的新 session 不會自動套用 ToolSearch 的 streamFn 包裝，會退回「下一次 prompt 生效」。
+- Subagent 使用記憶體內預設設定與 `getAgentDir()`（拿不到父 session 的 settingsManager）；憑證與模型目錄共用父 session 的 ModelRuntime。
+- 工具搜尋用 pi 內建的 `tool_search`（參數 `query`、`limit`），不是 Claude Code 的 `ToolSearch`（`select:` 語法）。
 
 ## 開發
 

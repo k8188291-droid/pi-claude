@@ -2,7 +2,7 @@ import { existsSync, readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, it } from "vitest";
-import type { ExtensionAPI, ExtensionFactory } from "@mariozechner/pi-coding-agent";
+import type { ExtensionAPI, ExtensionFactory } from "@earendil-works/pi-coding-agent";
 import { makePreview, registerOutputSpill } from "../src/output-spill.js";
 import { createCCContext } from "../src/shared/context.js";
 import type { ClaudeCodeHostEvent } from "../src/shared/types.js";

@@ -2,7 +2,7 @@ import { randomBytes } from "node:crypto";
 import { mkdir, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import type { ExtensionAPI, ExtensionContext } from "@mariozechner/pi-coding-agent";
+import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import type { CCContext } from "./shared/context.js";
 
 /**
@@ -17,8 +17,8 @@ import type { CCContext } from "./shared/context.js";
 
 const DEFAULT_MAX_CHARS = 30_000;
 const DEFAULT_PREVIEW_CHARS = 2_000;
-/** Never spilled: Read (spilling would make the model Read the spill file forever) and ToolSearch (schemas must stay inline). */
-const ALWAYS_EXCLUDED = ["Read", "ToolSearch"];
+/** Never spilled: Read (spilling would make the model Read the spill file forever) and tool_search (schemas must stay inline). */
+const ALWAYS_EXCLUDED = ["Read", "tool_search"];
 
 export function formatSize(bytes: number): string {
 	if (bytes < 1024) return `${bytes}B`;

@@ -1,6 +1,6 @@
 import { spawn, type ChildProcess } from "node:child_process";
 import { StringDecoder } from "node:string_decoder";
-import { getShellConfig } from "@mariozechner/pi-coding-agent";
+import { getShellConfig } from "@earendil-works/pi-coding-agent";
 
 /** Hard cap on captured output kept in memory per command (characters). Oldest output is dropped. */
 export const OUTPUT_HARD_CAP = 10 * 1024 * 1024;

@@ -1,8 +1,9 @@
 import { mkdirSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
-import { getModel } from "@mariozechner/pi-ai";
-import { AuthStorage, ModelRegistry } from "@mariozechner/pi-coding-agent";
-import { describe, expect, it } from "vitest";
+import { getModel } from "@earendil-works/pi-ai/compat";
+import { ModelRegistry } from "@earendil-works/pi-coding-agent";
+import { createTestModelRuntime } from "./helpers.js";
+import { beforeAll, describe, expect, it } from "vitest";
 import { BUILT_IN_AGENTS, loadAgentDefinitions, parseAgentMarkdown } from "../src/subagent/agents.js";
 import { buildTaskDescription } from "../src/subagent/index.js";
 import { resolveSubagentModel } from "../src/subagent/models.js";
@@ -78,9 +79,10 @@ describe("agent definitions", () => {
 });
 
 describe("subagent model resolution", () => {
-	const auth = AuthStorage.inMemory();
-	auth.setRuntimeApiKey("anthropic", "test");
-	const registry = ModelRegistry.inMemory(auth);
+	let registry: ModelRegistry;
+	beforeAll(async () => {
+		registry = new ModelRegistry(await createTestModelRuntime("anthropic"));
+	});
 	const parent = getModel("anthropic", "claude-sonnet-4-5") as any;
 
 	it("inherits the parent by default", () => {
@@ -101,10 +103,8 @@ describe("subagent model resolution", () => {
 	});
 
 	it("falls back to the parent for unresolvable aliases", () => {
-		const emptyAuth = AuthStorage.inMemory();
-		const reg = ModelRegistry.inMemory(emptyAuth);
 		const fauxParent = { provider: "faux", id: "faux-1" } as any;
-		const r = resolveSubagentModel("opus", { ...reg, getAll: () => [], hasConfiguredAuth: () => false } as any, fauxParent, { strict: true });
+		const r = resolveSubagentModel("opus", { getAll: () => [], getAvailable: () => [], find: () => undefined, hasConfiguredAuth: () => false } as any, fauxParent, { strict: true });
 		expect(r).toMatchObject({ ok: true, model: fauxParent });
 		expect((r as any).note).toMatch(/alias/);
 	});

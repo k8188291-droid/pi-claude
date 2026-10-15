@@ -1,8 +1,8 @@
 import { existsSync, readdirSync, readFileSync, statSync } from "node:fs";
 import { homedir } from "node:os";
 import { basename, join } from "node:path";
-import type { Model } from "@mariozechner/pi-ai";
-import { parseFrontmatter } from "@mariozechner/pi-coding-agent";
+import type { Model } from "@earendil-works/pi-ai";
+import { parseFrontmatter } from "@earendil-works/pi-coding-agent";
 import type { AgentDefinition } from "../shared/types.js";
 
 export type AgentSource = "built-in" | "user" | "project" | "options";

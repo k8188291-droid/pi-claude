@@ -1,5 +1,5 @@
-import type { Model } from "@mariozechner/pi-ai";
-import type { ExtensionFactory } from "@mariozechner/pi-coding-agent";
+import type { Model } from "@earendil-works/pi-ai";
+import type { ExtensionFactory, ModelRuntime } from "@earendil-works/pi-coding-agent";
 
 /** One question passed to AskUserQuestion (Claude Code-compatible shape). */
 export interface AskUserQuestionItem {
@@ -87,10 +87,17 @@ export interface ClaudeCodeToolsOptions {
 	/** Enable the Task tool. Default true. */
 	subagents?: boolean;
 	/**
-	 * Tool names that start inactive; only their names are listed in the system prompt and
-	 * the model activates them via ToolSearch. Default: [] (ToolSearch not registered when empty).
+	 * Names of this package's tools to register with pi's native `exposure: "deferred"`: they are
+	 * not declared to the model until pi's built-in `tool_search` finds them. createClaudeCodeSession
+	 * installs and activates `tool_search` automatically. (Your own tools can set `exposure: "deferred"`
+	 * themselves; MCP servers via their `exposure` setting.)
 	 */
 	deferredTools?: string[];
+	/**
+	 * Model runtime used for subagent sessions (credentials + model catalog). createClaudeCodeSession
+	 * fills this in; when omitted, the parent session's runtime is used if it can be found.
+	 */
+	modelRuntime?: ModelRuntime;
 	/** Bash defaults. */
 	bash?: { defaultTimeoutMs?: number; maxTimeoutMs?: number };
 	/** Internal: set for subagent sessions (disables Task, AskUserQuestion, nested spill dir). */

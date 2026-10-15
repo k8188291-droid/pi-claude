@@ -1,5 +1,5 @@
-import type { AssistantMessage, Context } from "@mariozechner/pi-ai";
-import type { ExtensionFactory } from "@mariozechner/pi-coding-agent";
+import type { AssistantMessage, Context } from "@earendil-works/pi-ai";
+import type { ExtensionFactory } from "@earendil-works/pi-coding-agent";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { subagentInternals } from "../src/subagent/index.js";
 import type { ClaudeCodeHostEvent } from "../src/shared/types.js";
@@ -103,7 +103,7 @@ describe("Task tool (subagents)", () => {
 
 		// child: agent prompt as system prompt, task prompt as user message, no nested Task / AskUserQuestion
 		expect(childCtx!.systemPrompt!.startsWith(`${CHILD_MARKER} tester`)).toBe(true);
-		expect(childCtx!.systemPrompt).toContain("Current working directory:");
+		expect(childCtx!.systemPrompt).toContain("<cwd>");
 		expect(firstUserText(childCtx!)).toBe("do the work");
 		expect(toolNames(childCtx!)).toContain("Echo");
 		expect(toolNames(childCtx!)).not.toContain("Task");

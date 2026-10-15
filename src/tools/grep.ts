@@ -3,8 +3,8 @@ import { existsSync, statSync } from "node:fs";
 import { createRequire } from "node:module";
 import { dirname, isAbsolute, join, relative, resolve } from "node:path";
 import { pathToFileURL } from "node:url";
-import { StringEnum } from "@mariozechner/pi-ai";
-import { getAgentDir, type ExtensionAPI } from "@mariozechner/pi-coding-agent";
+import { StringEnum } from "@earendil-works/pi-ai";
+import { getAgentDir, type ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Type, type Static } from "typebox";
 import type { CCContext } from "../shared/context.js";
 import { resolvePath } from "../shared/paths.js";
@@ -147,7 +147,7 @@ export async function resolveRgPath(): Promise<string> {
 	if (commandWorks("rg")) return (cachedRgPath = "rg");
 	try {
 		const require = createRequire(import.meta.url);
-		const entry = require.resolve("@mariozechner/pi-coding-agent");
+		const entry = require.resolve("@earendil-works/pi-coding-agent");
 		const managerPath = join(dirname(entry), "utils", "tools-manager.js");
 		if (existsSync(managerPath)) {
 			const mod: any = await import(pathToFileURL(managerPath).href);

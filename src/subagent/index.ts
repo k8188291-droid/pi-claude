@@ -1,14 +1,15 @@
 import { randomBytes } from "node:crypto";
-import type { AssistantMessage, Model } from "@mariozechner/pi-ai";
+import type { AssistantMessage, Model } from "@earendil-works/pi-ai";
 import {
 	type AgentSession,
 	type AgentToolUpdateCallback,
 	type ExtensionAPI,
 	type ExtensionContext,
 	type ExtensionFactory,
+	type ModelRuntime,
 	SessionManager,
 	SettingsManager,
-} from "@mariozechner/pi-coding-agent";
+} from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 import { createClaudeCodeSession } from "../sdk.js";
 import type { CCContext } from "../shared/context.js";
@@ -240,9 +241,9 @@ export function registerTask(pi: ExtensionAPI, cc: CCContext): void {
 		const tools = def.tools ? [...def.tools] : undefined;
 		let deferredTools = cc.options.deferredTools;
 		if (tools) {
-			// keep only deferred tools the agent may use; ToolSearch must be allowed to activate them
+			// keep only deferred tools the agent may use; tool_search must be allowed to load them
 			deferredTools = (cc.options.deferredTools ?? []).filter((n) => tools.includes(n));
-			if (deferredTools.length > 0) tools.push("ToolSearch");
+			if (deferredTools.length > 0) tools.push("tool_search");
 		}
 		let thinkingLevel: ReturnType<ExtensionAPI["getThinkingLevel"]> | undefined;
 		try {
@@ -255,8 +256,8 @@ export function registerTask(pi: ExtensionAPI, cc: CCContext): void {
 			cwd: ctx.cwd,
 			sessionManager: SessionManager.inMemory(ctx.cwd),
 			settingsManager: SettingsManager.inMemory(),
-			authStorage: registry?.authStorage,
-			modelRegistry: registry,
+			// share the parent's credentials and model catalog
+			modelRuntime: cc.options.modelRuntime ?? (registry as unknown as { runtime?: ModelRuntime } | undefined)?.runtime,
 			model,
 			thinkingLevel,
 			tools,
@@ -285,6 +286,12 @@ export function registerTask(pi: ExtensionAPI, cc: CCContext): void {
 		} catch (err) {
 			session.dispose();
 			throw err;
+		}
+		if (tools && deferredTools && deferredTools.length > 0) {
+			// The `tools` allowlist keeps deferred tools registered but also activates them; deactivate
+			// them so they stay deferred until tool_search loads them, as in the parent.
+			const deferredSet = new Set(deferredTools);
+			session.setActiveToolsByName(session.getActiveToolNames().filter((n) => !deferredSet.has(n)));
 		}
 		return session;
 	}

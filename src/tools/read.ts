@@ -4,8 +4,8 @@ import { mkdtemp, readFile, readdir, rm, stat } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { basename, dirname, extname, join } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
-import type { ImageContent, TextContent } from "@mariozechner/pi-ai";
-import type { AgentToolResult, ExtensionAPI } from "@mariozechner/pi-coding-agent";
+import type { ImageContent, TextContent } from "@earendil-works/pi-ai";
+import type { AgentToolResult, ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 import type { CCContext } from "../shared/context.js";
 import { resolvePath } from "../shared/paths.js";
@@ -167,7 +167,7 @@ function loadPiImageResize(): Promise<PiImageResizeModule> {
 	resizeModulePromise ??= (async () => {
 		const candidates: string[] = [];
 		try {
-			const indexUrl = import.meta.resolve("@mariozechner/pi-coding-agent");
+			const indexUrl = import.meta.resolve("@earendil-works/pi-coding-agent");
 			candidates.push(new URL("./utils/image-resize.js", indexUrl).href);
 		} catch {
 			// ignore

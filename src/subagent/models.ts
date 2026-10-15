@@ -1,5 +1,5 @@
-import type { Model } from "@mariozechner/pi-ai";
-import type { ModelRegistry } from "@mariozechner/pi-coding-agent";
+import type { Model } from "@earendil-works/pi-ai";
+import type { ModelRegistry } from "@earendil-works/pi-coding-agent";
 
 export const MODEL_ALIASES = ["sonnet", "opus", "haiku"] as const;
 
