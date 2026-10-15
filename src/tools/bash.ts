@@ -37,6 +37,10 @@ export interface BackgroundShell {
 	output: OutputBuffer;
 	/** Absolute offset into `output` up to which the model has read. */
 	cursor: number;
+	/** The model has seen the final status via BashOutput (no completion notice needed). */
+	finalSeen?: boolean;
+	/** Exited while the agent was running; notify at agent_end unless finalSeen by then. */
+	notifyPending?: boolean;
 	proc: SpawnedShell;
 }
 
@@ -124,6 +128,7 @@ export function registerBash(pi: ExtensionAPI, cc: CCContext): void {
 	const shells = new Map<string, BackgroundShell>();
 	let nextShellId = 1;
 	let shuttingDown = false;
+	let agentRunning = false;
 
 	function resolveCwd(baseCwd: string): { cwd: string; resetNote?: string } {
 		if (shellCwd && isDir(shellCwd)) return { cwd: shellCwd };
@@ -275,6 +280,18 @@ export function registerBash(pi: ExtensionAPI, cc: CCContext): void {
 		cc.emit({ type: "background_shell_exited", shellId: shell.id, exitCode, signal });
 		// No wake-up for shells the model (or shutdown) killed on purpose.
 		if (wasKilled || shuttingDown) return;
+		// While the agent is running, the model may still pick up the result with BashOutput;
+		// defer the wake-up to agent_end so we don't trigger a redundant extra turn.
+		if (agentRunning) {
+			shell.notifyPending = true;
+			return;
+		}
+		notifyExit(shell);
+	}
+
+	function notifyExit(shell: BackgroundShell): void {
+		shell.notifyPending = false;
+		const { exitCode, signal } = shell;
 		const how =
 			exitCode === null
 				? `was terminated by signal ${signal ?? "unknown"}`
@@ -373,6 +390,8 @@ For commands that are harder to parse at a glance (piped commands, obscure flags
 
 			const parts = [`<status>${status}</status>`];
 			if (status !== "running") {
+				shell.finalSeen = true;
+				shell.notifyPending = false;
 				parts.push(shell.exitCode === null ? `<signal>${shell.signal ?? "unknown"}</signal>` : `<exit_code>${shell.exitCode}</exit_code>`);
 			}
 			if (lost > 0) parts.push(`<warning>${lost} characters of output were dropped before they could be read (in-memory limit)</warning>`);
@@ -409,6 +428,20 @@ For commands that are harder to parse at a glance (piped commands, obscure flags
 			shell.proc.kill();
 			return textResult(`Successfully killed shell: ${shell.id} (${truncateCmd(shell.command)})`, { shellId: shell.id });
 		},
+	});
+
+	pi.on("agent_start", async () => {
+		agentRunning = true;
+	});
+	pi.on("agent_end", async () => {
+		agentRunning = false;
+		// Defer so the agent loop has fully settled (idle) before we possibly start a new turn.
+		setTimeout(() => {
+			if (shuttingDown || agentRunning) return;
+			for (const shell of shells.values()) {
+				if (shell.notifyPending && !shell.finalSeen) notifyExit(shell);
+			}
+		}, 0);
 	});
 
 	pi.on("session_shutdown", async () => {

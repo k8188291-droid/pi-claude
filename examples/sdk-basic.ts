@@ -1,14 +1,18 @@
 /**
  * Minimal SDK usage: a pi session with Claude Code-compatible tools.
- * Run: ANTHROPIC_API_KEY=... npx tsx examples/sdk-basic.ts
+ * Run: ANTHROPIC_API_KEY=... [MODEL=claude-sonnet-4-6] npx tsx examples/sdk-basic.ts "your prompt"
  */
-import { getModel } from "@mariozechner/pi-ai";
+import { getModel, type Model } from "@mariozechner/pi-ai";
 import { SessionManager } from "@mariozechner/pi-coding-agent";
 import { createClaudeCodeSession } from "../src/index.js";
 
+// pi-ai's built-in model list may lag behind the API; for unknown ids reuse a known Anthropic model's settings.
+const modelId = process.env.MODEL ?? "claude-sonnet-4-6";
+const model: Model<any> = getModel("anthropic", modelId as any) ?? { ...getModel("anthropic", "claude-sonnet-4-6"), id: modelId, name: modelId };
+
 const { session } = await createClaudeCodeSession({
 	cwd: process.cwd(),
-	model: getModel("anthropic", "claude-sonnet-4-6"),
+	model,
 	sessionManager: SessionManager.inMemory(process.cwd()),
 	claudeCode: {
 		// AskUserQuestion → your UI. Answers are keyed by question text.
@@ -37,7 +41,11 @@ session.subscribe((event) => {
 	if (event.type === "message_update" && event.assistantMessageEvent.type === "text_delta") {
 		process.stdout.write(event.assistantMessageEvent.delta);
 	}
-	if (event.type === "tool_execution_start") console.error(`\n[tool] ${event.toolName}`);
+	if (event.type === "tool_execution_start") console.error(`\n[tool] ${event.toolName} ${JSON.stringify(event.args).slice(0, 120)}`);
+	if (event.type === "tool_execution_end" && event.isError) console.error(`[tool error] ${event.toolName}`);
+	if (event.type === "message_end" && event.message.role === "assistant" && event.message.stopReason === "error") {
+		console.error(`[model error] ${event.message.errorMessage}`);
+	}
 });
 
 await session.prompt(process.argv[2] ?? "List the TypeScript files in this project and summarize what each does.");
