@@ -202,7 +202,7 @@ describe("Agent tool (subagents)", () => {
 		});
 		await t!.session.prompt("go");
 		const [a, b, c, d] = t!.toolResults();
-		expect(a).toMatchObject({ isError: true, text: "Agent type 'nope' not found. Available agents: Explore, general-purpose, Plan, restricted, tester" });
+		expect(a).toMatchObject({ isError: true, text: "Agent type 'nope' not found. Available agents: claude, Explore, general-purpose, Plan, restricted, tester" });
 		expect(b.isError).toBe(false);
 		expect(b.details.subagentType).toBe("Explore");
 		expect(c.isError).toBe(true);

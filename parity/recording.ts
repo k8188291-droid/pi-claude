@@ -28,9 +28,14 @@ export interface Recording {
 /** Values that differ per run and are referenced by later tool calls (task ids, temp paths). */
 const DYNAMIC = [/(?<=ID: )[\w-]+/g, /(?<=agentId: )[\w-]+/g, /(?<="task_id":")[\w-]+/g, /\/tmp\/[^\s"'<>)\]]+/g];
 
+/** Only values that look like run-specific ids or temp paths (never short words or numbers like "1"). */
+const LOOKS_DYNAMIC = /^(?:[ab][0-9a-z]{8,}|\/tmp\/.{6,})$/;
+
 function tokens(text: string): string[] {
-	return DYNAMIC.flatMap((re) => [...text.matchAll(re)].map((m) => m[0]));
+	return DYNAMIC.flatMap((re) => [...text.matchAll(re)].map((m) => m[0])).filter((t) => LOOKS_DYNAMIC.test(t));
 }
+
+const escapeRe = (s: string) => s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 
 /** Map recorded dynamic values to the values seen in this run (paired by result position, then token position). */
 function liveMapping(recorded: string[], live: string[], recordedCwd: string, cwd: string): Map<string, string> {
@@ -68,7 +73,10 @@ function toTurns(rec: Recording, conv: Recording["conversations"][number]): Scen
 					input: (ctx: InputContext) => {
 						let json = template;
 						const map = liveMapping(recordedResults, ctx.all, rec.recordedCwd, ctx.cwd);
-						for (const [from, to] of [...map].sort((a, b) => b[0].length - a[0].length)) json = json.replaceAll(from, to);
+						// whole-token replacement only, longest first
+						for (const [from, to] of [...map].sort((a, b) => b[0].length - a[0].length)) {
+							json = json.replace(new RegExp(`(?<![\\w/.-])${escapeRe(from)}(?![\\w-])`, "g"), to);
+						}
 						return JSON.parse(json);
 					},
 				};

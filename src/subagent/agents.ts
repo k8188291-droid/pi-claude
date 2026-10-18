@@ -147,6 +147,14 @@ Notes:
 - Do NOT Write report/summary/findings/analysis .md files. Return findings directly as your final assistant message — the parent agent reads your text output, not files you create. (Files written as input to another tool are fine; this note is about report files.)`;
 
 export const BUILT_IN_AGENTS: Record<string, SubagentDefinition> = {
+	// Claude Code (agent SDK builds) lists this catch-all type first, and real model sessions use it.
+	claude: {
+		name: "claude",
+		description: "Catch-all for any task that doesn't fit a more specific agent. FleetView's default when no agent name is typed.",
+		prompt: GENERAL_PURPOSE_PROMPT,
+		tools: ["*"],
+		source: "built-in",
+	},
 	"general-purpose": {
 		name: "general-purpose",
 		description:

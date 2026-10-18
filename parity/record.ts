@@ -32,7 +32,9 @@ const apiKey = process.env.ANTHROPIC_API_KEY;
 if (!apiKey && !upstream) throw new Error("ANTHROPIC_API_KEY is required for recording (or pass --upstream for a proxy that injects credentials)");
 const model = arg("model") ?? "claude-sonnet-5-5";
 const repo = resolve(arg("repo") ?? ".");
-const fixture = { repo, commit: resolveCommit(repo, arg("ref") ?? "HEAD") };
+const packageRoot = resolve(import.meta.dirname, "..");
+// store this package's own repo as "." so recordings replay on any checkout
+const fixture = { repo: repo === packageRoot ? "." : repo, commit: resolveCommit(repo, arg("ref") ?? "HEAD") };
 
 const mock = new MockAnthropicServer();
 const baseUrl = await mock.start();

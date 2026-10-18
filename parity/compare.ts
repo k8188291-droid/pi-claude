@@ -11,7 +11,8 @@ const NOISE_REMINDERS = [/<total_tokens>/, /tools? (haven't|hasn't) been used re
 
 export function stripNoise(text: string): string {
 	return text
-		.replace(/\n*<system-reminder>[\s\S]*?<\/system-reminder>/g, (block) => (NOISE_REMINDERS.some((re) => re.test(block)) ? "" : block))
+		// only whole reminder blocks (tag on its own line), so "<system-reminder>" inside file content is left alone
+		.replace(/(^|\n)\n*<system-reminder>\n(?:(?!<system-reminder>)[\s\S])*?\n<\/system-reminder>(?=\n|$)/g, (block) => (NOISE_REMINDERS.some((re) => re.test(block)) ? "" : block))
 		.replace(/^<tool_use_error>([\s\S]*)<\/tool_use_error>$/, "$1");
 }
 

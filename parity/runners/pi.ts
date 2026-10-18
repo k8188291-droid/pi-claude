@@ -20,6 +20,8 @@ export async function runPi(s: Scenario, mock: MockAnthropicServer, baseUrl: str
 	);
 	const t0 = Date.now();
 	let error: string | undefined;
+	// running subagents, tracked from host events (the session must not be closed while they work)
+	const runningAgents = new Set<string>();
 	const home = mkdtempSync(join(tmpdir(), "parity-pi-home-"));
 	const modelRuntime = await ModelRuntime.create({ authPath: join(home, "auth.json"), modelsPath: null, refreshOnCreate: false });
 	await modelRuntime.setRuntimeApiKey("anthropic", "sk-ant-mock");
@@ -37,6 +39,10 @@ export async function runPi(s: Scenario, mock: MockAnthropicServer, baseUrl: str
 		claudeCode: {
 			loadAgentsFromDisk: false,
 			outputSpill: { dir: join(home, "tool-results") },
+			onEvent: (e) => {
+				if (e.type === "subagent_start") runningAgents.add(e.agentId);
+				else if (e.type === "subagent_end") runningAgents.delete(e.agentId);
+			},
 			onAskUserQuestion: async (qs) => Object.fromEntries(qs.map((q) => [q.question, q.options[0]?.label ?? ""])),
 		},
 		loader: { noSkills: true, noContextFiles: true, noPromptTemplates: true, noThemes: true, noExtensions: true },
@@ -44,9 +50,21 @@ export async function runPi(s: Scenario, mock: MockAnthropicServer, baseUrl: str
 	try {
 		await session.bindExtensions({});
 		await session.prompt(s.prompt);
-		// let background notifications (if any) play out
-		await new Promise((r) => setTimeout(r, 300));
-		await session.waitForIdle?.();
+		// Let background agents and the turns their notifications start play out, like Claude Code
+		// does before its query ends: wait until no agent is running, the session is idle, and no
+		// model request has arrived for a while.
+		const quietMs = 3000;
+		const deadline = Date.now() + 10 * 60_000;
+		let seen = -1;
+		let quietSince = Date.now();
+		while (Date.now() < deadline) {
+			await new Promise((r) => setTimeout(r, 250));
+			await session.waitForIdle?.();
+			if (runningAgents.size > 0 || mock.requests.length !== seen) {
+				seen = mock.requests.length;
+				quietSince = Date.now();
+			} else if (Date.now() - quietSince >= quietMs) break;
+		}
 	} catch (e) {
 		error = (e as Error).message;
 	} finally {

@@ -17,7 +17,8 @@ function writeAgent(dir: string, file: string, content: string) {
 
 describe("agent definitions", () => {
 	it("has the built-in agents", () => {
-		expect(Object.keys(BUILT_IN_AGENTS).sort()).toEqual(["Explore", "Plan", "general-purpose"]);
+		expect(Object.keys(BUILT_IN_AGENTS).sort()).toEqual(["Explore", "Plan", "claude", "general-purpose"]);
+		expect(BUILT_IN_AGENTS.claude.tools).toEqual(["*"]);
 		expect(BUILT_IN_AGENTS["general-purpose"].tools).toEqual(["*"]);
 		expect(BUILT_IN_AGENTS.Explore.tools).toBeUndefined();
 		expect(BUILT_IN_AGENTS.Explore.disallowedTools).toEqual(expect.arrayContaining(["Agent", "Edit", "Write", "NotebookEdit"]));
@@ -65,7 +66,7 @@ describe("agent definitions", () => {
 		expect(defs.get("general-purpose")?.source).toBe("built-in");
 
 		const noDisk = loadAgentDefinitions({ cwd, homeDir: home, loadAgentsFromDisk: false });
-		expect([...noDisk.keys()].sort()).toEqual(["Explore", "Plan", "general-purpose"]);
+		expect([...noDisk.keys()].sort()).toEqual(["Explore", "Plan", "claude", "general-purpose"]);
 	});
 
 	it("parses disallowedTools, effort and background frontmatter", () => {
@@ -81,14 +82,15 @@ describe("agent definitions", () => {
 			agents: { mine: { description: "My agent", prompt: "p" }, reader: { description: "Reads", prompt: "p", tools: ["Read", "Grep"] } },
 		});
 		const text = formatAgentListingReminder(defs);
-		expect(text.startsWith("Available agent types for the Agent tool:\n- Explore: Fast read-only search agent")).toBe(true);
+		expect(text.startsWith("Available agent types for the Agent tool:\n- claude: Catch-all for any task that doesn't fit a more specific agent.")).toBe(true);
+		expect(text).toContain("\n- Explore: Fast read-only search agent");
 		expect(text).toContain("(Tools: All tools except Agent, Artifact, ArtifactComments, ArtifactData, ArtifactCheck, ExitPlanMode, Edit, Write, NotebookEdit)");
 		expect(text).toContain("- general-purpose: General-purpose agent for researching complex questions");
 		expect(text).toContain("- mine: My agent (Tools: All tools)");
 		expect(text).toContain("- reader: Reads (Tools: Read, Grep)");
 		// sorted case-insensitively
 		const names = [...text.matchAll(/^- ([^:]+):/gm)].map((m) => m[1]);
-		expect(names).toEqual(["Explore", "general-purpose", "mine", "Plan", "reader"]);
+		expect(names).toEqual(["claude", "Explore", "general-purpose", "mine", "Plan", "reader"]);
 		expect(text.endsWith("send them in a single message with multiple tool uses so they run concurrently.")).toBe(true);
 	});
 });
