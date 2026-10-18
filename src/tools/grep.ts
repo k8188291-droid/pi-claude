@@ -380,7 +380,9 @@ export async function executeGrep(
 		const details: GrepDetails = { mode, numFiles: lines.length, numMatches: totalMatches };
 		if (run.capped) details.outputCapped = true;
 		if (lines.length === 0) return { text: "No matches found", details };
-		const paged = applyPaging(lines, limit, offset);
+		// rg prints files in thread-completion order; sort so output and paging are deterministic
+		const sorted = [...lines].sort((a, b) => a.slice(0, a.lastIndexOf(":")).localeCompare(b.slice(0, b.lastIndexOf(":"))));
+		const paged = applyPaging(sorted, limit, offset);
 		const body = paged.items.join("\n");
 		let summary = `Found ${totalMatches} total ${totalMatches === 1 ? "occurrence" : "occurrences"} across ${lines.length} ${lines.length === 1 ? "file" : "files"}.`;
 		if (paged.truncated) {

@@ -97,6 +97,22 @@ const { session } = await createAgentSession({ cwd, modelRuntime, resourceLoader
 - Subagent 使用記憶體內預設設定與 `getAgentDir()`（拿不到父 session 的 settingsManager）；憑證與模型目錄共用父 session 的 ModelRuntime。
 - 工具搜尋用 pi 內建的 `tool_search`（參數 `query`、`limit`），不是 Claude Code 的 `ToolSearch`（`select:` 語法）。
 
+## 與 Claude Code 的差異測試（parity）
+
+`parity/` 用同一組可重播的情境，分別跑 Claude Code（透過 `@anthropic-ai/claude-agent-sdk`）和 pi-claude，再比對兩邊的工具結果。
+
+- **原理：** 兩邊都連到本機的模擬 Anthropic API（`parity/mock-server.ts`），由它依劇本回傳模型的工具呼叫，所以兩邊收到完全相同的模型輸出，差異只來自工具實作。不需要 API key，也不花費用。
+- **比對內容：** 每一步的工具結果（正規化路徑、時間、隨機 id 後逐字比對）、錯誤狀態、執行後的工作目錄檔案、宣告給模型的工具清單與參數、子 agent 的工具清單，以及劇本以外多出的模型回合（例如背景工作的喚醒）。
+- **輸出：** `parity/out/report.md`（Markdown 報告）和 `parity/out/results.json`。
+
+```bash
+npm run parity                              # 跑全部情境
+npx tsx parity/run.ts --only grep-modes,glob # 只跑部分情境
+npx tsx parity/debug.ts edit-guards claude  # 印出單一情境、單一 harness 的請求紀錄
+```
+
+新增情境：在 `parity/scenarios/` 加一個 `Scenario`。路徑寫成 `{{cwd}}`；兩邊工具名稱或參數不同時，用 `claude` / `pi` 覆寫；參數可以寫成函式，從前面的工具結果取值（例如背景工作 id）。子 agent 的劇本放在 `subagents`，並在 Task/Agent 的 prompt 裡寫 `[[sub:名稱]]`。
+
 ## 開發
 
 ```bash
