@@ -1,3 +1,4 @@
+import { loadRecordings } from "../recording.js";
 import type { Scenario } from "../types.js";
 import { agentScenarios } from "./agents.js";
 import { editScenarios } from "./edit.js";
@@ -6,4 +7,4 @@ import { readScenarios } from "./read.js";
 import { searchScenarios } from "./search.js";
 import { taskScenarios } from "./tasks.js";
 
-export const scenarios: Scenario[] = [...readScenarios, ...editScenarios, ...searchScenarios, ...execScenarios, ...agentScenarios, ...taskScenarios];
+export const scenarios: Scenario[] = [...readScenarios, ...editScenarios, ...searchScenarios, ...execScenarios, ...agentScenarios, ...taskScenarios, ...loadRecordings()];

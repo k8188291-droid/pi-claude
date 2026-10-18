@@ -124,6 +124,21 @@ npx tsx parity/debug.ts edit-guards claude  # 印出單一情境、單一 harnes
 npx tsx parity/debug.ts <情境> claude --full  # 印出完整（未截斷）的工具結果
 ```
 
+### 錄製真實 session 再重播
+
+手寫劇本只涵蓋想得到的情況。錄製模式讓真的模型透過 Claude Code 執行任務，把模型實際送出的工具呼叫錄下來，之後再拿去兩邊重播比對：
+
+```bash
+ANTHROPIC_API_KEY=... npx tsx parity/record.ts --name review-pi-claude \
+  --prompt "請 review 這個 repo 目前的程式碼……" [--model claude-sonnet-5-5] [--ref HEAD]
+npx tsx parity/run.ts --only review-pi-claude   # 重播：Claude Code 與 pi-claude 各跑一次並比對
+```
+
+- 錄製時，模擬伺服器改為代理：把請求轉發到真的 Anthropic API，同時記下每個模型回合（主 agent 與各 subagent），存成 `parity/recordings/<name>.json`；最後一則回覆另存成 `<name>.final.md`。
+- 工作目錄是指定 commit 的 `git archive`，以固定時間戳記建成 git repo，並連結 `node_modules`，錄製和重播時內容完全相同。
+- 重播時，背景工作 id、暫存檔路徑這類每次不同的值，會依前面的工具結果自動換成當次執行的值。
+- `parity/recordings/` 裡的錄製檔會自動載入成情境。
+
 ## 開發
 
 ```bash

@@ -36,6 +36,8 @@ export interface Scenario {
 	turns: ScenarioTurn[];
 	/** Subagent scripts: a Task/Agent prompt containing `[[sub:NAME]]` is answered from subagents[NAME]. */
 	subagents?: Record<string, ScenarioTurn[]>;
+	/** Routes subagent requests without a `[[sub:NAME]]` marker (recordings): first user message contains `match`. */
+	subagentRoutes?: Array<{ name: string; match: string }>;
 	/** Files whose final content is compared after the run (default: every file in the workspace). */
 	compareFiles?: string[];
 }

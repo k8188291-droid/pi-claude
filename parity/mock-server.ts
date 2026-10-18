@@ -10,6 +10,7 @@
  */
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
 import type { AddressInfo } from "node:net";
+import { gunzipSync } from "node:zlib";
 
 export interface ScriptedCall {
 	tool: string;
@@ -41,6 +42,8 @@ export interface MockScript {
 	main: Turn[];
 	/** Subagent scripts, selected when the first user message contains `[[sub:NAME]]`. */
 	subagents?: Record<string, Turn[]>;
+	/** Extra routing for subagents without a marker (recordings): first user message contains `match` → route `name`. */
+	subagentRoutes?: Array<{ name: string; match: string }>;
 	/** Maps canonical tool names in the script to this harness's names (e.g. Task → Agent). */
 	toolAliases?: Record<string, string>;
 	/** Rewrites inputs for this harness (e.g. path placeholders). */
@@ -67,11 +70,29 @@ function systemText(system: unknown): string {
 	return "";
 }
 
+/** One conversation captured in record mode (main agent or a subagent), keyed by its first user message. */
+export interface RecordedConversation {
+	firstUser: string;
+	system: string;
+	/** Assistant content per turn index (thinking blocks dropped). */
+	turns: Array<{ content: any[] } | undefined>;
+	/** Every tool_result the harness sent back, from the latest request of this conversation. */
+	toolResults: Array<{ toolUseId: string; text: string; isError: boolean }>;
+}
+
 export class MockAnthropicServer {
 	private server?: Server;
 	private script?: MockScript;
 	readonly requests: CapturedRequest[] = [];
 	private idPrefix = "run";
+	private recorder?: { upstream: string; apiKey: string };
+	readonly recording = new Map<string, RecordedConversation>();
+
+	/** Record mode: forward every request to the real API and capture the model's turns. */
+	startRecording(opts: { upstream?: string; apiKey: string }): void {
+		this.recorder = { upstream: opts.upstream ?? "https://api.anthropic.com", apiKey: opts.apiKey };
+		this.recording.clear();
+	}
 
 	async start(): Promise<string> {
 		this.server = createServer((req, res) => void this.handle(req, res));
@@ -93,8 +114,12 @@ export class MockAnthropicServer {
 
 	private async handle(req: IncomingMessage, res: ServerResponse): Promise<void> {
 		const url = req.url ?? "";
-		let raw = "";
-		for await (const chunk of req) raw += chunk;
+		const chunks: Buffer[] = [];
+		for await (const chunk of req) chunks.push(chunk as Buffer);
+		let buf = Buffer.concat(chunks);
+		if (req.headers["content-encoding"] === "gzip") buf = gunzipSync(buf);
+		const raw = buf.toString("utf8");
+		if (this.recorder) return this.proxy(req, res, url, raw);
 		if (req.method === "POST" && /\/v1\/messages\/count_tokens/.test(url)) {
 			return json(res, 200, { input_tokens: 100 });
 		}
@@ -111,7 +136,7 @@ export class MockAnthropicServer {
 		const tools: any[] = body.tools ?? [];
 		const firstUser = textOf(messages.find((m) => m.role === "user")?.content);
 		const last = messages.at(-1);
-		const sub = SUB_MARKER.exec(firstUser)?.[1];
+		const sub = SUB_MARKER.exec(firstUser)?.[1] ?? this.script?.subagentRoutes?.find((r) => firstUser.includes(r.match))?.name;
 		const hasTools = tools.length > 0;
 		const route = !hasTools ? "side" : sub ?? "main";
 		const turnIndex = messages.filter((m) => m.role === "assistant").length;
@@ -159,6 +184,47 @@ export class MockAnthropicServer {
 		return json(res, 200, message);
 	}
 
+	/** Record mode: pass the request through to the real API and capture the assistant turn. */
+	private async proxy(req: IncomingMessage, res: ServerResponse, url: string, raw: string): Promise<void> {
+		const rec = this.recorder!;
+		const headers: Record<string, string> = { "content-type": "application/json", "x-api-key": rec.apiKey };
+		for (const h of ["anthropic-version", "anthropic-beta", "accept"]) {
+			const v = req.headers[h];
+			if (typeof v === "string") headers[h] = v;
+		}
+		const upstream = await fetch(rec.upstream + url, { method: req.method, headers, body: req.method === "POST" ? raw : undefined });
+		const resHeaders: Record<string, string> = {};
+		upstream.headers.forEach((v, k) => {
+			if (!["content-encoding", "content-length", "transfer-encoding", "connection"].includes(k)) resHeaders[k] = v;
+		});
+		res.writeHead(upstream.status, resHeaders);
+		const text = await upstream.text();
+		res.end(text);
+		if (upstream.status >= 400) process.stderr.write(`[record] upstream ${req.method} ${url} → ${upstream.status}: ${text.slice(0, 300)}\n`);
+
+		let body: any;
+		try {
+			body = JSON.parse(raw);
+		} catch {
+			return;
+		}
+		if (!/\/v1\/messages(\?|$)/.test(url) || !(body.tools?.length > 0) || upstream.status !== 200) return;
+		const messages: any[] = body.messages ?? [];
+		const firstUser = textOf(messages.find((m) => m.role === "user")?.content);
+		const turnIndex = messages.filter((m) => m.role === "assistant").length;
+		const content = body.stream ? contentFromSse(text) : (JSON.parse(text).content ?? []);
+		let conv = this.recording.get(firstUser);
+		if (!conv) {
+			conv = { firstUser, system: systemText(body.system), turns: [], toolResults: [] };
+			this.recording.set(firstUser, conv);
+		}
+		conv.turns[turnIndex] = { content: content.filter((b: any) => b.type === "text" || b.type === "tool_use") };
+		conv.toolResults = messages
+			.filter((m) => m.role === "user" && Array.isArray(m.content))
+			.flatMap((m) => m.content.filter((b: any) => b?.type === "tool_result"))
+			.map((b: any) => ({ toolUseId: b.tool_use_id, text: textOf(b.content), isError: !!b.is_error }));
+	}
+
 	private renderTurn(turn: Turn, route: string, turnIndex: number, req: CapturedRequest): any[] {
 		const out: any[] = [];
 		if (turn.text) out.push({ type: "text", text: turn.text });
@@ -201,4 +267,35 @@ function sse(res: ServerResponse, message: any): void {
 	send("message_delta", { type: "message_delta", delta: { stop_reason, stop_sequence: null }, usage: { output_tokens: usage.output_tokens } });
 	send("message_stop", { type: "message_stop" });
 	res.end();
+}
+
+/** Rebuild the assistant content blocks from an Anthropic SSE stream. */
+export function contentFromSse(text: string): any[] {
+	const blocks: any[] = [];
+	const json: Record<number, string> = {};
+	for (const line of text.split("\n")) {
+		if (!line.startsWith("data:")) continue;
+		let ev: any;
+		try {
+			ev = JSON.parse(line.slice(5).trim());
+		} catch {
+			continue;
+		}
+		if (ev.type === "content_block_start") {
+			blocks[ev.index] = { ...ev.content_block };
+			if (ev.content_block.type === "tool_use") json[ev.index] = "";
+		} else if (ev.type === "content_block_delta") {
+			const b = blocks[ev.index];
+			if (!b) continue;
+			if (ev.delta.type === "text_delta") b.text = (b.text ?? "") + ev.delta.text;
+			else if (ev.delta.type === "input_json_delta") json[ev.index] += ev.delta.partial_json;
+		} else if (ev.type === "content_block_stop" && json[ev.index] !== undefined) {
+			try {
+				blocks[ev.index].input = json[ev.index] ? JSON.parse(json[ev.index]) : {};
+			} catch {
+				blocks[ev.index].input = {};
+			}
+		}
+	}
+	return blocks.filter(Boolean);
 }

@@ -18,6 +18,7 @@ export async function runClaude(s: Scenario, mock: MockAnthropicServer, baseUrl:
 		{
 			main: toMockTurns(s.turns, "claude", cwd),
 			subagents: Object.fromEntries(Object.entries(s.subagents ?? {}).map(([k, v]) => [k, toMockTurns(v, "claude", cwd)])),
+			subagentRoutes: s.subagentRoutes,
 		},
 		"claude",
 	);

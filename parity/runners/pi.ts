@@ -14,6 +14,7 @@ export async function runPi(s: Scenario, mock: MockAnthropicServer, baseUrl: str
 		{
 			main: toMockTurns(s.turns, "pi", cwd),
 			subagents: Object.fromEntries(Object.entries(s.subagents ?? {}).map(([k, v]) => [k, toMockTurns(v, "pi", cwd)])),
+			subagentRoutes: s.subagentRoutes,
 		},
 		"pi",
 	);
