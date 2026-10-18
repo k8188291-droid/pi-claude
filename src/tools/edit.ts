@@ -1,239 +1,302 @@
-import { mkdir, readFile, stat, writeFile } from "node:fs/promises";
-import { dirname } from "node:path";
+import { readdir, readFile, realpath, stat } from "node:fs/promises";
+import { basename, dirname, extname, join, relative, sep } from "node:path";
 import type { AgentToolResult, ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { withFileMutationQueue } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 import type { CCContext } from "../shared/context.js";
+import { FILE_CONTENT_CHANGED, FILE_MODIFIED_SINCE_READ, FileStateTracker } from "../shared/file-state.js";
 import { resolvePath } from "../shared/paths.js";
-import { formatNumberedLine, splitLines } from "./read.js";
+import { FILE_STATE_CURRENT_NOTE, readExistingText, writeText, notTextMessage } from "./write.js";
+
+// Mirrors Claude Code 2.1.302's Edit tool (description, schema, validation order and messages).
 
 const DESCRIPTION = `Performs exact string replacements in files.
 
 Usage:
 - You must use your \`Read\` tool at least once in the conversation before editing. This tool will error if you attempt an edit without reading the file.
-- When editing text from Read tool output, ensure you preserve the exact indentation (tabs/spaces) as it appears AFTER the line number prefix. The line number prefix format is: spaces + line number + tab. Everything after that tab is the actual file content to match. Never include any part of the line number prefix in the old_string or new_string.
+- When editing text from Read tool output, ensure you preserve the exact indentation (tabs/spaces) as it appears AFTER the line number prefix. The line number prefix format is: line number + tab. Everything after that is the actual file content to match. Never include any part of the line number prefix in the old_string or new_string.
 - ALWAYS prefer editing existing files in the codebase. NEVER write new files unless explicitly required.
 - Only use emojis if the user explicitly requests it. Avoid adding emojis to files unless asked.
 - The edit will FAIL if \`old_string\` is not unique in the file. Either provide a larger string with more surrounding context to make it unique or use \`replace_all\` to change every instance of \`old_string\`.
-- Use \`replace_all\` for replacing and renaming strings across the file. This parameter is useful if you want to rename a variable for instance.
-- To make several changes to the same file in one call, pass \`edits\` (an array of {old_string, new_string, replace_all?}) instead of the top-level old_string/new_string. Edits are applied sequentially, each to the result of the previous one, and atomically: if any edit fails, none are applied.
-- To create a new file, use an empty old_string and the file's contents as new_string (the file must not already exist with content).`;
-
-const editItemSchema = Type.Object(
-	{
-		old_string: Type.String({ description: "The text to replace" }),
-		new_string: Type.String({ description: "The text to replace it with (must be different from old_string)" }),
-		replace_all: Type.Optional(Type.Boolean({ description: "Replace all occurences of old_string (default false)", default: false })),
-	},
-	{ additionalProperties: false },
-);
+- Use \`replace_all\` for replacing and renaming strings across the file. This parameter is useful if you want to rename a variable for instance.`;
 
 const editSchema = Type.Object(
 	{
 		file_path: Type.String({ description: "The absolute path to the file to modify" }),
-		old_string: Type.Optional(Type.String({ description: "The text to replace" })),
-		new_string: Type.Optional(Type.String({ description: "The text to replace it with (must be different from old_string)" })),
-		replace_all: Type.Optional(Type.Boolean({ description: "Replace all occurences of old_string (default false)", default: false })),
-		edits: Type.Optional(
-			Type.Array(editItemSchema, {
-				description:
-					"Optional: multiple edits to apply to the same file in one call, sequentially and atomically (all or nothing). Use instead of the top-level old_string/new_string.",
-				minItems: 1,
-			}),
-		),
+		old_string: Type.String({ description: "The text to replace" }),
+		new_string: Type.String({ description: "The text to replace it with (must be different from old_string)" }),
+		replace_all: Type.Optional(Type.Boolean({ description: "Replace all occurrences of old_string (default false)", default: false })),
 	},
 	{ additionalProperties: false },
 );
 
-export interface EditSpec {
-	old_string: string;
-	new_string: string;
-	replace_all?: boolean;
-}
-
 export interface EditToolDetails {
 	filePath: string;
+	oldString: string;
+	newString: string;
+	/** File content before the edit (null when the edit created the file). */
+	originalFile: string | null;
+	replaceAll: boolean;
 	created: boolean;
-	/** total number of replacements performed across all edits */
-	replacements: number;
-	/** first changed line (1-based) in the new file, if any */
-	firstChangedLine?: number;
 }
 
-const SNIPPET_CONTEXT_LINES = 4;
-const SNIPPET_MAX_LINES = 60;
-const MAX_EDIT_FILE_BYTES = 256 * 1024 * 1024;
+const MAX_EDIT_FILE_BYTES = 1024 * 1024 * 1024;
+const NOT_A_NOTEBOOK_TOOL = "File is a Jupyter Notebook. Use the NotebookEdit to edit this file.";
+const STALE_RECOVERED_NOTE =
+	" (note: the file had been modified on disk since you last read it — the edit applied cleanly, but the file contains other changes not in your context. Read it before edits that depend on surrounding content.)";
+const ESCAPE_NOTE =
+	"\n(note: Edit also tried swapping \\uXXXX escapes and their characters; neither form matched, so the mismatch is likely elsewhere in old_string. Re-read the file and copy the exact surrounding text.)";
+const CWD_NOTE = "Note: your current working directory is";
 
 // ---------------------------------------------------------------------------------------------
-// Pure helpers (exported for tests)
+// String matching (ported from Claude Code)
 // ---------------------------------------------------------------------------------------------
+
+const LSQ = "‘";
+const RSQ = "’";
+const LDQ = "“";
+const RDQ = "”";
+const ESCAPE_RE = /\\u[0-9a-fA-F]{4}/;
+const NON_ASCII_RE = /[\u0080-￿]/;
 
 export function normalizeQuotes(s: string): string {
-	return s.replace(/[‘’]/g, "'").replace(/[“”]/g, '"');
+	return s.replaceAll(LSQ, "'").replaceAll(RSQ, "'").replaceAll(LDQ, '"').replaceAll(RDQ, '"');
 }
 
-function isOpeningContext(prev: string): boolean {
-	return prev === "" || /[\s([{—–-]/.test(prev);
+function decodeEscapes(s: string): string {
+	return s.replace(/(\\\\)|\\u([0-9a-fA-F]{4})/g, (m, bs, hex) => (bs !== undefined ? m : String.fromCharCode(parseInt(hex, 16))));
 }
 
-/**
- * When old_string only matched after quote normalization (the file uses curly quotes), apply the
- * file's curly-quote style to straight quotes in new_string.
- */
-export function preserveQuoteStyle(requestedOld: string, actualOld: string, newString: string): string {
-	if (requestedOld === actualOld) return newString;
-	const hasDouble = /[“”]/.test(actualOld);
-	const hasSingle = /[‘’]/.test(actualOld);
-	if (!hasDouble && !hasSingle) return newString;
+function escapeRegexChar(c: string): string {
+	return c.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+/** Regex source matching `s` with every non-ASCII char written as a \uXXXX escape (any hex case). */
+function escapedPattern(s: string): string {
 	let out = "";
-	for (let i = 0; i < newString.length; i++) {
-		const ch = newString[i];
-		const prev = i > 0 ? newString[i - 1] : "";
-		const next = i + 1 < newString.length ? newString[i + 1] : "";
-		if (ch === '"' && hasDouble) {
-			out += isOpeningContext(prev) ? "“" : "”";
-		} else if (ch === "'" && hasSingle) {
-			if (/[\p{L}\p{N}]/u.test(prev) && /[\p{L}\p{N}]/u.test(next)) out += "’"; // apostrophe
-			else out += isOpeningContext(prev) ? "‘" : "’";
-		} else {
-			out += ch;
-		}
+	for (let i = 0; i < s.length; i++) {
+		const code = s.charCodeAt(i);
+		if (code >= 128) {
+			out += "\\\\u";
+			for (const h of code.toString(16).padStart(4, "0")) out += h >= "a" ? `[${h}${h.toUpperCase()}]` : h;
+		} else out += escapeRegexChar(s[i]);
 	}
 	return out;
 }
 
-export function countOccurrences(haystack: string, needle: string): number {
-	if (needle === "") return 0;
-	let count = 0;
-	let idx = haystack.indexOf(needle);
-	while (idx !== -1) {
-		count++;
-		idx = haystack.indexOf(needle, idx + needle.length);
-	}
-	return count;
+function escapedLength(s: string): number {
+	let n = 0;
+	for (let i = 0; i < s.length; i++) if (s.charCodeAt(i) >= 128) n++;
+	return s.length + 5 * n;
 }
 
-class EditError extends Error {}
+function backslashesBefore(s: string, idx: number): number {
+	let n = 0;
+	while (s[idx - 1 - n] === "\\") n++;
+	return n;
+}
+
+/** Find `needle` in `haystack` where the haystack spells its non-ASCII chars as \uXXXX escapes. */
+function findEscapedForm(needle: string, haystack: string): string | null {
+	if (backslashesBefore(needle, needle.length) % 2 === 1) return null;
+	const escapeOffsets = needle[0] === "\\" ? [0] : [];
+	let pos = 0;
+	for (let i = 0; i < needle.length; i++) {
+		if (needle.charCodeAt(i) >= 128) {
+			escapeOffsets.push(pos);
+			pos += 6;
+		} else pos += 1;
+	}
+	try {
+		const re = new RegExp(escapedPattern(needle), "g");
+		for (let m = re.exec(haystack); m !== null; m = re.exec(haystack)) {
+			const at = m.index;
+			if (escapeOffsets.every((o) => backslashesBefore(haystack, at + o) % 2 === 0)) return haystack.indexOf(m[0]) === at ? m[0] : null;
+			re.lastIndex = at + 1;
+		}
+		return null;
+	} catch {
+		return null;
+	}
+}
 
 /**
- * Apply edits sequentially to `content`. Throws EditError on the first failing edit.
- * `fileExists` controls the empty-old_string semantics.
+ * The string in `file` that `oldString` refers to: exact match, else the same text with curly
+ * quotes, else with \uXXXX escapes decoded or applied. Null when nothing matches.
  */
-export function applyEdits(content: string, edits: EditSpec[], fileExists: boolean): { content: string; replacements: number } {
-	let current = content;
-	let replacements = 0;
-	const previousNew: string[] = [];
-	const multi = edits.length > 1;
-	for (let i = 0; i < edits.length; i++) {
-		const prefix = multi ? `Edit ${i + 1} of ${edits.length}: ` : "";
-		const { old_string: oldStr, new_string: newStr } = edits[i];
-		const replaceAll = edits[i].replace_all === true;
-		if (oldStr === newStr) {
-			throw new EditError(`${prefix}No changes to make: old_string and new_string are exactly the same.`);
-		}
-		if (oldStr === "") {
-			if (i > 0) throw new EditError(`${prefix}old_string must not be empty (an empty old_string is only allowed as the first edit, to create a file).`);
-			if (fileExists && current.trim() !== "") {
-				throw new EditError("Cannot create new file - file already exists.");
-			}
-			current = newStr;
-			replacements++;
-			previousNew.push(newStr);
-			continue;
-		}
-		if (!fileExists && i === 0) {
-			throw new EditError("File does not exist.");
-		}
-		if (previousNew.some((s) => s.includes(oldStr))) {
-			throw new EditError(`${prefix}Cannot edit file: old_string is a substring of a new_string from a previous edit.`);
-		}
-
-		let actualOld = oldStr;
-		let actualNew = newStr;
-		let count = countOccurrences(current, oldStr);
-		if (count === 0) {
-			// Fallback: the model may have typed straight quotes where the file has curly ones (or vice versa).
-			const idx = normalizeQuotes(current).indexOf(normalizeQuotes(oldStr));
-			if (idx !== -1) {
-				actualOld = current.slice(idx, idx + oldStr.length);
-				actualNew = preserveQuoteStyle(oldStr, actualOld, newStr);
-				count = countOccurrences(current, actualOld);
-			}
-		}
-		if (count === 0) {
-			throw new EditError(`${prefix}String to replace not found in file.\nString: ${oldStr}`);
-		}
-		if (count > 1 && !replaceAll) {
-			throw new EditError(
-				`${prefix}Found ${count} matches of the string to replace, but replace_all is false. To replace all occurrences, set replace_all to true. To replace only one occurrence, please provide more context to uniquely identify the instance.\nString: ${oldStr}`,
-			);
-		}
-		if (replaceAll) {
-			current = current.split(actualOld).join(actualNew);
-			replacements += count;
-		} else {
-			const idx = current.indexOf(actualOld);
-			current = current.slice(0, idx) + actualNew + current.slice(idx + actualOld.length);
-			replacements++;
-		}
-		previousNew.push(actualNew);
+export function findActualString(file: string, oldString: string): string | null {
+	if (file.includes(oldString)) return oldString;
+	const idx = normalizeQuotes(file).indexOf(normalizeQuotes(oldString));
+	if (idx !== -1) return file.substring(idx, idx + oldString.length);
+	if (ESCAPE_RE.test(oldString)) {
+		const decoded = decodeEscapes(oldString);
+		if (decoded !== oldString && file.includes(decoded)) return decoded;
 	}
-	return { content: current, replacements };
+	if (NON_ASCII_RE.test(oldString)) {
+		if (escapedLength(oldString) > file.length || !file.includes("\\u")) return null;
+		return findEscapedForm(oldString, file);
+	}
+	return null;
 }
 
-/** Build a cat -n snippet of the changed region of `after` (compared to `before`). */
-export function buildSnippet(before: string, after: string): { snippet: string; firstChangedLine?: number } {
-	const afterLines = splitLines(after);
-	if (afterLines.length === 0) return { snippet: "" };
-	let p = 0;
-	const minLen = Math.min(before.length, after.length);
-	while (p < minLen && before.charCodeAt(p) === after.charCodeAt(p)) p++;
-	let s = 0;
-	while (s < minLen - p && before.charCodeAt(before.length - 1 - s) === after.charCodeAt(after.length - 1 - s)) s++;
-	const lineOf = (pos: number) => {
-		let n = 0;
-		for (let i = 0; i < pos && i < after.length; i++) if (after.charCodeAt(i) === 10) n++;
-		return n;
-	};
-	const firstIdx = Math.min(lineOf(p), afterLines.length - 1);
-	const changedEnd = Math.max(p, after.length - s - 1);
-	const lastIdx = Math.min(Math.max(firstIdx, lineOf(changedEnd)), afterLines.length - 1);
-	const from = Math.max(0, firstIdx - SNIPPET_CONTEXT_LINES);
-	const to = Math.min(afterLines.length - 1, lastIdx + SNIPPET_CONTEXT_LINES);
-	const out: string[] = [];
-	for (let i = from; i <= to && out.length < SNIPPET_MAX_LINES; i++) out.push(formatNumberedLine(i + 1, afterLines[i]));
-	const shownTo = from + out.length - 1;
-	if (shownTo < to) out.push(`... (${to - shownTo} more changed lines not shown)`);
-	return { snippet: out.join("\n"), firstChangedLine: firstIdx + 1 };
+function isOpeningContext(chars: string[], i: number): boolean {
+	if (i === 0) return true;
+	const p = chars[i - 1];
+	return p === " " || p === "\t" || p === "\n" || p === "\r" || p === "(" || p === "[" || p === "{" || p === "—" || p === "–";
 }
 
-function collectEdits(params: {
-	old_string?: string;
-	new_string?: string;
-	replace_all?: boolean;
-	edits?: EditSpec[];
-}): EditSpec[] {
-	const edits: EditSpec[] = [];
-	const hasTop = params.old_string !== undefined || params.new_string !== undefined;
-	if (hasTop) {
-		if (typeof params.old_string !== "string" || typeof params.new_string !== "string") {
-			throw new Error("Both old_string and new_string are required (or pass an `edits` array).");
+function curlDoubleQuotes(s: string): string {
+	const chars = [...s];
+	return chars.map((c, i) => (c === '"' ? (isOpeningContext(chars, i) ? LDQ : RDQ) : c)).join("");
+}
+
+function curlSingleQuotes(s: string): string {
+	const chars = [...s];
+	return chars
+		.map((c, i) => {
+			if (c !== "'") return c;
+			const prev = i > 0 ? chars[i - 1] : undefined;
+			const next = i < chars.length - 1 ? chars[i + 1] : undefined;
+			if (prev !== undefined && next !== undefined && /\p{L}/u.test(prev) && /\p{L}/u.test(next)) return RSQ;
+			return isOpeningContext(chars, i) ? LSQ : RSQ;
+		})
+		.join("");
+}
+
+/** When old_string matched only via curly-quote normalization, give new_string the file's quote style. */
+export function preserveQuoteStyle(oldString: string, actualOld: string, newString: string): string {
+	if (oldString === actualOld) return newString;
+	const hasDouble = actualOld.includes(LDQ) || actualOld.includes(RDQ);
+	const hasSingle = actualOld.includes(LSQ) || actualOld.includes(RSQ);
+	if (!hasDouble && !hasSingle) return newString;
+	let out = newString;
+	if (hasDouble) out = curlDoubleQuotes(out);
+	if (hasSingle) out = curlSingleQuotes(out);
+	return out;
+}
+
+/** When old_string matched via \uXXXX escapes (either direction), spell new_string the same way. */
+export function preserveEscapeStyle(oldString: string, actualOld: string, newString: string): string {
+	if (oldString === actualOld) return newString;
+	if (NON_ASCII_RE.test(oldString) && escapedLength(oldString) === actualOld.length && findEscapedForm(oldString, actualOld) !== null) {
+		const spelled = new Map<number, string>();
+		let upper = 0;
+		let lower = 0;
+		for (let i = 0, j = 0; i < oldString.length; i++) {
+			const code = oldString.charCodeAt(i);
+			if (code >= 128) {
+				const hex = actualOld.slice(j + 2, j + 6);
+				spelled.set(code, hex);
+				for (const h of hex) {
+					if (h >= "a" && h <= "f") lower++;
+					else if (h >= "A" && h <= "F") upper++;
+				}
+				j += 6;
+			} else j += 1;
 		}
-		edits.push({ old_string: params.old_string, new_string: params.new_string, replace_all: params.replace_all });
+		return newString.replace(/[\u0080-￿]/g, (c) => {
+			const code = c.charCodeAt(0);
+			const known = spelled.get(code);
+			if (known !== undefined) return "\\u" + known;
+			const hex = code.toString(16).padStart(4, "0");
+			return "\\u" + (upper > lower ? hex.toUpperCase() : hex);
+		});
 	}
-	if (params.edits !== undefined) {
-		if (!Array.isArray(params.edits)) throw new Error("edits must be an array.");
-		for (const [i, e] of params.edits.entries()) {
-			if (!e || typeof e.old_string !== "string" || typeof e.new_string !== "string") {
-				throw new Error(`edits[${i}] must have string old_string and new_string.`);
-			}
-			edits.push({ old_string: e.old_string, new_string: e.new_string, replace_all: e.replace_all });
-		}
+	if (ESCAPE_RE.test(oldString) && decodeEscapes(oldString) === actualOld) return decodeEscapes(newString);
+	return newString;
+}
+
+export type EditOutcome = "applies" | "ambiguous" | "no_match";
+
+export function editOutcome(file: string, oldString: string, replaceAll: boolean): EditOutcome {
+	if (oldString === "") return "no_match";
+	const actual = findActualString(file, oldString);
+	if (!actual) return "no_match";
+	if (!replaceAll) {
+		const first = file.indexOf(actual);
+		if (file.indexOf(actual, first + actual.length) !== -1) return "ambiguous";
 	}
-	if (edits.length === 0) {
-		throw new Error("Missing old_string/new_string: provide old_string and new_string, or a non-empty `edits` array.");
+	return "applies";
+}
+
+class EditApplyError extends Error {}
+
+/**
+ * Replace `oldString` (already resolved to the file's spelling) with `newString`. Deleting text
+ * that ends a line also removes that line's newline.
+ */
+export function applyEdit(content: string, oldString: string, newString: string, replaceAll = false): string {
+	if (oldString === "") {
+		if (newString === content) throw new EditApplyError("String not found in file. Failed to apply edit.");
+		return newString;
 	}
-	return edits;
+	const rep = (s: string, find: string) => (replaceAll ? s.replaceAll(find, () => newString) : s.replace(find, () => newString));
+	const updated =
+		newString === "" && !oldString.endsWith("\n") && content.includes(oldString + "\n") ? rep(content, oldString + "\n") : rep(content, oldString);
+	if (updated === content) throw new EditApplyError("String not found in file. Failed to apply edit.");
+	return updated;
+}
+
+function addBomLike(original: string | null | undefined, next: string): string {
+	return next !== "" && original?.charCodeAt(0) === 0xfeff && next.charCodeAt(0) !== 0xfeff ? `﻿${next}` : next;
+}
+
+// ---------------------------------------------------------------------------------------------
+// "File does not exist" suggestions
+// ---------------------------------------------------------------------------------------------
+
+async function exists(p: string): Promise<boolean> {
+	try {
+		await stat(p);
+		return true;
+	} catch {
+		return false;
+	}
+}
+
+/** A path outside cwd (but under its parent) that exists when re-rooted under cwd. */
+async function suggestUnderCwd(absPath: string, cwd: string): Promise<string | undefined> {
+	const parent = dirname(cwd);
+	let p = absPath;
+	try {
+		p = join(await realpath(dirname(absPath)), basename(absPath));
+	} catch {}
+	const prefix = parent === sep ? sep : parent + sep;
+	if (!p.startsWith(prefix) || p.startsWith(cwd + sep) || p === cwd) return undefined;
+	const candidate = join(cwd, relative(parent, p));
+	return (await exists(candidate)) ? candidate : undefined;
+}
+
+const EXT_RE = /^(\.[\p{L}\p{N}_+~#-]{1,32})?$/u;
+
+/** A sibling with the same name but another extension. */
+async function suggestOtherExtension(absPath: string): Promise<string | undefined> {
+	try {
+		const dir = dirname(absPath);
+		const base = basename(absPath, extname(absPath));
+		const entries = await readdir(dir);
+		return entries.find((name) => EXT_RE.test(extname(name).normalize("NFC")) && basename(name, extname(name)) === base && join(dir, name) !== absPath);
+	} catch {
+		return undefined;
+	}
+}
+
+async function fileNotFoundMessage(absPath: string, cwd: string): Promise<string> {
+	let msg = `File does not exist. ${CWD_NOTE} ${cwd}.`;
+	const suggestion = (await suggestUnderCwd(absPath, cwd)) ?? (await suggestOtherExtension(absPath));
+	if (suggestion) msg += ` Did you mean ${suggestion}?`;
+	return msg;
+}
+
+function formatSize(bytes: number): string {
+	const units = ["bytes", "KB", "MB", "GB", "TB"];
+	let n = bytes;
+	let u = 0;
+	while (n >= 1024 && u < units.length - 1) {
+		n /= 1024;
+		u++;
+	}
+	return u === 0 ? `${bytes} bytes` : `${Number.isInteger(n) ? n : n.toFixed(1)}${units[u]}`;
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -249,87 +312,100 @@ export function registerEdit(pi: ExtensionAPI, cc: CCContext): void {
 		parameters: editSchema,
 		async execute(_toolCallId, params, signal, _onUpdate, ctx): Promise<AgentToolResult<EditToolDetails>> {
 			if (signal?.aborted) throw new Error("Operation aborted");
-			if (typeof params.file_path !== "string" || params.file_path.trim() === "") throw new Error("file_path is required.");
-			const edits = collectEdits(params);
-			const absPath = resolvePath(ctx?.cwd ?? process.cwd(), params.file_path);
+			const filePath = params.file_path;
+			const oldString = params.old_string;
+			const newStringIn = params.new_string;
+			const replaceAll = params.replace_all === true;
+			if (typeof filePath !== "string" || typeof oldString !== "string" || typeof newStringIn !== "string") {
+				throw new Error("file_path, old_string and new_string are required strings.");
+			}
+			const cwd = ctx?.cwd ?? process.cwd();
+			const absPath = resolvePath(cwd, filePath);
 
 			return withFileMutationQueue(absPath, async () => {
 				if (signal?.aborted) throw new Error("Operation aborted");
-
-				let fileExists = false;
+				// ---- validation (same order as Claude Code) ----
+				if (oldString === newStringIn) throw new Error("No changes to make: old_string and new_string are exactly the same.");
 				try {
 					const st = await stat(absPath);
-					if (st.isDirectory()) throw new Error(`${absPath} is a directory.`);
-					if (st.size > MAX_EDIT_FILE_BYTES) throw new Error(`File is too large to edit (${(st.size / 1024 / 1024).toFixed(1)}MB).`);
-					fileExists = true;
+					if (st.size > MAX_EDIT_FILE_BYTES) {
+						throw new Error(`File is too large to edit (${formatSize(st.size)}). Maximum editable file size is ${formatSize(MAX_EDIT_FILE_BYTES)}.`);
+					}
 				} catch (err: any) {
 					if (err?.code !== "ENOENT") throw err;
 				}
 
-				if (!fileExists && edits[0].old_string !== "") {
-					throw new Error(
-						`File does not exist: ${absPath}. To create a new file, use the Write tool (or Edit with an empty old_string).`,
-					);
-				}
-				if (fileExists) {
-					const problem = cc.fileState.checkCanModify(absPath);
-					if (problem) throw new Error(problem);
-				}
-
-				let bom = "";
-				let body = "";
-				if (fileExists) {
-					const raw = (await readFile(absPath, { signal })).toString("utf8");
-					if (raw.startsWith("﻿")) {
-						bom = "﻿";
-						body = raw.slice(1);
-					} else body = raw;
-				}
-
-				// Line endings: if the file is consistently CRLF, work in LF space and convert back.
-				// If it has no CR at all, normalize CRLF in the model's strings to LF.
-				// Mixed files are matched exactly as-is.
-				const isCrlf = body.includes("\r\n") && !/(^|[^\r])\n/.test(body);
-				const normalizeEol = isCrlf || !body.includes("\r");
-				const toLf = (s: string) => (normalizeEol ? s.replace(/\r\n/g, "\n") : s);
-				const work = toLf(body);
-				const normalizedEdits = edits.map((e) => ({ ...e, old_string: toLf(e.old_string), new_string: toLf(e.new_string) }));
-
-				let result: { content: string; replacements: number };
+				let existing: Awaited<ReturnType<typeof readExistingText>>;
 				try {
-					result = applyEdits(work, normalizedEdits, fileExists);
+					existing = await readExistingText(absPath);
+				} catch (err: any) {
+					throw new Error(`Error calling tool (Edit): ${err?.message ?? String(err)}`);
+				}
+				const rec = cc.fileState.get(absPath);
+
+				if (existing === null) {
+					if (oldString !== "") throw new Error(await fileNotFoundMessage(absPath, cwd));
+				} else if (oldString === "") {
+					if (stripBom(existing.content).trim() !== "") throw new Error("Cannot create new file - file already exists.");
+				} else {
+					if (absPath.endsWith(".ipynb")) throw new Error(NOT_A_NOTEBOOK_TOOL);
+					const text = stripBom(existing.content);
+					if (rec && cc.fileState.isStale(absPath, text) && editOutcome(text, oldString, replaceAll) !== "applies") {
+						throw new Error(FILE_MODIFIED_SINCE_READ);
+					}
+					if (existing.notText) throw new Error(notTextMessage(existing.notText));
+					const actual = findActualString(text, oldString);
+					if (!actual) {
+						const note = ESCAPE_RE.test(oldString) || NON_ASCII_RE.test(oldString) ? ESCAPE_NOTE : "";
+						throw new Error(`String to replace not found in file.\nString: ${oldString}${note}`);
+					}
+					const matches = text.split(actual).length - 1;
+					if (matches > 1 && !replaceAll) {
+						throw new Error(
+							`Found ${matches} matches of the string to replace, but replace_all is false. To replace all occurrences, set replace_all to true. To replace only one occurrence, please provide more context to uniquely identify the instance.\nString: ${oldString}`,
+						);
+					}
+				}
+
+				// ---- apply ----
+				const fileExists = existing !== null;
+				const content = existing?.content ?? "";
+				let staleRecovered = false;
+				if (fileExists && rec && cc.fileState.isStale(absPath, content)) {
+					if (editOutcome(content, oldString, replaceAll) !== "applies") throw new Error(FILE_CONTENT_CHANGED);
+					staleRecovered = true;
+				}
+				if (existing?.notText) throw new Error(notTextMessage(existing.notText));
+				const actualOld = findActualString(content, oldString) || oldString;
+				let newString = preserveEscapeStyle(oldString, actualOld, preserveQuoteStyle(oldString, actualOld, newStringIn));
+				if (oldString === "") newString = addBomLike(content, newString);
+				let updated: string;
+				try {
+					updated = applyEdit(content, actualOld, newString, replaceAll);
 				} catch (err) {
-					if (err instanceof EditError) throw new Error(err.message);
+					if (err instanceof EditApplyError) throw new Error(err.message);
 					throw err;
 				}
-				if (fileExists && result.content === work) {
-					throw new Error("Original and edited file match exactly. Failed to apply edit.");
-				}
+				const contentNotInModelContext =
+					fileExists && (!FileStateTracker.inModelContext(rec) || staleRecovered || !FileStateTracker.sameContent(rec!, content));
 
-				const finalText = bom + (isCrlf ? result.content.replace(/\n/g, "\r\n") : result.content);
-				const data = Buffer.from(finalText, "utf8");
 				if (signal?.aborted) throw new Error("Operation aborted");
-				if (!fileExists) await mkdir(dirname(absPath), { recursive: true });
-				await writeFile(absPath, data);
-				cc.fileState.recordWrite(absPath, data);
+				await writeText(absPath, updated, existing?.encoding ?? "utf8", existing?.lineEndings ?? "LF", !fileExists);
+				cc.fileState.recordWrite(absPath, updated, { contentNotInModelContext, truncated: fileExists && rec?.truncated === true });
 
-				const { snippet, firstChangedLine } = buildSnippet(work, result.content);
-				let text: string;
-				if (!fileExists) {
-					text = `File created successfully at: ${absPath}`;
-				} else {
-					text = `The file ${absPath} has been updated.`;
-					if (edits.length > 1) text += ` Applied ${edits.length} edits (${result.replacements} replacement${result.replacements === 1 ? "" : "s"}).`;
-					else if (edits[0].replace_all) text += ` All ${result.replacements} occurrence${result.replacements === 1 ? "" : "s"} of the string were successfully replaced.`;
-					text += snippet
-						? ` Here's the result of running \`cat -n\` on a snippet of the edited file:\n${snippet}`
-						: " The file is now empty.";
-				}
+				const suffix = staleRecovered ? STALE_RECOVERED_NOTE : contentNotInModelContext ? "" : FILE_STATE_CURRENT_NOTE;
+				const text = replaceAll
+					? `The file ${filePath} has been updated. All occurrences were successfully replaced.${suffix}`
+					: `The file ${filePath} has been updated successfully.${suffix}`;
 				return {
 					content: [{ type: "text", text }],
-					details: { filePath: absPath, created: !fileExists, replacements: result.replacements, firstChangedLine },
+					details: { filePath: absPath, oldString: actualOld, newString: newStringIn, originalFile: fileExists ? content : null, replaceAll, created: !fileExists },
 				};
 			});
 		},
 	});
+}
+
+function stripBom(s: string): string {
+	return s.charCodeAt(0) === 0xfeff ? s.slice(1) : s;
 }

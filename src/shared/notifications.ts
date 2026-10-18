@@ -60,7 +60,14 @@ export class NotificationQueue {
 		this.pi.on("tool_result", async (event) => {
 			if (this.pending.length === 0) return undefined;
 			const text = this.pending.splice(0).join("\n\n");
-			return { content: [...(event.content ?? []), { type: "text", text: `\n\n${text}` }] };
+			// Claude Code appends the reminder to the result text after a blank line
+			const content = [...(event.content ?? [])];
+			const lastText = content.map((c) => c.type).lastIndexOf("text");
+			if (lastText >= 0) {
+				const block = content[lastText] as { type: "text"; text: string };
+				content[lastText] = { ...block, text: `${block.text}\n\n${text}` };
+			} else content.push({ type: "text", text });
+			return { content };
 		});
 	}
 

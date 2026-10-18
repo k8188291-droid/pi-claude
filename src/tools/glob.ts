@@ -1,18 +1,21 @@
-import { statSync } from "node:fs";
-import { resolve } from "node:path";
+import { lstat, stat } from "node:fs/promises";
+import { basename, dirname, isAbsolute, join, resolve, sep } from "node:path";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
-import { glob } from "glob";
 import { Type, type Static } from "typebox";
 import type { CCContext } from "../shared/context.js";
 import { resolvePath } from "../shared/paths.js";
 import { textResult } from "../shared/text.js";
+import { displayPath, missingPathMessage, runRipgrep, splitNullOutput } from "./grep.js";
 
 export const GLOB_TOOL_NAME = "Glob";
 export const GLOB_MAX_RESULTS = 100;
-export const GLOB_TRUNCATION_NOTE = "(Results are truncated. Consider using a more specific path or pattern.)";
 
-const DESCRIPTION =
-	'Fast file pattern matching. Supports glob patterns like "**/*.js" or "src/**/*.ts". Returns matching file paths sorted by modification time (most recently modified first).';
+// Mirrors Claude Code's Glob tool description verbatim.
+const DESCRIPTION = `- Fast file pattern matching tool that works with any codebase size
+- Supports glob patterns like "**/*.js" or "src/**/*.ts"
+- Returns matching file paths sorted by modification time
+- Use this tool when you need to find files by name patterns
+- When you are doing an open ended search that may require multiple rounds of globbing and grepping, use the Agent tool instead (if available)`;
 
 const globSchema = Type.Object({
 	pattern: Type.String({ description: "The glob pattern to match files against" }),
@@ -26,28 +29,76 @@ const globSchema = Type.Object({
 
 export type GlobParams = Static<typeof globSchema>;
 
+/** Same shape as Claude Code's Glob output. */
 export interface GlobDetails {
-	/** Total number of matching files (before truncation). */
-	numFiles: number;
-	truncated: boolean;
 	durationMs: number;
+	/** Number of file paths returned (after truncation). */
+	numFiles: number;
+	filenames: string[];
+	truncated: boolean;
+	/** Total number of matching files before truncation. */
+	totalMatches: number;
+	countIsComplete: boolean;
+}
+
+/** Claude Code's truncation line. */
+export function globTruncationNote(shown: number, total: number): string {
+	return `(Showing ${shown} of ${total} matching files; ${total - shown} more are not listed. Narrow the pattern or path to see the rest.)`;
+}
+
+function envFlag(name: string, dflt: boolean): boolean {
+	const v = process.env[name];
+	if (v === undefined || v === "") return dflt;
+	return ["1", "true", "yes", "on"].includes(v.trim().toLowerCase());
 }
 
 /**
- * Directories skipped by default because they are almost never what the model wants and can be huge.
- * Each is only skipped when the pattern does not itself mention that directory name as a path segment
- * (e.g. "node_modules/foo/**" or "**\/.git/config" still work).
- * .gitignore files are NOT consulted (plain glob semantics, like Claude Code's Glob), so build output
- * and other ignored files are still matched; dotfiles are included.
+ * An absolute pattern is split into its literal base directory and the rest
+ * ("/repo/src/**\/*.ts" → "/repo/src" + "**\/*.ts"); the base directory replaces `path`.
  */
-export const GLOB_DEFAULT_IGNORED_DIRS = ["node_modules", ".git", ".svn", ".hg", ".jj", ".sl", ".bzr"];
-
-function patternMentionsDir(pattern: string, dir: string): boolean {
-	return pattern.split(/[\\/]/).some((seg) => seg === dir);
+export function splitAbsolutePattern(pattern: string): { baseDir: string; relativePattern: string } | null {
+	if (!isAbsolute(pattern)) return null;
+	const m = /[*?[{]/.exec(pattern);
+	if (!m) return { baseDir: dirname(pattern), relativePattern: basename(pattern) };
+	const literal = pattern.slice(0, m.index);
+	const cut = Math.max(literal.lastIndexOf("/"), literal.lastIndexOf(sep));
+	if (cut === -1) return null;
+	let baseDir = literal.slice(0, cut);
+	if (baseDir === "" && cut === 0) baseDir = "/";
+	if (!baseDir) return null;
+	return { baseDir, relativePattern: pattern.slice(cut + 1) };
 }
 
-export function defaultIgnores(pattern: string): string[] {
-	return GLOB_DEFAULT_IGNORED_DIRS.filter((d) => !patternMentionsDir(pattern, d)).map((d) => `**/${d}/**`);
+/**
+ * When the pattern repeats the tail of the search directory ("src/**\/*.ts" searched in ".../src"),
+ * return the pattern anchored without that prefix ("/**\/*.ts"); otherwise the pattern unchanged.
+ */
+export function stripRepeatedDirPrefix(pattern: string, searchDir: string): string {
+	const segs = pattern.split("/");
+	let literal = 0;
+	while (literal < segs.length - 1 && segs[literal] !== "" && !/[*?[\]{}!]/.test(segs[literal])) literal++;
+	const dirSegs = searchDir.split(/[\\/]+/).filter(Boolean);
+	for (let n = literal; n > 0; n--) {
+		const head = segs.slice(0, n);
+		const tail = dirSegs.slice(-n);
+		if (tail.length === n && head.every((s, i) => s === tail[i])) return "/" + segs.slice(n).join("/");
+	}
+	return pattern;
+}
+
+/** True when every segment exists under `dir` as a real (non-symlink) directory. */
+async function prefixIsRealDir(dir: string, segs: string[]): Promise<boolean> {
+	let p = dir;
+	for (const s of segs) {
+		p = join(p, s);
+		try {
+			const st = await lstat(p);
+			if (!st.isDirectory() || st.isSymbolicLink()) return false;
+		} catch {
+			return false;
+		}
+	}
+	return segs.length > 0;
 }
 
 export async function executeGlob(
@@ -56,49 +107,60 @@ export async function executeGlob(
 	signal?: AbortSignal,
 ): Promise<{ text: string; details: GlobDetails }> {
 	const start = Date.now();
-	if (typeof params.pattern !== "string" || params.pattern.trim() === "") {
-		throw new Error("pattern must be a non-empty string");
-	}
+	if (typeof params.pattern !== "string") throw new Error("pattern must be a string");
 	if (signal?.aborted) throw new Error("Operation aborted");
 
-	// Some models pass the literal strings "undefined"/"null" despite instructions; treat as omitted.
-	const rawPath = params.path && params.path !== "undefined" && params.path !== "null" ? params.path : undefined;
-	const searchDir = rawPath ? resolvePath(cwd, rawPath) : resolve(cwd);
-	let st;
+	const abs = splitAbsolutePattern(params.pattern);
+	const searchDir = abs ? resolve(abs.baseDir) : params.path ? resolvePath(cwd, params.path) : resolve(cwd);
+
+	// The path parameter is validated only when it is the directory searched.
+	if (params.path && searchDir === resolvePath(cwd, params.path)) {
+		let st;
+		try {
+			st = await stat(searchDir);
+		} catch {
+			throw new Error(missingPathMessage("Directory", params.path, searchDir, cwd));
+		}
+		if (!st.isDirectory()) throw new Error(`Path is not a directory: ${params.path}`);
+	}
+
+	let pattern = abs ? abs.relativePattern : params.pattern;
+	if (!abs) {
+		const stripped = stripRepeatedDirPrefix(pattern, searchDir);
+		if (stripped !== pattern) {
+			const restSegs = stripped.replace(/^\//, "").split("/").length;
+			const segs = pattern.split("/");
+			if (!(await prefixIsRealDir(searchDir, segs.slice(0, Math.max(1, segs.length - restSegs))))) pattern = stripped;
+		}
+	}
+
+	const details: GlobDetails = { durationMs: 0, numFiles: 0, filenames: [], truncated: false, totalMatches: 0, countIsComplete: true };
+	let isDir = false;
 	try {
-		st = statSync(searchDir);
+		isDir = (await stat(searchDir)).isDirectory();
 	} catch {
-		throw new Error(`Directory does not exist: ${rawPath ?? searchDir}. Current working directory: ${cwd}.`);
+		details.durationMs = Date.now() - start;
+		return { text: "No files found", details };
 	}
-	if (!st.isDirectory()) throw new Error(`Path is not a directory: ${rawPath ?? searchDir}`);
 
-	let matches;
-	try {
-		matches = await glob(params.pattern, {
-			cwd: searchDir,
-			withFileTypes: true,
-			stat: true,
-			nodir: true,
-			dot: true,
-			follow: false,
-			ignore: defaultIgnores(params.pattern),
-			signal,
-		});
-	} catch (err) {
-		if (signal?.aborted) throw new Error("Operation aborted");
-		throw err;
-	}
+	const args = ["--files", "--null", "--glob", pattern, "--sort=modified"];
+	if (envFlag("CLAUDE_CODE_GLOB_NO_IGNORE", true)) args.push("--no-ignore");
+	if (envFlag("CLAUDE_CODE_GLOB_HIDDEN", true)) args.push("--hidden");
+	args.push(isDir ? "." : searchDir);
+	const run = await runRipgrep(args, isDir ? searchDir : dirname(searchDir), signal);
 	if (signal?.aborted) throw new Error("Operation aborted");
 
-	const files = matches.map((p) => ({ path: p.fullpath(), mtime: p.mtimeMs ?? 0 }));
-	files.sort((a, b) => b.mtime - a.mtime || a.path.localeCompare(b.path));
-
-	const truncated = files.length > GLOB_MAX_RESULTS;
-	const shown = files.slice(0, GLOB_MAX_RESULTS).map((f) => f.path);
-	const details: GlobDetails = { numFiles: files.length, truncated, durationMs: Date.now() - start };
+	const files = splitNullOutput(run.lines, "files_with_matches").map((p) =>
+		isDir ? join(searchDir, p.startsWith("./") ? p.slice(2) : p) : p,
+	);
+	const shown = files.slice(0, GLOB_MAX_RESULTS).map((f) => displayPath(cwd, f));
+	details.filenames = shown;
+	details.numFiles = shown.length;
+	details.truncated = files.length > GLOB_MAX_RESULTS;
+	details.totalMatches = files.length;
+	details.durationMs = Date.now() - start;
 	if (shown.length === 0) return { text: "No files found", details };
-	let text = shown.join("\n");
-	if (truncated) text += `\n${GLOB_TRUNCATION_NOTE}`;
+	const text = [...shown, ...(details.truncated ? [globTruncationNote(shown.length, files.length)] : [])].join("\n");
 	return { text, details };
 }
 
@@ -107,7 +169,7 @@ export function registerGlob(pi: ExtensionAPI, _cc: CCContext): void {
 		name: GLOB_TOOL_NAME,
 		label: "Glob",
 		description: DESCRIPTION,
-		promptSnippet: 'Find files by glob pattern (e.g. "**/*.ts"), newest first',
+		promptSnippet: 'Find files by glob pattern (e.g. "**/*.ts"), oldest first',
 		parameters: globSchema,
 		async execute(_toolCallId, params, signal, _onUpdate, ctx) {
 			const { text, details } = await executeGlob(params, ctx.cwd, signal);

@@ -1,12 +1,16 @@
-import { readFileSync, utimesSync, writeFileSync, existsSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, utimesSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import type { ExtensionAPI, ToolDefinition } from "@earendil-works/pi-coding-agent";
 import { beforeEach, describe, expect, it } from "vitest";
 import { createCCContext, type CCContext } from "../src/shared/context.js";
-import { applyEdits, buildSnippet, normalizeQuotes, preserveQuoteStyle, registerEdit } from "../src/tools/edit.js";
+import { applyEdit, editOutcome, findActualString, normalizeQuotes, preserveEscapeStyle, preserveQuoteStyle, registerEdit } from "../src/tools/edit.js";
 import { registerRead } from "../src/tools/read.js";
 import { registerWrite } from "../src/tools/write.js";
 import { captureTools, createTestSession, fakeCtx, fauxAssistantMessage, fauxToolCall, resultText, tempDir } from "./helpers.js";
+
+const CURRENT = " (file state is current in your context — no need to Read it back)";
+const STALE_NOTE =
+	" (note: the file had been modified on disk since you last read it — the edit applied cleanly, but the file contains other changes not in your context. Read it before edits that depend on surrounding content.)";
 
 let dir: string;
 let cc: CCContext;
@@ -15,11 +19,22 @@ const call = (name: string, params: any, signal?: AbortSignal) =>
 	tools.get(name)!.execute("id", params, signal, undefined, fakeCtx(dir)) as Promise<any>;
 const edit = (params: any) => call("Edit", params);
 
-async function fileRead(name: string, content: string | Buffer): Promise<string> {
+function file(name: string, content: string | Buffer): string {
 	const p = join(dir, name);
 	writeFileSync(p, content);
+	return p;
+}
+
+async function fileRead(name: string, content: string | Buffer): Promise<string> {
+	const p = file(name, content);
 	await call("Read", { file_path: p });
 	return p;
+}
+
+/** Change a file behind the tools' back, with an mtime clearly after the recorded one. */
+function externalWrite(p: string, content: string): void {
+	writeFileSync(p, content);
+	utimesSync(p, new Date(), new Date(Date.now() + 5000));
 }
 
 beforeEach(() => {
@@ -33,11 +48,12 @@ beforeEach(() => {
 });
 
 describe("Edit schema", () => {
-	it("has Claude Code params plus edits", () => {
+	it("matches Claude Code's schema", () => {
 		const params = tools.get("Edit")!.parameters as any;
-		expect(Object.keys(params.properties).sort()).toEqual(["edits", "file_path", "new_string", "old_string", "replace_all"]);
-		expect(params.required).toEqual(["file_path"]);
-		expect(params.properties.replace_all.default).toBe(false);
+		expect(Object.keys(params.properties)).toEqual(["file_path", "old_string", "new_string", "replace_all"]);
+		expect(params.required).toEqual(["file_path", "old_string", "new_string"]);
+		expect(params.properties.replace_all).toMatchObject({ default: false, description: "Replace all occurrences of old_string (default false)" });
+		expect(tools.get("Edit")!.description).toMatch(/^Performs exact string replacements in files\.\n\nUsage:/);
 	});
 });
 
@@ -45,191 +61,184 @@ describe("pure helpers", () => {
 	it("normalizes quotes", () => {
 		expect(normalizeQuotes("“hi” ‘x’")).toBe(`"hi" 'x'`);
 	});
+	it("finds the file's spelling of old_string", () => {
+		expect(findActualString("a “b” c", 'a "b"')).toBe("a “b”");
+		expect(findActualString('x = "caf\\u00e9"', "café")).toBe("caf\\u00e9");
+		expect(findActualString("x = café", "caf\\u00e9")).toBe("café");
+		expect(findActualString("abc", "zzz")).toBeNull();
+	});
 	it("preserves curly quote style", () => {
 		expect(preserveQuoteStyle(`"a"`, "“a”", `"b" it's`)).toBe("“b” it's");
 		expect(preserveQuoteStyle(`'a'`, "‘a’", `'b' it's`)).toBe("‘b’ it’s");
 		expect(preserveQuoteStyle("same", "same", `"x"`)).toBe(`"x"`);
 	});
-	it("does not interpret $ patterns", () => {
-		expect(applyEdits("a b a", [{ old_string: "b", new_string: "$&$1$$" }], true).content).toBe("a $&$1$$ a");
-		expect(applyEdits("a b a", [{ old_string: "a", new_string: "$'", replace_all: true }], true).content).toBe("$' b $'");
+	it("preserves \\u escape style", () => {
+		expect(preserveEscapeStyle("café", "caf\\u00e9", "naïve")).toBe("na\\u00efve");
+		expect(preserveEscapeStyle("caf\\u00e9", "café", "na\\u00efve")).toBe("naïve");
 	});
-	it("builds snippets around the change", () => {
-		const before = Array.from({ length: 20 }, (_, i) => `l${i + 1}`).join("\n") + "\n";
-		const after = before.replace("l10\n", "CHANGED\n");
-		const { snippet, firstChangedLine } = buildSnippet(before, after);
-		expect(firstChangedLine).toBe(10);
-		expect(snippet.split("\n")[0]).toBe("     6\tl6");
-		expect(snippet).toContain("    10\tCHANGED");
-		expect(snippet.split("\n").at(-1)).toBe("    14\tl14");
-		expect(buildSnippet("x", "").snippet).toBe("");
+	it("classifies outcomes", () => {
+		expect(editOutcome("a a", "a", false)).toBe("ambiguous");
+		expect(editOutcome("a a", "a", true)).toBe("applies");
+		expect(editOutcome("a", "", false)).toBe("no_match");
+	});
+	it("does not interpret $ patterns", () => {
+		expect(applyEdit("a b a", "b", "$&$1$$")).toBe("a $&$1$$ a");
+		expect(applyEdit("a b a", "a", "$'", true)).toBe("$' b $'");
+	});
+	it("removes the newline of a deleted line", () => {
+		expect(applyEdit("keep\ndrop\nend\n", "drop", "")).toBe("keep\nend\n");
+		expect(applyEdit("first\nlast", "last", "")).toBe("first\n");
 	});
 });
 
 describe("Edit", () => {
-	it("replaces a unique string and returns a numbered snippet", async () => {
-		const p = await fileRead("a.ts", "const a = 1;\nconst b = 2;\nconst c = 3;\n");
+	it("replaces a unique string; no snippet, file-state note after a full read", async () => {
+		const p = await fileRead("a.ts", "const a = 1;\nconst b = 2;\n");
 		const r = await edit({ file_path: p, old_string: "const b = 2;", new_string: "const b = 42;" });
-		expect(readFileSync(p, "utf8")).toBe("const a = 1;\nconst b = 42;\nconst c = 3;\n");
-		const text = resultText(r);
-		expect(text).toContain(`The file ${p} has been updated.`);
-		expect(text).toContain("cat -n");
-		expect(text).toContain("     2\tconst b = 42;");
-		expect(text).toContain("     1\tconst a = 1;");
-		expect(r.details).toMatchObject({ created: false, replacements: 1, firstChangedLine: 2 });
+		expect(readFileSync(p, "utf8")).toBe("const a = 1;\nconst b = 42;\n");
+		expect(resultText(r)).toBe(`The file ${p} has been updated successfully.${CURRENT}`);
+		expect(r.details).toMatchObject({ created: false, replaceAll: false, originalFile: "const a = 1;\nconst b = 2;\n" });
 	});
 
-	it("requires a prior read", async () => {
-		const p = join(dir, "u.txt");
-		writeFileSync(p, "abc");
-		await expect(edit({ file_path: p, old_string: "b", new_string: "x" })).rejects.toThrow(/has not been read yet/);
-	});
-
-	it("refuses when the file changed since read", async () => {
-		const p = await fileRead("c.txt", "abc");
-		writeFileSync(p, "abcd");
-		utimesSync(p, new Date(), new Date(Date.now() + 5000));
-		await expect(edit({ file_path: p, old_string: "b", new_string: "x" })).rejects.toThrow(/modified since read/);
-	});
-
-	it("allows consecutive edits without re-reading", async () => {
-		const p = await fileRead("c.txt", "abc");
-		await edit({ file_path: p, old_string: "b", new_string: "x" });
-		await edit({ file_path: p, old_string: "x", new_string: "y" });
+	it("edits a never-read file, without the file-state note (also on the next edit)", async () => {
+		const p = file("u.txt", "abc");
+		expect(resultText(await edit({ file_path: p, old_string: "b", new_string: "x" }))).toBe(`The file ${p} has been updated successfully.`);
+		expect(resultText(await edit({ file_path: p, old_string: "x", new_string: "y" }))).toBe(`The file ${p} has been updated successfully.`);
 		expect(readFileSync(p, "utf8")).toBe("ayc");
 	});
 
-	it("errors when old_string is not found", async () => {
-		const p = await fileRead("n.txt", "abc");
-		await expect(edit({ file_path: p, old_string: "zzz", new_string: "x" })).rejects.toThrow(/String to replace not found in file.\nString: zzz/);
+	it("keeps the note across consecutive edits after a read", async () => {
+		const p = await fileRead("c.txt", "abc");
+		await edit({ file_path: p, old_string: "b", new_string: "x" });
+		const r = await edit({ file_path: p, old_string: "x", new_string: "y" });
+		expect(resultText(r)).toBe(`The file ${p} has been updated successfully.${CURRENT}`);
 	});
 
-	it("errors on multiple matches without replace_all", async () => {
-		const p = await fileRead("m.txt", "foo\nfoo\nfoo\n");
-		await expect(edit({ file_path: p, old_string: "foo", new_string: "bar" })).rejects.toThrow(/Found 3 matches.*replace_all/s);
+	it("omits the note after a partial read", async () => {
+		const p = await fileRead("p.txt", "one\ntwo\nthree\n");
+		cc.fileState.recordRead(p, readFileSync(p), { partial: true, limit: 1 });
+		expect(resultText(await edit({ file_path: p, old_string: "three", new_string: "3" }))).toBe(`The file ${p} has been updated successfully.`);
+	});
+
+	it("rejects a stale file when the edit does not apply", async () => {
+		const p = await fileRead("s.txt", "abc");
+		externalWrite(p, "abcd");
+		await expect(edit({ file_path: p, old_string: "zzz", new_string: "x" })).rejects.toThrow(
+			"File has been modified since read, either by the user or by a linter. Read it again before attempting to write it.",
+		);
+		await expect(edit({ file_path: p, old_string: "x", new_string: "y" })).rejects.toThrow(/modified since read/);
+	});
+
+	it("applies to a stale file when the edit applies, with a note", async () => {
+		const p = await fileRead("s.txt", "abc\n");
+		externalWrite(p, "abc\nmore\n");
+		const r = await edit({ file_path: p, old_string: "abc", new_string: "xyz" });
+		expect(resultText(r)).toBe(`The file ${p} has been updated successfully.${STALE_NOTE}`);
+		expect(readFileSync(p, "utf8")).toBe("xyz\nmore\n");
+		// the model has not seen the rest of the file: no file-state note afterwards
+		expect(resultText(await edit({ file_path: p, old_string: "more", new_string: "less" }))).toBe(`The file ${p} has been updated successfully.`);
+	});
+
+	it("ignores an mtime change that left the content the same", async () => {
+		const p = await fileRead("t.txt", "abc");
+		externalWrite(p, "abc");
+		expect(resultText(await edit({ file_path: p, old_string: "b", new_string: "x" }))).toBe(`The file ${p} has been updated successfully.${CURRENT}`);
+	});
+
+	it("errors when old_string is not found", async () => {
+		const p = file("n.txt", "abc");
+		await expect(edit({ file_path: p, old_string: "zzz", new_string: "x" })).rejects.toThrow(/^String to replace not found in file.\nString: zzz$/);
+		await expect(edit({ file_path: p, old_string: "zzé", new_string: "x" })).rejects.toThrow(/String: zzé\n\(note: Edit also tried swapping \\uXXXX escapes/);
+	});
+
+	it("errors on multiple matches without replace_all, replaces all with it", async () => {
+		const p = file("m.txt", "foo\nfoo\nfoo\n");
+		await expect(edit({ file_path: p, old_string: "foo", new_string: "bar" })).rejects.toThrow(
+			"Found 3 matches of the string to replace, but replace_all is false. To replace all occurrences, set replace_all to true. To replace only one occurrence, please provide more context to uniquely identify the instance.\nString: foo",
+		);
 		expect(readFileSync(p, "utf8")).toBe("foo\nfoo\nfoo\n");
 		const r = await edit({ file_path: p, old_string: "foo", new_string: "bar", replace_all: true });
 		expect(readFileSync(p, "utf8")).toBe("bar\nbar\nbar\n");
-		expect(resultText(r)).toContain("All 3 occurrences");
-		expect(r.details.replacements).toBe(3);
+		expect(resultText(r)).toBe(`The file ${p} has been updated. All occurrences were successfully replaced.`);
 	});
 
-	it("errors when old_string equals new_string", async () => {
-		const p = await fileRead("s.txt", "abc");
-		await expect(edit({ file_path: p, old_string: "b", new_string: "b" })).rejects.toThrow(/No changes to make/);
+	it("errors when old_string equals new_string (even for a missing file)", async () => {
+		await expect(edit({ file_path: join(dir, "nope.txt"), old_string: "b", new_string: "b" })).rejects.toThrow(
+			"No changes to make: old_string and new_string are exactly the same.",
+		);
 	});
 
-	it("creates a new file with an empty old_string", async () => {
+	it("creates a new file (and parents) with an empty old_string", async () => {
 		const p = join(dir, "new", "dir", "f.txt");
 		const r = await edit({ file_path: p, old_string: "", new_string: "fresh\n" });
-		expect(resultText(r)).toBe(`File created successfully at: ${p}`);
+		expect(resultText(r)).toBe(`The file ${p} has been updated successfully.${CURRENT}`);
 		expect(readFileSync(p, "utf8")).toBe("fresh\n");
 		expect(r.details.created).toBe(true);
-		// and can be edited again immediately
-		await edit({ file_path: p, old_string: "fresh", new_string: "stale" });
-		expect(readFileSync(p, "utf8")).toBe("stale\n");
+		expect(resultText(await edit({ file_path: p, old_string: "fresh", new_string: "stale" }))).toBe(`The file ${p} has been updated successfully.${CURRENT}`);
 	});
 
-	it("refuses empty old_string on an existing non-empty file", async () => {
-		const p = await fileRead("x.txt", "content");
-		await expect(edit({ file_path: p, old_string: "", new_string: "y" })).rejects.toThrow(/file already exists/);
+	it("refuses empty old_string on an existing non-blank file, fills a blank one", async () => {
+		const p = file("x.txt", "content");
+		await expect(edit({ file_path: p, old_string: "", new_string: "y" })).rejects.toThrow("Cannot create new file - file already exists.");
+		const b = file("blank.txt", "  \n");
+		expect(resultText(await edit({ file_path: b, old_string: "", new_string: "now full" }))).toBe(`The file ${b} has been updated successfully.`);
+		expect(readFileSync(b, "utf8")).toBe("now full");
 	});
 
-	it("fills an existing empty file with an empty old_string", async () => {
-		const p = await fileRead("empty.txt", "");
-		await edit({ file_path: p, old_string: "", new_string: "now full" });
-		expect(readFileSync(p, "utf8")).toBe("now full");
-	});
-
-	it("errors on a missing file with non-empty old_string", async () => {
-		await expect(edit({ file_path: join(dir, "missing.txt"), old_string: "a", new_string: "b" })).rejects.toThrow(/does not exist/);
+	it("reports a missing file with the cwd and a similar name", async () => {
+		await expect(edit({ file_path: join(dir, "missing.txt"), old_string: "a", new_string: "b" })).rejects.toThrow(
+			`File does not exist. Note: your current working directory is ${dir}.`,
+		);
 		expect(existsSync(join(dir, "missing.txt"))).toBe(false);
+		file("nf.txt", "x");
+		await expect(edit({ file_path: join(dir, "nf.md"), old_string: "a", new_string: "b" })).rejects.toThrow(/ Did you mean nf\.txt\?$/);
 	});
 
-	it("preserves CRLF line endings", async () => {
+	it("refuses notebooks, binary and non-UTF-8 files", async () => {
+		const nb = file("n.ipynb", '{"cells":[]}');
+		await expect(edit({ file_path: nb, old_string: "cells", new_string: "x" })).rejects.toThrow("File is a Jupyter Notebook. Use the NotebookEdit to edit this file.");
+		const bin = file("b.dat", Buffer.from([0x61, 0, 0x62]));
+		await expect(edit({ file_path: bin, old_string: "a", new_string: "x" })).rejects.toThrow(/^File has NUL bytes in its first 8 KB/);
+		const latin = file("l.txt", Buffer.from([0x63, 0xe9, 0x0a]));
+		await expect(edit({ file_path: latin, old_string: "c", new_string: "x" })).rejects.toThrow(/^File is not valid UTF-8/);
+	});
+
+	it("errors on directories like Claude Code", async () => {
+		mkdirSync(join(dir, "d"));
+		await expect(edit({ file_path: join(dir, "d"), old_string: "a", new_string: "b" })).rejects.toThrow(
+			"Error calling tool (Edit): EISDIR: illegal operation on a directory, read",
+		);
+	});
+
+	it("echoes the file_path as given", async () => {
+		file("rel.txt", "abc");
+		expect(resultText(await edit({ file_path: "rel.txt", old_string: "b", new_string: "x" }))).toBe("The file rel.txt has been updated successfully.");
+	});
+
+	it("converts edits on CRLF files back to CRLF (also normalizing mixed files)", async () => {
 		const p = await fileRead("crlf.txt", "one\r\ntwo\r\nthree\r\n");
 		await edit({ file_path: p, old_string: "one\ntwo", new_string: "uno\ndos\nextra" });
 		expect(readFileSync(p, "utf8")).toBe("uno\r\ndos\r\nextra\r\nthree\r\n");
-		// model passing CRLF strings also works
-		await edit({ file_path: p, old_string: "dos\r\nextra", new_string: "DOS" });
-		expect(readFileSync(p, "utf8")).toBe("uno\r\nDOS\r\nthree\r\n");
+		await expect(edit({ file_path: p, old_string: "dos\r\nextra", new_string: "DOS" })).rejects.toThrow(/String to replace not found/);
+		const m = file("mixed.txt", "a\r\nb\r\nc\nd\r\n");
+		await edit({ file_path: m, old_string: "c", new_string: "C" });
+		expect(readFileSync(m, "utf8")).toBe("a\r\nb\r\nC\r\nd\r\n");
 	});
 
-	it("accepts CRLF strings on an LF file", async () => {
-		const p = await fileRead("lf.txt", "a\nb\nc\n");
-		await edit({ file_path: p, old_string: "a\r\nb", new_string: "x\r\ny" });
-		expect(readFileSync(p, "utf8")).toBe("x\ny\nc\n");
-	});
-
-	it("matches mixed line-ending files exactly", async () => {
-		const p = await fileRead("mixed.txt", "a\r\nb\nc\r\n");
-		await edit({ file_path: p, old_string: "b\nc", new_string: "B\nC" });
-		expect(readFileSync(p, "utf8")).toBe("a\r\nB\nC\r\n");
-	});
-
-	it("preserves a UTF-8 BOM", async () => {
-		const p = await fileRead("bom.txt", "﻿hello world\n");
+	it("preserves a UTF-8 BOM and UTF-16LE encoding", async () => {
+		const p = file("bom.txt", "﻿hello world\n");
 		await edit({ file_path: p, old_string: "world", new_string: "there" });
-		const buf = readFileSync(p);
-		expect([...buf.subarray(0, 3)]).toEqual([0xef, 0xbb, 0xbf]);
-		expect(buf.toString("utf8")).toBe("﻿hello there\n");
+		expect(readFileSync(p, "utf8")).toBe("﻿hello there\n");
+		const u = file("u16.txt", Buffer.concat([Buffer.from([0xff, 0xfe]), Buffer.from("hi\r\nthere\r\n", "utf16le")]));
+		await edit({ file_path: u, old_string: "there", new_string: "you" });
+		expect(readFileSync(u).toString("utf16le")).toBe("﻿hi\r\nyou\r\n");
 	});
 
 	it("falls back to curly-quote normalization and keeps the file's quote style", async () => {
-		const p = await fileRead("q.md", "He said “hello” and it’s fine.\n");
+		const p = file("q.md", "He said “hello” and it’s fine.\n");
 		await edit({ file_path: p, old_string: `said "hello" and it's`, new_string: `said "goodbye" and it's` });
 		expect(readFileSync(p, "utf8")).toBe("He said “goodbye” and it’s fine.\n");
-	});
-
-	it("applies multiple edits sequentially", async () => {
-		const p = await fileRead("multi.txt", "alpha\nbeta\ngamma\n");
-		const r = await edit({
-			file_path: p,
-			edits: [
-				{ old_string: "alpha", new_string: "ALPHA" },
-				{ old_string: "gamma", new_string: "delta" },
-			],
-		});
-		expect(readFileSync(p, "utf8")).toBe("ALPHA\nbeta\ndelta\n");
-		expect(resultText(r)).toContain("Applied 2 edits");
-		expect(r.details.replacements).toBe(2);
-	});
-
-	it("is atomic: a failing edit leaves the file unchanged", async () => {
-		const p = await fileRead("atomic.txt", "one two three");
-		await expect(
-			edit({ file_path: p, edits: [{ old_string: "one", new_string: "1" }, { old_string: "missing", new_string: "x" }] }),
-		).rejects.toThrow(/Edit 2 of 2: String to replace not found/);
-		expect(readFileSync(p, "utf8")).toBe("one two three");
-	});
-
-	it("rejects an old_string that is a substring of a previous new_string", async () => {
-		const p = await fileRead("sub.txt", "a b c");
-		await expect(
-			edit({ file_path: p, edits: [{ old_string: "a", new_string: "xyz" }, { old_string: "y", new_string: "Y" }] }),
-		).rejects.toThrow(/substring of a new_string from a previous edit/);
-	});
-
-	it("combines top-level old/new with edits", async () => {
-		const p = await fileRead("combo.txt", "a b c");
-		await edit({ file_path: p, old_string: "a", new_string: "A", edits: [{ old_string: "c", new_string: "C" }] });
-		expect(readFileSync(p, "utf8")).toBe("A b C");
-	});
-
-	it("validates missing params", async () => {
-		const p = await fileRead("v.txt", "abc");
-		await expect(edit({ file_path: p })).rejects.toThrow(/Missing old_string/);
-		await expect(edit({ file_path: p, old_string: "a" })).rejects.toThrow(/Both old_string and new_string/);
-		await expect(edit({ file_path: p, edits: [{ old_string: "a" }] })).rejects.toThrow(/edits\[0\]/);
-	});
-
-	it("handles deleting text and emptying a file", async () => {
-		const p = await fileRead("del.txt", "keep\nremove me\nkeep2\n");
-		await edit({ file_path: p, old_string: "remove me\n", new_string: "" });
-		expect(readFileSync(p, "utf8")).toBe("keep\nkeep2\n");
-		const r = await edit({ file_path: p, old_string: "keep\nkeep2\n", new_string: "" });
-		expect(readFileSync(p, "utf8")).toBe("");
-		expect(resultText(r)).toContain("now empty");
+		await expect(edit({ file_path: p, old_string: `"goodbye"`, new_string: "“goodbye”" })).rejects.toThrow("String not found in file. Failed to apply edit.");
 	});
 
 	it("serializes concurrent edits on the same file", async () => {
@@ -241,14 +250,10 @@ describe("Edit", () => {
 		]);
 		expect(readFileSync(p, "utf8")).toBe("A B C d");
 	});
-
-	it("errors on directories", async () => {
-		await expect(edit({ file_path: dir, old_string: "a", new_string: "b" })).rejects.toThrow(/is a directory/);
-	});
 });
 
 describe("end-to-end via faux model", () => {
-	it("Read then Edit then Write in a session", async () => {
+	it("Edit (never read), Read, Edit, Write in a session", async () => {
 		const cwd = tempDir("pi-cc-edit-e2e-");
 		const p = join(cwd, "file.txt");
 		writeFileSync(p, "hello world\n");
@@ -257,7 +262,7 @@ describe("end-to-end via faux model", () => {
 			responses: [
 				fauxAssistantMessage(fauxToolCall("Edit", { file_path: p, old_string: "world", new_string: "pi" }), { stopReason: "toolUse" }),
 				fauxAssistantMessage(fauxToolCall("Read", { file_path: p }), { stopReason: "toolUse" }),
-				fauxAssistantMessage(fauxToolCall("Edit", { file_path: p, old_string: "world", new_string: "pi" }), { stopReason: "toolUse" }),
+				fauxAssistantMessage(fauxToolCall("Edit", { file_path: p, old_string: "pi", new_string: "there" }), { stopReason: "toolUse" }),
 				fauxAssistantMessage(fauxToolCall("Write", { file_path: join(cwd, "new.txt"), content: "x" }), { stopReason: "toolUse" }),
 				fauxAssistantMessage("done"),
 			],
@@ -265,14 +270,15 @@ describe("end-to-end via faux model", () => {
 		await t.session.prompt("go");
 		const results = t.toolResults();
 		expect(results.map((r) => [r.toolName, r.isError])).toEqual([
-			["Edit", true],
+			["Edit", false],
 			["Read", false],
 			["Edit", false],
 			["Write", false],
 		]);
-		expect(results[0].text).toMatch(/has not been read yet/);
-		expect(results[1].text).toBe("     1\thello world");
-		expect(readFileSync(p, "utf8")).toBe("hello pi\n");
+		expect(results[0].text).toBe(`The file ${p} has been updated successfully.`);
+		expect(results[2].text).toBe(`The file ${p} has been updated successfully.${CURRENT}`);
+		expect(results[3].text).toBe(`File created successfully at: ${join(cwd, "new.txt")}${CURRENT}`);
+		expect(readFileSync(p, "utf8")).toBe("hello there\n");
 		expect(readFileSync(join(cwd, "new.txt"), "utf8")).toBe("x");
 		t.dispose();
 	});

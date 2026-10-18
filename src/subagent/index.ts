@@ -1,4 +1,4 @@
-import { randomBytes } from "node:crypto";
+import { appendFileSync, writeFileSync } from "node:fs";
 import type { AssistantMessage, Model } from "@earendil-works/pi-ai";
 import {
 	type AgentSession,
@@ -11,20 +11,64 @@ import {
 	SettingsManager,
 } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
+import { withDeferredExposure } from "../deferred-tools.js";
 import { createClaudeCodeSession } from "../sdk.js";
-import type { CCContext } from "../shared/context.js";
-import { sendReminder } from "../shared/reminders.js";
-import type { ClaudeCodeHostEvent, SubagentUsage } from "../shared/types.js";
-import { formatAgentList, loadAgentDefinitions, type SubagentDefinition } from "./agents.js";
+import { type BackgroundTask, newTaskId } from "../shared/background.js";
+import { type CCContext, createCCContext } from "../shared/context.js";
+import { formatTaskNotification } from "../shared/notifications.js";
+import { REMINDER_CUSTOM_TYPE, wrapReminder } from "../shared/reminders.js";
+import type { ClaudeCodeHostEvent, ClaudeCodeToolsOptions, SubagentUsage } from "../shared/types.js";
+import { type AgentEffort, agentAllowsTool, formatAgentListingReminder, loadAgentDefinitions, SUBAGENT_PROMPT_NOTES, type SubagentDefinition, sortedAgentNames } from "./agents.js";
 import { resolveSubagentModel } from "./models.js";
+import {
+	AGENT_NOTIFICATION_NOTE,
+	AGENT_TOOL_DESCRIPTION,
+	type AgentEndStatus,
+	agentNotificationSummary,
+	asyncLaunchText,
+	EFFORT_OPTIONS,
+	FORK_STARTED,
+	foregroundResultText,
+	forkDirective,
+	forkWorktreeNotice,
+	ISOLATION_OPTIONS,
+	MODEL_OPTIONS,
+	noSuchToolText,
+	PARAM_DESCRIPTIONS,
+	validateAgentInput,
+	type WorktreeInfo,
+} from "./prompt.js";
+import { type AgentWorktree, createAgentWorktree, finishAgentWorktree, gitRootOf } from "./worktree.js";
 
-export { BUILT_IN_AGENTS, loadAgentDefinitions, parseAgentMarkdown, type SubagentDefinition } from "./agents.js";
+export {
+	BUILT_IN_AGENTS,
+	formatAgentList,
+	formatAgentListingReminder,
+	loadAgentDefinitions,
+	parseAgentMarkdown,
+	type SubagentDefinition,
+} from "./agents.js";
 export { resolveSubagentModel } from "./models.js";
+export { AGENT_TOOL_DESCRIPTION, foregroundResultText, frameHandback, validateAgentInput } from "./prompt.js";
 
-export const TASK_TOOL_NAME = "Task";
+export const AGENT_TOOL_NAME = "Agent";
+/** @deprecated The tool is called `Agent` now (Claude Code renamed Task → Agent). */
+export const TASK_TOOL_NAME = AGENT_TOOL_NAME;
 const DEFAULT_AGENT_TYPE = "general-purpose";
-/** Finished child sessions kept around for `resume`. Oldest are disposed beyond this. */
-const MAX_RETAINED_AGENTS = 20;
+const FORK_AGENT_TYPE = "fork";
+
+/** Never available to subagents. */
+const SUBAGENT_EXCLUDED_TOOLS = ["AskUserQuestion", "EnterPlanMode", "ExitPlanMode"];
+/** Claude Code gives background agents no task-list tools. */
+const BACKGROUND_EXCLUDED_TOOLS = ["TaskCreate", "TaskGet", "TaskList", "TaskUpdate", "TodoWrite"];
+
+const FORK_DEFINITION: SubagentDefinition = {
+	name: FORK_AGENT_TYPE,
+	description: 'Fork — inherits full conversation context. Selected explicitly via subagent_type: "fork"; never the default.',
+	prompt: "",
+	tools: ["*"],
+	source: "built-in",
+};
 
 /**
  * Internal hooks (mainly for tests). `childExtensionFactories` are appended to every child session's
@@ -35,41 +79,31 @@ export const subagentInternals: { childExtensionFactories: ExtensionFactory[]; h
 	homeDir: undefined,
 };
 
-const TaskParams = Type.Object({
-	description: Type.String({ description: "A short (3-5 word) description of the task" }),
-	prompt: Type.String({ description: "The task for the agent to perform" }),
-	subagent_type: Type.Optional(
-		Type.String({ description: `The type of specialized agent to use for this task. Defaults to "${DEFAULT_AGENT_TYPE}".` }),
-	),
-	model: Type.Optional(
-		Type.String({
-			description:
-				'Optional model override for this agent: an alias ("sonnet", "opus", "haiku"), a model id, or "provider/model-id". Takes precedence over the agent definition\'s model. If omitted, uses the agent definition\'s model, or inherits from the parent.',
-		}),
-	),
-	run_in_background: Type.Optional(
-		Type.Boolean({
-			description: "Set to true to run this agent in the background. You will be notified automatically when it completes.",
-		}),
-	),
-	resume: Type.Optional(
-		Type.String({
-			description:
-				"Optional agent ID to resume from. If provided, the agent will continue from the previous execution transcript (subagent_type and model are ignored).",
-		}),
-	),
+const AgentParams = Type.Object({
+	description: Type.String({ description: PARAM_DESCRIPTIONS.description }),
+	prompt: Type.String({ description: PARAM_DESCRIPTIONS.prompt }),
+	subagent_type: Type.Optional(Type.String({ description: PARAM_DESCRIPTIONS.subagent_type })),
+	model: Type.Optional(Type.String({ description: PARAM_DESCRIPTIONS.model, enum: [...MODEL_OPTIONS] })),
+	effort: Type.Optional(Type.String({ description: PARAM_DESCRIPTIONS.effort, enum: [...EFFORT_OPTIONS] })),
+	run_in_background: Type.Optional(Type.Boolean({ description: PARAM_DESCRIPTIONS.run_in_background })),
+	isolation: Type.Optional(Type.String({ description: PARAM_DESCRIPTIONS.isolation, enum: [...ISOLATION_OPTIONS] })),
 });
 
-interface TaskInput {
+export interface AgentInput {
 	description: string;
 	prompt: string;
 	subagent_type?: string;
-	model?: string;
+	model?: (typeof MODEL_OPTIONS)[number];
+	effort?: AgentEffort;
 	run_in_background?: boolean;
-	resume?: string;
+	isolation?: (typeof ISOLATION_OPTIONS)[number];
+	/** Accepted and ignored (agent teams are not supported). */
+	name?: string;
+	team_name?: string;
+	mode?: string;
 }
 
-export interface TaskDetails {
+export interface AgentDetails {
 	agentId: string;
 	subagentType: string;
 	description: string;
@@ -79,53 +113,15 @@ export interface TaskDetails {
 	model?: string;
 	/** Set when the requested/defined model could not be resolved and the parent model was used. */
 	modelNote?: string;
+	/** Transcript file of a background agent. */
+	outputFile?: string;
+	worktree?: WorktreeInfo;
 	usage?: SubagentUsage;
 	toolUses?: number;
 	lastToolName?: string;
 }
-
-export function buildTaskDescription(defs: Map<string, SubagentDefinition>, knownTools?: ReadonlySet<string>): string {
-	return `Launch a new agent to handle complex, multi-step tasks autonomously.
-
-The ${TASK_TOOL_NAME} tool launches specialized agents that autonomously handle complex tasks. Each agent type has specific capabilities and tools available to it.
-
-Available agent types and the tools they have access to:
-${formatAgentList(defs, knownTools)}
-
-When using the ${TASK_TOOL_NAME} tool, specify a subagent_type parameter to select which agent type to use. If omitted, the ${DEFAULT_AGENT_TYPE} agent is used.
-
-When NOT to use the ${TASK_TOOL_NAME} tool:
-- If you want to read a specific file path, use the Read or Glob tool instead of the ${TASK_TOOL_NAME} tool, to find the match more quickly
-- If you are searching for a specific class definition like "class Foo", use the Glob tool instead, to find the match more quickly
-- If you are searching for code within a specific file or set of 2-3 files, use the Read tool instead of the ${TASK_TOOL_NAME} tool, to find the match more quickly
-- Other tasks that are not related to the agent descriptions above
-
-Usage notes:
-- Always include a short description (3-5 words) summarizing what the agent will do
-- Launch multiple agents concurrently whenever possible, to maximize performance; to do that, use a single message with multiple tool uses
-- When the agent is done, it will return a single message back to you along with its agent ID. The result returned by the agent is not visible to the user. To show the user the result, you should send a text message back to the user with a concise summary of the result.
-- You can optionally run agents in the background using the run_in_background parameter. When an agent runs in the background, you will be automatically notified when it completes — do NOT sleep, poll, or proactively check on its progress. Continue with other work or respond to the user instead.
-- Agents can be resumed using the \`resume\` parameter by passing the agent ID from a previous invocation. When resumed, the agent continues with its full previous context preserved. When NOT resuming, each invocation starts fresh and you should provide a detailed task description with all necessary context.
-- Provide clear, detailed prompts so the agent can work autonomously, and specify exactly what information the agent should return back to you in its final message.
-- The agent's outputs should generally be trusted
-- Clearly tell the agent whether you expect it to write code or just to do research (search, file reads, web fetches, etc.), since it is not aware of the user's intent
-- If the agent description mentions that it should be used proactively, then you should try your best to use it without the user having to ask for it first. Use your judgement.
-- If the user specifies that they want you to run agents "in parallel", you MUST send a single message with multiple ${TASK_TOOL_NAME} tool use content blocks. For example, if you need to launch both a code-reviewer agent and a test-runner agent in parallel, send a single message with both tool calls.
-
-Example usage:
-
-<example>
-user: "Where are API errors handled in this codebase?"
-assistant: I'll use the ${TASK_TOOL_NAME} tool with subagent_type "Explore" to search the codebase.
-<commentary>
-The question requires searching across many files with uncertain naming, so delegating to an exploration agent keeps the main context small.
-</commentary>
-</example>`;
-}
-
-function newAgentId(): string {
-	return `a${randomBytes(8).toString("hex")}`;
-}
+/** @deprecated Use AgentDetails. */
+export type TaskDetails = AgentDetails;
 
 function modelLabel(m: Model<any> | undefined): string | undefined {
 	return m ? `${m.provider}/${m.id}` : undefined;
@@ -135,12 +131,18 @@ function isAssistant(m: unknown): m is AssistantMessage {
 	return !!m && typeof m === "object" && (m as { role?: string }).role === "assistant";
 }
 
-function assistantText(m: AssistantMessage): string {
+function assistantText(m: AssistantMessage | undefined): string {
+	if (!m) return "";
 	return m.content
-		.filter((c): c is { type: "text"; text: string } => c.type === "text")
+		.filter((c): c is { type: "text"; text: string } => c.type === "text" && !!c.text)
 		.map((c) => c.text)
-		.join("\n")
-		.trim();
+		.join("\n");
+}
+
+function messageTokens(m: AssistantMessage): number {
+	const u = m.usage;
+	if (!u) return 0;
+	return u.totalTokens ?? (u.input ?? 0) + (u.output ?? 0) + (u.cacheRead ?? 0) + (u.cacheWrite ?? 0);
 }
 
 /** Sum usage over the assistant messages of one run. */
@@ -156,45 +158,41 @@ export function computeSubagentUsage(messages: readonly unknown[], durationMs: n
 		u.output += usage.output ?? 0;
 		u.cacheRead += usage.cacheRead ?? 0;
 		u.cacheWrite += usage.cacheWrite ?? 0;
-		u.totalTokens += usage.totalTokens ?? (usage.input ?? 0) + (usage.output ?? 0) + (usage.cacheRead ?? 0) + (usage.cacheWrite ?? 0);
+		u.totalTokens += messageTokens(m);
 		u.costTotal += usage.cost?.total ?? 0;
 	}
 	return u;
 }
 
-function usageBlock(u: SubagentUsage): string {
-	return `<usage>total_tokens: ${u.totalTokens}\ntool_uses: ${u.toolUses}\nduration_ms: ${u.durationMs}</usage>`;
+/** Claude Code reports a subagent's tokens as the context size of its last model call. */
+function lastCallTokens(messages: readonly unknown[]): number {
+	const last = [...messages].reverse().find((m) => isAssistant(m) && !!m.usage) as AssistantMessage | undefined;
+	return last ? messageTokens(last) : 0;
 }
 
-function escapeXmlText(s: string): string {
-	return s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+/**
+ * A sibling model of the parent's provider (e.g. the "opus" alias) is reached through the same
+ * endpoint as the parent model, so a parent configured with a custom baseUrl/proxy keeps using it.
+ */
+function sameEndpoint(model: Model<any> | undefined, parent: Model<any> | undefined): Model<any> | undefined {
+	if (!model || !parent || model === parent || model.provider !== parent.provider) return model;
+	if (model.baseUrl === parent.baseUrl && model.headers === parent.headers) return model;
+	return { ...model, baseUrl: parent.baseUrl, ...(parent.headers ? { headers: parent.headers } : {}) };
 }
 
-/** Identifies the current run of an agent; child host events are tagged with it. */
-interface RunTag {
-	agentId: string;
-	toolCallId: string;
-}
-
-interface AgentRecord {
-	tag: RunTag;
-	definition: SubagentDefinition;
-	description: string;
-	session: AgentSession;
-	model?: Model<any>;
-	modelNote?: string;
-	running: boolean;
-	background: boolean;
-	/** Aborts the current run. */
-	controller?: AbortController;
-	/** Set when the parent session shuts down: no notification is delivered. */
-	killed?: boolean;
-	finishedAt: number;
-}
-
-interface RunResult {
-	text: string;
-	usage: SubagentUsage;
+/**
+ * Rewrites pi's "Tool X not found" result for a call to an unavailable tool into Claude Code's
+ * wording. Installed in every subagent session and in the session that owns the Agent tool.
+ */
+export function registerUnknownToolErrors(pi: ExtensionAPI): void {
+	pi.on("message_end", (event) => {
+		const m = event.message as { role?: string; isError?: boolean; toolName?: string; content?: unknown };
+		if (m?.role !== "toolResult" || !m.isError || !Array.isArray(m.content) || m.content.length !== 1) return undefined;
+		const block = m.content[0] as { type?: string; text?: string };
+		const match = block?.type === "text" ? /^Tool (.+) not found$/.exec(block.text ?? "") : null;
+		if (!match || (m.toolName && match[1] !== m.toolName)) return undefined;
+		return { message: { ...(event.message as object), content: [{ type: "text", text: noSuchToolText(match[1]) }] } as typeof event.message };
+	});
 }
 
 class SubagentAbortedError extends Error {
@@ -203,9 +201,45 @@ class SubagentAbortedError extends Error {
 	}
 }
 
-export function registerTask(pi: ExtensionAPI, cc: CCContext): void {
-	const records = new Map<string, AgentRecord>();
-	let currentDescription: string | undefined;
+interface AgentRun {
+	agentId: string;
+	toolCallId: string;
+	definition: SubagentDefinition;
+	description: string;
+	session: AgentSession;
+	model?: Model<any>;
+	modelNote?: string;
+	background: boolean;
+	controller: AbortController;
+	running: boolean;
+	/** Messages before this run's prompt (a fork's inherited history). */
+	startIndex: number;
+	worktree?: AgentWorktree;
+	outputFile?: string;
+	task?: BackgroundTask;
+	/** Settles (never rejects) when the run has ended and been cleaned up. */
+	done?: Promise<void>;
+	/** Set by TaskStop ("parent") or when the parent session shuts down ("shutdown"). */
+	killedBy?: "parent" | "shutdown";
+}
+
+interface RunResult {
+	text: string;
+	usage: SubagentUsage;
+	totalTokens: number;
+}
+
+interface RegisterAgentInternalOptions {
+	/** The session is a forked worker: forking again is refused. */
+	inFork?: boolean;
+}
+
+/** Register Claude Code's Agent tool (subagents). */
+export function registerAgent(pi: ExtensionAPI, cc: CCContext, internal: RegisterAgentInternalOptions = {}): void {
+	const runs = new Map<string, AgentRun>();
+	let shuttingDown = false;
+	let lastListing: string | undefined;
+	const isSubagent = cc.options.isSubagent === true;
 
 	const loadDefs = (cwd: string) =>
 		loadAgentDefinitions({
@@ -217,68 +251,148 @@ export function registerTask(pi: ExtensionAPI, cc: CCContext): void {
 
 	const emit = (event: ClaudeCodeHostEvent) => cc.emit(event);
 
-	async function disposeRecord(rec: AgentRecord): Promise<void> {
-		records.delete(rec.tag.agentId);
+	function resolveAgentType(defs: Map<string, SubagentDefinition>, requested: string | undefined): SubagentDefinition {
+		const names = sortedAgentNames(defs);
+		if (!requested) {
+			const def = defs.get(DEFAULT_AGENT_TYPE);
+			if (!def) {
+				const avail = internal.inFork ? names : [FORK_AGENT_TYPE, ...names];
+				throw new Error(`subagent_type is required: the general-purpose agent is not available in this session. Available agents: ${avail.join(", ") || "none"}`);
+			}
+			return def;
+		}
+		const exact = defs.get(requested);
+		if (exact) return exact;
+		// Claude Code matches names ignoring case, whitespace, dashes and underscores
+		const norm = (s: string) => s.normalize("NFKC").toLowerCase().replace(/[\p{White_Space}\p{Pd}_]+/gu, "");
+		const matches = names.filter((n) => norm(n) === norm(requested));
+		if (matches.length === 1) return defs.get(matches[0])!;
+		if (matches.length > 1) throw new Error(`Agent type '${requested}' is ambiguous: ${matches.join(", ")}. Use the exact name: ${matches.join(" or ")}`);
+		throw new Error(`Agent type '${requested}' not found. Available agents: ${names.join(", ") || "none"}`);
+	}
+
+	async function disposeSession(session: AgentSession): Promise<void> {
 		try {
-			const runner = rec.session.extensionRunner;
+			const runner = session.extensionRunner;
 			if (runner?.hasHandlers("session_shutdown")) await runner.emit({ type: "session_shutdown", reason: "quit" });
 		} catch {
 			// ignore child extension errors during teardown
 		}
 		try {
-			rec.session.dispose();
+			session.dispose();
 		} catch {
 			// ignore
 		}
 	}
 
-	function evictFinished(): void {
-		const finished = [...records.values()].filter((r) => !r.running).sort((a, b) => a.finishedAt - b.finishedAt);
-		while (finished.length > MAX_RETAINED_AGENTS) void disposeRecord(finished.shift()!);
+	/** Seed a fork's session with the parent's conversation plus synthetic results for the pending tool calls. */
+	function forkSessionManager(ctx: ExtensionContext, cwd: string): SessionManager {
+		const sm = SessionManager.inMemory(cwd);
+		let messages: any[] = [];
+		try {
+			messages = [...((ctx.sessionManager as any).buildSessionProjection?.().messages ?? [])];
+		} catch {
+			messages = [];
+		}
+		messages = messages.filter((m) => m && m.role !== "system");
+		for (const m of messages) {
+			try {
+				sm.appendMessage(m);
+			} catch {
+				// not a message pi can replay; skip it
+			}
+		}
+		const last = messages.at(-1);
+		if (isAssistant(last)) {
+			for (const c of last.content) {
+				if (c.type !== "toolCall") continue;
+				sm.appendMessage({ role: "toolResult", toolCallId: c.id, toolName: c.name, content: [{ type: "text", text: FORK_STARTED }], isError: false, timestamp: Date.now() } as any);
+			}
+		}
+		return sm;
 	}
 
-	async function createChildSession(ctx: ExtensionContext, def: SubagentDefinition, model: Model<any> | undefined, tag: RunTag): Promise<AgentSession> {
-		const tools = def.tools ? [...def.tools] : undefined;
-		let deferredTools = cc.options.deferredTools;
-		if (tools) {
-			// keep only deferred tools the agent may use; tool_search must be allowed to load them
-			deferredTools = (cc.options.deferredTools ?? []).filter((n) => tools.includes(n));
-			if (deferredTools.length > 0) tools.push("tool_search");
+	async function createChildSession(
+		ctx: ExtensionContext,
+		def: SubagentDefinition,
+		model: Model<any> | undefined,
+		opts: { agentId: string; toolCallId: string; background: boolean; cwd: string; effort?: AgentEffort; fork: boolean },
+	): Promise<AgentSession> {
+		let parentActive: Set<string> | undefined;
+		if (opts.fork) {
+			try {
+				parentActive = new Set(pi.getActiveTools());
+			} catch {
+				parentActive = undefined;
+			}
 		}
-		let thinkingLevel: ReturnType<ExtensionAPI["getThinkingLevel"]> | undefined;
-		try {
-			thinkingLevel = pi.getThinkingLevel();
-		} catch {
-			thinkingLevel = undefined;
+		const allowed = (name: string): boolean => {
+			if (parentActive) return parentActive.has(name);
+			if (SUBAGENT_EXCLUDED_TOOLS.includes(name)) return false;
+			if (opts.background && BACKGROUND_EXCLUDED_TOOLS.includes(name)) return false;
+			return agentAllowsTool(def, name);
+		};
+		const deferredTools = opts.fork ? cc.options.deferredTools : (cc.options.deferredTools ?? []).filter(allowed);
+
+		let thinkingLevel: ReturnType<ExtensionAPI["getThinkingLevel"]> | undefined = opts.effort;
+		if (!thinkingLevel) {
+			try {
+				thinkingLevel = pi.getThinkingLevel();
+			} catch {
+				thinkingLevel = undefined;
+			}
 		}
+
+		const childOptions: ClaudeCodeToolsOptions = {
+			...cc.options,
+			isSubagent: true,
+			onAskUserQuestion: undefined,
+			sharedTaskStore: cc.taskStore,
+			deferredTools,
+			// child host events (todos, background shells, ...) are forwarded wrapped in subagent_event,
+			// so they never clobber the parent's state in the host UI
+			onEvent: (event) => emit({ type: "subagent_event", agentId: opts.agentId, parentToolCallId: opts.toolCallId, event }),
+		};
+		const factories: ExtensionFactory[] = [...(cc.options.subagentExtensions ?? []), ...subagentInternals.childExtensionFactories, (childPi) => registerUnknownToolErrors(childPi)];
+		if (allowed(AGENT_TOOL_NAME)) {
+			// subagents can launch their own agents (foreground by default)
+			factories.push((childPi) => {
+				const childCC = createCCContext(childOptions, childPi);
+				registerAgent(withDeferredExposure(childPi, new Set(deferredTools ?? [])), childCC, { inFork: internal.inFork || opts.fork });
+				(childCC.notifications as { attachToToolResults?: () => void }).attachToToolResults?.();
+			});
+		}
+
+		let parentPrompt = "";
+		if (opts.fork) {
+			try {
+				parentPrompt = ctx.getSystemPrompt();
+			} catch {
+				parentPrompt = "";
+			}
+		}
+		const systemPrompt = opts.fork ? parentPrompt : def.prompt ? `${def.prompt}\n\n${SUBAGENT_PROMPT_NOTES}` : SUBAGENT_PROMPT_NOTES;
+
 		const registry = ctx.modelRegistry;
 		const { session } = await createClaudeCodeSession({
-			cwd: ctx.cwd,
-			sessionManager: SessionManager.inMemory(ctx.cwd),
+			cwd: opts.cwd,
+			sessionManager: opts.fork ? forkSessionManager(ctx, opts.cwd) : SessionManager.inMemory(opts.cwd),
 			settingsManager: SettingsManager.inMemory(),
 			// share the parent's credentials and model catalog
 			modelRuntime: cc.options.modelRuntime ?? (registry as unknown as { runtime?: ModelRuntime } | undefined)?.runtime,
 			model,
 			thinkingLevel,
-			tools,
-			claudeCode: {
-				...cc.options,
-				isSubagent: true,
-				onAskUserQuestion: undefined,
-				deferredTools,
-				// child host events (todos, background shells, ...) are forwarded wrapped in subagent_event,
-				// so they never clobber the parent's state in the host UI
-				onEvent: (event) => emit({ type: "subagent_event", agentId: tag.agentId, parentToolCallId: tag.toolCallId, event }),
-			},
+			claudeCode: childOptions,
 			loader: {
 				// no disk-discovered pi extensions/templates/themes/skills in children; context files (AGENTS.md/CLAUDE.md) are kept
 				noExtensions: true,
 				noPromptTemplates: true,
 				noThemes: true,
 				noSkills: true,
-				systemPromptOverride: () => def.prompt,
+				...(opts.fork ? { noContextFiles: true } : {}),
+				systemPromptOverride: () => systemPrompt,
 				appendSystemPromptOverride: () => [],
-				extensionFactories: [...(cc.options.subagentExtensions ?? []), ...subagentInternals.childExtensionFactories],
+				extensionFactories: factories,
 			},
 		});
 		try {
@@ -287,30 +401,40 @@ export function registerTask(pi: ExtensionAPI, cc: CCContext): void {
 			session.dispose();
 			throw err;
 		}
-		if (tools && deferredTools && deferredTools.length > 0) {
-			// The `tools` allowlist keeps deferred tools registered but also activates them; deactivate
-			// them so they stay deferred until tool_search loads them, as in the parent.
-			const deferredSet = new Set(deferredTools);
-			session.setActiveToolsByName(session.getActiveToolNames().filter((n) => !deferredSet.has(n)));
-		}
+		// Deferred tools stay registered-but-inactive until tool_search loads them, as in the parent.
+		session.setActiveToolsByName(session.getActiveToolNames().filter((n) => n === "tool_search" || allowed(n)));
 		return session;
 	}
 
-	async function runAgent(
-		rec: AgentRecord,
-		prompt: string,
-		signal: AbortSignal,
-		onUpdate: AgentToolUpdateCallback<TaskDetails> | undefined,
-	): Promise<RunResult> {
-		const { session } = rec;
-		const { agentId, toolCallId: parentToolCallId } = rec.tag;
-		const subagentType = rec.definition.name;
-		rec.running = true;
-		emit({ type: "subagent_start", agentId, parentToolCallId, subagentType, description: rec.description, background: rec.background });
+	function startTranscript(run: AgentRun): () => void {
+		const file = run.outputFile;
+		if (!file) return () => {};
+		try {
+			writeFileSync(file, "");
+		} catch {
+			return () => {};
+		}
+		return run.session.subscribe((event) => {
+			if (event.type !== "message_end" || (event.message as { role?: string }).role === "system") return;
+			try {
+				appendFileSync(file, `${JSON.stringify({ type: (event.message as { role?: string }).role, agentId: run.agentId, timestamp: new Date().toISOString(), message: event.message })}\n`);
+			} catch {
+				// transcript is best-effort
+			}
+		});
+	}
+
+	async function runAgent(run: AgentRun, prompt: string, onUpdate: AgentToolUpdateCallback<AgentDetails> | undefined): Promise<RunResult> {
+		const { session, agentId, toolCallId: parentToolCallId } = run;
+		const signal = run.controller.signal;
+		const subagentType = run.definition.name;
+		run.running = true;
+		emit({ type: "subagent_start", agentId, parentToolCallId, subagentType, description: run.description, background: run.background });
 
 		const t0 = Date.now();
-		const startIndex = session.messages.length;
+		const startIndex = run.startIndex;
 		let toolUses = 0;
+		const stopTranscript = startTranscript(run);
 		const unsubscribe = session.subscribe((event) => {
 			emit({ type: "subagent_event", agentId, parentToolCallId, event });
 			if (event.type === "tool_execution_start" && onUpdate) {
@@ -318,15 +442,7 @@ export function registerTask(pi: ExtensionAPI, cc: CCContext): void {
 				try {
 					onUpdate({
 						content: [{ type: "text", text: `[${subagentType}] ${event.toolName} (${toolUses} tool use${toolUses === 1 ? "" : "s"})` }],
-						details: {
-							agentId,
-							subagentType,
-							description: rec.description,
-							status: "running",
-							background: rec.background,
-							toolUses,
-							lastToolName: event.toolName,
-						},
+						details: { agentId, subagentType, description: run.description, status: "running", background: run.background, toolUses, lastToolName: event.toolName },
 					});
 				} catch {
 					// progress is best-effort
@@ -350,181 +466,244 @@ export function registerTask(pi: ExtensionAPI, cc: CCContext): void {
 			if (!last) throw new Error("Subagent produced no response");
 			if (last.stopReason === "error") throw new Error(`Subagent failed: ${last.errorMessage ?? "unknown error"}`);
 			isError = false;
-			return { text: assistantText(last) || "(Subagent completed with no text output)", usage };
+			return { text: assistantText(last), usage, totalTokens: lastCallTokens(newMessages) };
 		} finally {
 			unsubscribe();
+			stopTranscript();
 			signal.removeEventListener("abort", onAbort);
-			rec.running = false;
-			rec.controller = undefined;
-			rec.finishedAt = Date.now();
+			run.running = false;
 			usage ??= computeSubagentUsage(session.messages.slice(startIndex), Date.now() - t0);
 			emit({ type: "subagent_end", agentId, parentToolCallId, subagentType, isError, usage });
-			evictFinished();
 		}
 	}
 
-	function deliverBackgroundResult(rec: AgentRecord, outcome: { ok: true; result: RunResult } | { ok: false; error: unknown }): void {
-		if (rec.killed) return; // parent session is shutting down
-		const status = outcome.ok ? "completed" : outcome.error instanceof SubagentAbortedError ? "killed" : "failed";
-		const summary = `Agent "${rec.description}" ${status === "completed" ? "completed" : status === "killed" ? "was stopped" : "failed"}`;
-		const body = outcome.ok
-			? `<result>\n${outcome.result.text}\n</result>\n${usageBlock(outcome.result.usage)}`
-			: `<error>${escapeXmlText(outcome.error instanceof Error ? outcome.error.message : String(outcome.error))}</error>`;
-		const text = `<task-notification>\n<task-id>${rec.tag.agentId}</task-id>\n<task-type>agent</task-type>\n<status>${status}</status>\n<summary>${escapeXmlText(summary)}</summary>\n${body}\n</task-notification>`;
-		try {
-			sendReminder(pi, text, {
-				wake: true,
-				details: { agentId: rec.tag.agentId, subagentType: rec.definition.name, status, usage: outcome.ok ? outcome.result.usage : undefined },
+	/** Last assistant text of a run that did not complete (for failed/killed notifications). */
+	function partialText(run: AgentRun): string {
+		const last = [...run.session.messages.slice(run.startIndex)].reverse().find(isAssistant);
+		return assistantText(last);
+	}
+
+	async function finishBackground(run: AgentRun, outcome: { ok: true; result: RunResult } | { ok: false; error: unknown }): Promise<void> {
+		const status: AgentEndStatus = outcome.ok ? "completed" : run.killedBy ? "killed" : "failed";
+		if (run.task && run.task.status === "running") run.task.status = status;
+		const result = outcome.ok ? outcome.result.text : partialText(run);
+		runs.delete(run.agentId);
+		const worktree = run.worktree ? finishAgentWorktree(run.worktree) : undefined;
+		const silent = run.killedBy === "shutdown" || shuttingDown;
+		if (!silent) {
+			const error = outcome.ok ? undefined : outcome.error instanceof Error ? outcome.error.message : String(outcome.error);
+			let text = formatTaskNotification({
+				taskId: run.agentId,
+				toolUseId: run.toolCallId,
+				outputFile: run.outputFile,
+				status,
+				summary: agentNotificationSummary(run.description, status, error),
+				note: AGENT_NOTIFICATION_NOTE,
+				result: result.trim() ? result : undefined,
+				usage: outcome.ok ? { subagentTokens: outcome.result.totalTokens, toolUses: outcome.result.usage.toolUses, durationMs: outcome.result.usage.durationMs } : undefined,
 			});
-		} catch {
-			// parent session already gone
+			if (worktree) {
+				const branch = worktree.worktreeBranch ? `<worktreeBranch>${worktree.worktreeBranch}</worktreeBranch>` : "";
+				text = text.replace("\n</task-notification>", `\n<worktree><worktreePath>${worktree.worktreePath}</worktreePath>${branch}</worktree>\n</task-notification>`);
+			}
+			if (status === "killed") {
+				// stopped by TaskStop: delivered after that tool call settles, never inside its result
+				setTimeout(() => {
+					if (!shuttingDown) cc.notifications.enqueue(text);
+				}, 0);
+			} else {
+				cc.notifications.enqueue(text);
+			}
 		}
+		await disposeSession(run.session);
+	}
+
+	async function stopRun(run: AgentRun): Promise<void> {
+		if (!run.running) return;
+		run.killedBy ??= "parent";
+		run.controller.abort();
+		await Promise.race([run.done, new Promise((r) => setTimeout(r, 10_000).unref?.())]);
 	}
 
 	async function execute(
 		toolCallId: string,
-		params: TaskInput,
+		params: AgentInput,
 		signal: AbortSignal | undefined,
-		onUpdate: AgentToolUpdateCallback<TaskDetails> | undefined,
+		onUpdate: AgentToolUpdateCallback<AgentDetails> | undefined,
 		ctx: ExtensionContext,
-	): Promise<{ content: Array<{ type: "text"; text: string }>; details: TaskDetails }> {
+	): Promise<{ content: Array<{ type: "text"; text: string }>; details: AgentDetails }> {
 		if (signal?.aborted) throw new SubagentAbortedError();
-		if (typeof params.prompt !== "string" || !params.prompt.trim()) throw new Error("prompt must be a non-empty string");
-		const background = params.run_in_background === true;
+		const invalid = validateAgentInput(params);
+		if (invalid) throw new Error(invalid);
 
-		let rec: AgentRecord;
-		if (params.resume) {
-			const existing = records.get(params.resume.trim());
-			if (!existing) throw new Error(`No agent found with ID "${params.resume}". It may have expired or never existed.`);
-			if (existing.running) throw new Error(`Agent ${existing.tag.agentId} is still running; wait for it to finish before resuming it.`);
-			rec = existing;
-			rec.tag.toolCallId = toolCallId;
-			rec.background = background;
-			if (params.description) rec.description = params.description;
-		} else {
-			const defs = loadDefs(ctx.cwd);
-			const type = params.subagent_type?.trim() || DEFAULT_AGENT_TYPE;
-			const def = defs.get(type);
-			if (!def) throw new Error(`Agent type '${type}' not found. Available agents: ${[...defs.keys()].join(", ")}`);
-			const resolved = params.model
+		const requested = params.subagent_type?.trim() || undefined;
+		const fork = requested === FORK_AGENT_TYPE && !loadDefs(ctx.cwd).has(FORK_AGENT_TYPE);
+		if (fork && internal.inFork) throw new Error("Fork is not available inside a forked worker. Complete your task directly using your tools.");
+		if (fork && params.isolation === "remote") {
+			throw new Error('Fork cannot use isolation: "remote" — a remote session cannot inherit the conversation context. Omit isolation (or use "worktree"), or spawn a named agent type for remote work.');
+		}
+		const def = fork ? FORK_DEFINITION : resolveAgentType(loadDefs(ctx.cwd), requested);
+
+		const resolved = fork
+			? ({ ok: true, model: ctx.model } as const)
+			: params.model
 				? resolveSubagentModel(params.model, ctx.modelRegistry, ctx.model, { strict: true })
 				: resolveSubagentModel(def.model, ctx.modelRegistry, ctx.model, { strict: false });
-			if (!resolved.ok) throw new Error(resolved.error);
-			const tag: RunTag = { agentId: newAgentId(), toolCallId };
-			const session = await createChildSession(ctx, def, resolved.model, tag);
-			rec = {
-				tag,
-				definition: def,
-				description: params.description,
-				session,
-				model: session.model ?? resolved.model,
-				modelNote: resolved.note,
-				running: false,
-				background,
-				finishedAt: Date.now(),
-			};
-			records.set(tag.agentId, rec);
-			if (signal?.aborted) {
-				await disposeRecord(rec);
-				throw new SubagentAbortedError();
-			}
-		}
+		if (!resolved.ok) throw new Error(resolved.error);
+		const childModel = sameEndpoint(resolved.model, ctx.model);
+		const modelNote = "note" in resolved ? resolved.note : undefined;
 
-		const baseDetails: TaskDetails = {
-			agentId: rec.tag.agentId,
-			subagentType: rec.definition.name,
-			description: rec.description,
+		// Claude Code: agents run in the background unless run_in_background is false; agents launched
+		// by a subagent run in the foreground unless run_in_background is true.
+		const background = params.run_in_background === true || def.background === true || (!isSubagent && params.run_in_background !== false);
+
+		// "remote" is not available here: fall back to a worktree in a git checkout, else run locally
+		const isolation = params.isolation === "remote" ? (gitRootOf(ctx.cwd) ? "worktree" : undefined) : params.isolation;
+		const agentId = newTaskId("local_agent");
+		const worktree = isolation === "worktree" ? createAgentWorktree(ctx.cwd, agentId) : undefined;
+
+		let session: AgentSession;
+		try {
+			session = await createChildSession(ctx, def, childModel, {
+				agentId,
+				toolCallId,
+				background,
+				cwd: worktree?.cwd ?? ctx.cwd,
+				effort: fork ? undefined : (params.effort ?? def.effort),
+				fork,
+			});
+		} catch (err) {
+			if (worktree) finishAgentWorktree(worktree);
+			throw err;
+		}
+		const run: AgentRun = {
+			agentId,
+			toolCallId,
+			definition: def,
+			description: params.description,
+			session,
+			model: session.model ?? childModel,
+			modelNote,
+			background,
+			controller: new AbortController(),
+			running: false,
+			startIndex: session.messages.length,
+			worktree,
+		};
+		if (signal?.aborted) {
+			if (worktree) finishAgentWorktree(worktree);
+			await disposeSession(session);
+			throw new SubagentAbortedError();
+		}
+		const prompt = fork ? `${forkDirective(params.prompt)}${worktree ? `\n\n${forkWorktreeNotice(ctx.cwd, worktree.path)}` : ""}` : params.prompt;
+		const baseDetails: AgentDetails = {
+			agentId,
+			subagentType: def.name,
+			description: params.description,
 			status: "completed",
 			background,
-			model: modelLabel(rec.model),
-			modelNote: rec.modelNote,
+			model: modelLabel(run.model),
+			modelNote,
 		};
-
-		const controller = new AbortController();
-		rec.controller = controller;
+		runs.set(agentId, run);
 
 		if (background) {
+			run.outputFile = cc.tasks.outputPath(agentId);
+			run.task = cc.tasks.add({
+				id: agentId,
+				type: "local_agent",
+				label: params.description,
+				status: "running",
+				outputFile: run.outputFile,
+				toolUseId: toolCallId,
+				stop: () => stopRun(run),
+			});
 			// not tied to the parent's abort signal: the tool call returns immediately
-			runAgent(rec, params.prompt, controller.signal, undefined).then(
-				(result) => deliverBackgroundResult(rec, { ok: true, result }),
-				(error) => deliverBackgroundResult(rec, { ok: false, error }),
+			run.done = runAgent(run, prompt, undefined).then(
+				(result) => finishBackground(run, { ok: true, result }),
+				(error) => finishBackground(run, { ok: false, error }),
 			);
 			return {
-				content: [
-					{
-						type: "text",
-						text: `Async agent launched successfully.\nagentId: ${rec.tag.agentId} (internal ID - do not mention to the user; pass it as \`resume\` to continue this agent later)\nThe agent is working in the background. You will be notified automatically when it completes. Do not duplicate this agent's work. Continue with other tasks or briefly tell the user what you launched.`,
-					},
-				],
-				details: { ...baseDetails, status: "async_launched" },
+				content: [{ type: "text", text: asyncLaunchText(agentId, run.outputFile) }],
+				details: { ...baseDetails, status: "async_launched", outputFile: run.outputFile },
 			};
 		}
 
-		const forwardAbort = () => controller.abort();
+		const forwardAbort = () => run.controller.abort();
 		signal?.addEventListener("abort", forwardAbort, { once: true });
+		let worktreeInfo: WorktreeInfo | undefined;
 		try {
-			const result = await runAgent(rec, params.prompt, controller.signal, onUpdate);
+			const result = await runAgent(run, prompt, onUpdate);
+			worktreeInfo = worktree ? finishAgentWorktree(worktree) : undefined;
 			return {
 				content: [
 					{
 						type: "text",
-						text: `${result.text}\n\nagentId: ${rec.tag.agentId} (pass as \`resume\` to continue this agent's work if needed)\n${usageBlock(result.usage)}`,
+						text: foregroundResultText({
+							report: result.text,
+							agentId,
+							agentType: def.name,
+							usage: { totalTokens: result.totalTokens, toolUses: result.usage.toolUses, durationMs: result.usage.durationMs },
+							worktree: worktreeInfo,
+						}),
 					},
 				],
-				details: { ...baseDetails, usage: result.usage },
+				details: { ...baseDetails, usage: result.usage, worktree: worktreeInfo },
 			};
+		} catch (err) {
+			if (worktree) finishAgentWorktree(worktree);
+			throw err;
 		} finally {
 			signal?.removeEventListener("abort", forwardAbort);
+			runs.delete(agentId);
+			await disposeSession(session);
 		}
 	}
 
-	function registerTool(description: string): void {
-		currentDescription = description;
-		pi.registerTool({
-			name: TASK_TOOL_NAME,
-			label: "Task",
-			description,
-			parameters: TaskParams,
-			execute: (toolCallId, params, signal, onUpdate, ctx) => execute(toolCallId, params as TaskInput, signal, onUpdate, ctx),
-		});
-	}
-
-	/** Refresh the model-facing description (the agent list depends on cwd's .claude/agents). */
-	function refreshDescription(cwd: string): void {
-		try {
-			let known: Set<string> | undefined;
-			try {
-				known = new Set(pi.getAllTools().map((t) => t.name));
-			} catch {
-				known = undefined;
-			}
-			const description = buildTaskDescription(loadDefs(cwd), known);
-			if (description !== currentDescription) registerTool(description);
-		} catch {
-			// keep previous description
-		}
-	}
-
-	// The extension factory has no cwd: start with process.cwd() and refresh once a ctx is available.
-	registerTool(buildTaskDescription(loadDefs(process.cwd())));
-	pi.on("session_start", (_event, ctx) => {
-		refreshDescription(ctx.cwd);
+	pi.registerTool({
+		name: AGENT_TOOL_NAME,
+		label: "Agent",
+		description: AGENT_TOOL_DESCRIPTION,
+		promptSnippet: "Launch a subagent (general-purpose, Explore, Plan, fork, or a custom agent) for complex multi-step work",
+		parameters: AgentParams,
+		// Claude Code's InputValidationError wording (pi's own validation would word it differently)
+		prepareArguments: (args) => {
+			const invalid = validateAgentInput(args);
+			if (invalid) throw new Error(invalid);
+			return args as AgentInput;
+		},
+		execute: (toolCallId, params, signal, onUpdate, ctx) => execute(toolCallId, params as AgentInput, signal, onUpdate, ctx),
 	});
+
+	if (!isSubagent) registerUnknownToolErrors(pi);
+
+	// Claude Code lists the agent types in a system reminder (re-sent when the list changes).
 	pi.on("before_agent_start", (_event, ctx) => {
-		refreshDescription(ctx.cwd);
+		let listing: string;
+		try {
+			listing = formatAgentListingReminder(loadDefs(ctx.cwd));
+		} catch {
+			return undefined;
+		}
+		if (listing === lastListing) return undefined;
+		lastListing = listing;
+		return { message: { customType: REMINDER_CUSTOM_TYPE, content: wrapReminder(listing), display: false } };
 	});
 
 	pi.on("session_shutdown", async () => {
-		const all = [...records.values()];
+		shuttingDown = true;
 		await Promise.all(
-			all.map(async (rec) => {
-				if (rec.running) {
-					rec.killed = true;
-					rec.controller?.abort();
-					await rec.session.abort().catch(() => {});
+			[...runs.values()].map(async (run) => {
+				if (run.running) {
+					run.killedBy ??= "shutdown";
+					run.controller.abort();
+					await run.session.abort().catch(() => {});
 				}
-				await disposeRecord(rec);
+				if (run.done) await Promise.race([run.done, new Promise((r) => setTimeout(r, 5_000).unref?.())]);
 			}),
 		);
 	});
 }
+
+/** @deprecated Use registerAgent (kept for src/index.ts). */
+export const registerTask = registerAgent;

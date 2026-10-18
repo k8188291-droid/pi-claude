@@ -13,7 +13,15 @@ export interface AskUserQuestionItem {
  * Host answers keyed by question text. For multiSelect questions, join labels with ", ".
  * Free-text answers ("Other") are allowed as arbitrary strings.
  */
-export type AskUserQuestionAnswers = Record<string, string>;
+export type AskUserQuestionAnswers = Record<string, string | string[]>;
+
+/** Full host reply: answers plus optional per-question annotations or a free-form response. */
+export interface AskUserQuestionReply {
+	answers: AskUserQuestionAnswers;
+	annotations?: Record<string, { preview?: string; notes?: string }>;
+	/** Free-form response instead of (or in addition to) answers. */
+	response?: string;
+}
 
 export interface TodoItem {
 	content: string;
@@ -37,6 +45,7 @@ export interface AgentDefinition {
 /** Events pushed to the SDK host via `onEvent`. */
 export type ClaudeCodeHostEvent =
 	| { type: "todos_updated"; todos: TodoItem[] }
+	| { type: "tasks_updated"; tasks: import("../tools/task-tools.js").TaskItem[] }
 	| { type: "background_shell_started"; shellId: string; command: string }
 	| { type: "background_shell_exited"; shellId: string; exitCode: number | null; signal?: string | null }
 	| { type: "subagent_start"; agentId: string; parentToolCallId: string; subagentType: string; description: string; background: boolean }
@@ -58,7 +67,7 @@ export interface SubagentUsage {
 }
 
 export interface OutputSpillOptions {
-	/** Max characters of tool text output kept inline. Default 30000. */
+	/** Max characters of tool text output kept inline, for every tool. Default: per tool, like Claude Code (Grep 20000, Bash 30000, others 50000; Read is never spilled). */
 	maxChars?: number;
 	/** Characters of preview kept inline when spilling. Default 2000. */
 	previewChars?: number;
@@ -70,7 +79,7 @@ export interface OutputSpillOptions {
 
 export interface ClaudeCodeToolsOptions {
 	/** Host callback for AskUserQuestion. Without it, the tool returns an error to the model. */
-	onAskUserQuestion?: (questions: AskUserQuestionItem[], ctx: { signal?: AbortSignal; toolCallId: string }) => Promise<AskUserQuestionAnswers>;
+	onAskUserQuestion?: (questions: AskUserQuestionItem[], ctx: { signal?: AbortSignal; toolCallId: string }) => Promise<AskUserQuestionAnswers | AskUserQuestionReply>;
 	/** Receives host-facing notifications (todos, background shells, subagents, ...). */
 	onEvent?: (event: ClaudeCodeHostEvent) => void;
 	/** Large tool output → file. `false` disables. */
@@ -100,6 +109,8 @@ export interface ClaudeCodeToolsOptions {
 	modelRuntime?: ModelRuntime;
 	/** Bash defaults. */
 	bash?: { defaultTimeoutMs?: number; maxTimeoutMs?: number };
+	/** Internal: the parent's task list, shared with foreground subagents (as in Claude Code). */
+	sharedTaskStore?: import("../tools/task-tools.js").TaskStore;
 	/** Internal: set for subagent sessions (disables Task, AskUserQuestion, nested spill dir). */
 	isSubagent?: boolean;
 }

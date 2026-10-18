@@ -27,7 +27,7 @@ const { session } = await createClaudeCodeSession({
 		},
 		// Todos, background shells, subagent progress, spilled outputs, ...
 		onEvent: (event) => {
-			if (event.type === "todos_updated") console.error("[todos]", event.todos.map((t) => `${t.status}: ${t.content}`));
+			if (event.type === "tasks_updated") console.error("[tasks]", event.tasks.map((t) => `#${t.id} ${t.status}: ${t.subject}`));
 			if (event.type === "subagent_start") console.error(`[subagent ${event.subagentType}] ${event.description}`);
 		},
 		// Custom subagents (in addition to general-purpose / Explore / Plan and .claude/agents/*.md)

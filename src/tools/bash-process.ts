@@ -97,17 +97,19 @@ export function shellQuote(s: string): string {
 }
 
 /**
- * Build the shell script that runs a user command:
+ * Build the shell script that runs a user command. Everything is on ONE line so bash reports
+ * errors in the user's command as "line 1" (like Claude Code, which also runs `eval '<cmd>'` on
+ * the first line of its script):
  * - stderr merged into stdout (preserves interleaving order),
  * - stdin from /dev/null (spawned with stdio "ignore"),
- * - optional EXIT trap writing the final `pwd -P` to a side-channel file (also runs on `exit`/`set -e`),
- * - the user command runs through `eval` so syntax errors are reported as a normal non-zero exit.
+ * - the user command runs through `eval` so syntax errors are reported as a normal non-zero exit,
+ * - optional: on success, the final `pwd -P` is written to a side-channel file (Claude Code only
+ *   updates the working directory when the command succeeds).
  */
 export function buildScript(command: string, cwdFile?: string): string {
-	const lines = ["exec 2>&1"];
-	if (cwdFile) lines.push(`trap ${shellQuote(`pwd -P >| ${shellQuote(cwdFile)} 2>/dev/null`)} EXIT`);
-	lines.push(`eval ${shellQuote(command)}`);
-	return lines.join("\n");
+	let script = `exec 2>&1; eval ${shellQuote(command)}`;
+	if (cwdFile) script += ` && pwd -P >| ${shellQuote(cwdFile)}`;
+	return script;
 }
 
 export interface SpawnedShell {
@@ -201,16 +203,34 @@ export function spawnShell(script: string, cwd: string, onData: (text: string) =
 	};
 }
 
-/** Strip leading blank lines and trailing whitespace (Claude Code output normalization). */
-export function normalizeOutput(text: string): string {
-	return text.replace(/^(?:[ \t]*\r?\n)+/, "").trimEnd();
-}
-
-export function formatDuration(ms: number): string {
-	if (ms < 1000) return `${ms}ms`;
-	const totalSec = Math.round(ms / 100) / 10;
-	if (totalSec < 60) return `${Number.isInteger(totalSec) ? totalSec : totalSec.toFixed(1)}s`;
-	const m = Math.floor(totalSec / 60);
-	const s = Math.round(totalSec - m * 60);
-	return s ? `${m}m ${s}s` : `${m}m`;
+/** Claude Code's duration format: "0s", "45s", "2m 5s", "30m" (hideTrailingZeros), "1h 30m". */
+export function formatClaudeDuration(ms: number, hideTrailingZeros = false): string {
+	if (ms < 60000) {
+		if (ms === 0) return "0s";
+		if (ms < 1) return `${(ms / 1000).toFixed(1)}s`;
+		return `${Math.floor(ms / 1000)}s`;
+	}
+	let d = Math.floor(ms / 86400000);
+	let h = Math.floor((ms % 86400000) / 3600000);
+	let m = Math.floor((ms % 3600000) / 60000);
+	let s = Math.round((ms % 60000) / 1000);
+	if (s === 60) (s = 0), m++;
+	if (m === 60) (m = 0), h++;
+	if (h === 24) (h = 0), d++;
+	const o = hideTrailingZeros;
+	if (d > 0) {
+		if (o && h === 0 && m === 0) return `${d}d`;
+		if (o && m === 0) return `${d}d ${h}h`;
+		return `${d}d ${h}h ${m}m`;
+	}
+	if (h > 0) {
+		if (o && m === 0 && s === 0) return `${h}h`;
+		if (o && s === 0) return `${h}h ${m}m`;
+		return `${h}h ${m}m ${s}s`;
+	}
+	if (m > 0) {
+		if (o && s === 0) return `${m}m`;
+		return `${m}m ${s}s`;
+	}
+	return `${s}s`;
 }

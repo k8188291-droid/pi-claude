@@ -1,7 +1,8 @@
 import type { Model } from "@earendil-works/pi-ai";
 import type { ModelRegistry } from "@earendil-works/pi-coding-agent";
 
-export const MODEL_ALIASES = ["sonnet", "opus", "haiku"] as const;
+/** Model aliases accepted by the Agent tool's `model` parameter (Claude Code's enum). */
+export const MODEL_ALIASES = ["sonnet", "opus", "haiku", "fable"] as const;
 
 export function isModelAlias(s: string): boolean {
 	return (MODEL_ALIASES as readonly string[]).includes(s.toLowerCase());
@@ -35,7 +36,7 @@ export type ModelResolution =
  * Resolve a model spec for a subagent.
  * - undefined / "inherit" → parent model
  * - a pi Model object → used as-is
- * - "sonnet" | "opus" | "haiku" → best available registry model whose id contains the alias
+ * - "sonnet" | "opus" | "haiku" | "fable" → best available registry model whose id contains the alias
  *   (preferring the parent's provider); falls back to the parent model when none is found
  * - "provider/model-id" or bare "model-id" → registry lookup (exact id match; the parent model
  *   itself also matches). Unknown ids → error (strict) or parent model with a note (non-strict).
@@ -76,7 +77,7 @@ export function resolveSubagentModel(
 	if (found) return { ok: true, model: found };
 
 	if (opts.strict) {
-		return { ok: false, error: `Unknown model "${s}". Use "sonnet", "opus", "haiku", a model id, or "provider/model-id", or omit the model parameter to inherit the parent model.` };
+		return { ok: false, error: `Unknown model "${s}". Use "sonnet", "opus", "haiku", "fable", a model id, or "provider/model-id", or omit the model parameter to inherit the parent model.` };
 	}
 	return { ok: true, model: parent, note: `Unknown model "${s}"; using the parent model.` };
 }

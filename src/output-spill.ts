@@ -7,7 +7,14 @@ import type { CCContext } from "./shared/context.js";
 
 /**
  * Large tool output → file, for every tool in the session (ours, other extensions', SDK
- * customTools, Task results).
+ * customTools, Task results). Mirrors Claude Code's tool-result persistence:
+ *
+ * - A result is persisted when its text exceeds the tool's threshold: Claude Code uses
+ *   min(tool.maxResultSizeChars, 50000) — Grep 20000, Bash 30000, everything else 50000;
+ *   Read is never persisted. `outputSpill.maxChars` overrides the threshold for every tool.
+ * - Results containing images are never persisted.
+ * - The inline replacement is `<persisted-output>` + size + path + a 2KB preview cut at a line break.
+ * - A successful result with no text at all becomes "(<Tool> completed with no output)".
  *
  * Implemented as a `tool_result` handler. pi chains `tool_result` handlers in extension load order
  * (and registration order within an extension); each handler sees the previous handler's patch.
@@ -15,19 +22,25 @@ import type { CCContext } from "./shared/context.js";
  * run after it.
  */
 
-const DEFAULT_MAX_CHARS = 30_000;
+/** Claude Code's cap on any tool's persistence threshold. */
+export const SPILL_THRESHOLD_CEILING = 50_000;
+/** Claude Code's per-tool maxResultSizeChars where it is below the ceiling. */
+export const TOOL_SPILL_THRESHOLDS: Record<string, number> = { Grep: 20_000, Bash: 30_000 };
 const DEFAULT_PREVIEW_CHARS = 2_000;
 /** Never spilled: Read (spilling would make the model Read the spill file forever) and tool_search (schemas must stay inline). */
 const ALWAYS_EXCLUDED = ["Read", "tool_search"];
 
-export function formatSize(bytes: number): string {
-	if (bytes < 1024) return `${bytes}B`;
-	if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)}KB`;
-	return `${(bytes / (1024 * 1024)).toFixed(1)}MB`;
-}
+export const PERSISTED_OUTPUT_OPEN = "<persisted-output>";
+export const PERSISTED_OUTPUT_CLOSE = "</persisted-output>";
 
-function previewLabel(chars: number): string {
-	return chars >= 1000 && chars % 1000 === 0 ? `${chars / 1000}KB` : `${chars} characters`;
+/** Claude Code's size formatter (1024-based, trailing ".0" dropped). */
+export function formatSize(bytes: number): string {
+	const kb = bytes / 1024;
+	if (kb < 1) return `${bytes} bytes`;
+	if (kb < 1024) return `${kb.toFixed(1).replace(/\.0$/, "")}KB`;
+	const mb = kb / 1024;
+	if (mb < 1024) return `${mb.toFixed(1).replace(/\.0$/, "")}MB`;
+	return `${(mb / 1024).toFixed(1).replace(/\.0$/, "")}GB`;
 }
 
 function sanitize(s: string, max = 100): string {
@@ -35,26 +48,35 @@ function sanitize(s: string, max = 100): string {
 	return out || "unknown";
 }
 
-/** First `max` chars, cut at the last line break if that keeps at least half of the budget. */
+/** First `max` chars, cut at the last line break when that keeps more than half of the budget. */
 export function makePreview(text: string, max: number): { preview: string; truncated: boolean } {
 	if (text.length <= max) return { preview: text, truncated: false };
-	const slice = text.slice(0, max);
-	const nl = slice.lastIndexOf("\n");
-	return { preview: nl >= max / 2 ? slice.slice(0, nl) : slice, truncated: true };
+	const nl = text.slice(0, max).lastIndexOf("\n");
+	return { preview: text.slice(0, nl > max * 0.5 ? nl : max), truncated: true };
 }
 
-function countLines(text: string): number {
-	if (text.length === 0) return 0;
-	let n = 1;
-	for (let i = text.indexOf("\n"); i !== -1; i = text.indexOf("\n", i + 1)) n++;
-	return text.endsWith("\n") ? n - 1 : n;
+/** The `<persisted-output>` message Claude Code puts in place of a large result. */
+export function formatPersistedOutput(opts: { size: number; path: string; preview: string; truncated: boolean; previewChars?: number }): string {
+	return (
+		`${PERSISTED_OUTPUT_OPEN}\n` +
+		`Output too large (${formatSize(opts.size)}). Full output saved to: ${opts.path}\n\n` +
+		`Preview (first ${formatSize(opts.previewChars ?? DEFAULT_PREVIEW_CHARS)}):\n` +
+		opts.preview +
+		(opts.truncated ? "\n...\n" : "\n") +
+		PERSISTED_OUTPUT_CLOSE
+	);
+}
+
+/** Persistence threshold for a tool (characters of text; results strictly larger are spilled). */
+export function spillThreshold(toolName: string, maxChars?: number): number {
+	if (maxChars !== undefined) return Math.max(1, maxChars);
+	return Math.min(TOOL_SPILL_THRESHOLDS[toolName] ?? SPILL_THRESHOLD_CEILING, SPILL_THRESHOLD_CEILING);
 }
 
 export function registerOutputSpill(pi: ExtensionAPI, cc: CCContext): void {
 	if (cc.options.outputSpill === false) return;
 	const opts = cc.options.outputSpill;
-	const maxChars = Math.max(1, opts?.maxChars ?? DEFAULT_MAX_CHARS);
-	const previewChars = Math.max(0, Math.min(opts?.previewChars ?? DEFAULT_PREVIEW_CHARS, maxChars));
+	const previewChars = Math.max(0, opts?.previewChars ?? DEFAULT_PREVIEW_CHARS);
 	const excluded = new Set([...ALWAYS_EXCLUDED, ...(opts?.exclude ?? [])]);
 	const fallbackId = randomBytes(8).toString("hex");
 
@@ -70,63 +92,35 @@ export function registerOutputSpill(pi: ExtensionAPI, cc: CCContext): void {
 	};
 
 	pi.on("tool_result", async (event, ctx) => {
-		if (excluded.has(event.toolName)) return undefined;
+		if (event.isError) return undefined;
 		const content = event.content ?? [];
-		const texts: string[] = [];
-		let total = 0;
-		for (const block of content) {
-			if (block.type === "text") {
-				texts.push(block.text);
-				total += block.text.length;
-			}
+		const texts = content.filter((b): b is Extract<typeof b, { type: "text" }> => b.type === "text");
+		const hasImage = content.some((b) => b.type !== "text");
+
+		if (!hasImage && texts.every((b) => typeof b.text !== "string" || b.text.trim() === "")) {
+			return { content: [{ type: "text", text: `(${event.toolName} completed with no output)` }] };
 		}
-		if (total <= maxChars) return undefined;
+		if (excluded.has(event.toolName) || hasImage) return undefined;
 
-		const fullText = texts.join("\n");
+		let total = 0;
+		for (const b of texts) total += b.text.length;
+		if (total <= spillThreshold(event.toolName, opts?.maxChars)) return undefined;
+
+		// Claude Code persists a single text result as text, a multi-block result as JSON.
+		const isJson = texts.length > 1;
+		const fullText = isJson ? JSON.stringify(texts, null, 2) : texts[0].text;
 		const dir = spillDir(ctx);
-		const path = join(dir, `${sanitize(event.toolName)}-${sanitize(event.toolCallId)}.txt`);
-		const bytes = Buffer.byteLength(fullText, "utf8");
-		const lines = countLines(fullText);
-		const { preview, truncated } = makePreview(fullText, previewChars);
-
-		let header: string;
-		let footer: string;
-		let saved = true;
+		const path = join(dir, `${sanitize(event.toolCallId)}.${isJson ? "json" : "txt"}`);
 		try {
 			await mkdir(dir, { recursive: true });
 			await writeFile(path, fullText, "utf8");
-			header = `Output too large (${formatSize(bytes)}; ${fullText.length.toLocaleString("en-US")} characters, ${lines.toLocaleString("en-US")} lines). Full output saved to: ${path}`;
-			footer = `Use the Read tool with offset/limit on ${path} to view the rest of the output (${lines.toLocaleString("en-US")} lines), or Grep to search it.`;
-		} catch (err) {
-			saved = false;
-			const msg = err instanceof Error ? err.message : String(err);
-			header = `Output too large (${formatSize(bytes)}; ${fullText.length.toLocaleString("en-US")} characters, ${lines.toLocaleString("en-US")} lines). The full output could not be saved to a file (${msg}) and was truncated.`;
-			footer = "Re-run the tool with a narrower scope to see the remaining output.";
+		} catch {
+			// Claude Code keeps the original result when it cannot be persisted.
+			return undefined;
 		}
-
-		const text = [
-			"<persisted-output>",
-			header,
-			"",
-			`Preview (first ${previewLabel(previewChars)}):`,
-			preview + (truncated ? "\n..." : ""),
-			"",
-			footer,
-			"</persisted-output>",
-		].join("\n");
-
-		// Replace the first text block with the note, drop the other text blocks, keep images in place.
-		const newContent: typeof content = [];
-		let placed = false;
-		for (const block of content) {
-			if (block.type !== "text") newContent.push(block);
-			else if (!placed) {
-				newContent.push({ type: "text", text });
-				placed = true;
-			}
-		}
-
-		if (saved) cc.emit({ type: "output_spilled", toolName: event.toolName, toolCallId: event.toolCallId, path, totalChars: total });
-		return { content: newContent };
+		const { preview, truncated } = makePreview(fullText, previewChars);
+		const text = formatPersistedOutput({ size: fullText.length, path, preview, truncated, previewChars });
+		cc.emit({ type: "output_spilled", toolName: event.toolName, toolCallId: event.toolCallId, path, totalChars: total });
+		return { content: [{ type: "text", text }] };
 	});
 }

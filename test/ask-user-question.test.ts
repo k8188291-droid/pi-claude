@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from "vitest";
-import { registerAskUserQuestion } from "../src/tools/ask-user-question.js";
+import { formatAnswers, joinLabels, registerAskUserQuestion, SINGLE_OPTION_STEER } from "../src/tools/ask-user-question.js";
 import { createCCContext } from "../src/shared/context.js";
 import type { AskUserQuestionItem, ClaudeCodeToolsOptions } from "../src/shared/types.js";
 import { captureTools, createTestSession, fakeCtx, fauxAssistantMessage, fauxToolCall, resultText } from "./helpers.js";
@@ -8,9 +8,10 @@ function setup(options: ClaudeCodeToolsOptions = {}) {
 	const cc = createCCContext(options);
 	const { tools } = captureTools((pi) => registerAskUserQuestion(pi, cc));
 	const tool = tools.get("AskUserQuestion")!;
+	const prepare = (params: any) => tool.prepareArguments!(params) as any;
 	const run = (params: any, opts: { signal?: AbortSignal; ctx?: any } = {}) =>
-		tool.execute("call-1", params, opts.signal, undefined, opts.ctx ?? fakeCtx("/tmp"));
-	return { tool, run };
+		tool.execute("call-1", prepare(params), opts.signal, undefined, opts.ctx ?? fakeCtx("/tmp"));
+	return { tool, run, prepare };
 }
 
 const opt = (label: string) => ({ label, description: `${label} description` });
@@ -26,66 +27,114 @@ describe("AskUserQuestion schema & validation", () => {
 	it("exposes the Claude Code schema", () => {
 		const { tool } = setup();
 		const p = tool.parameters as any;
-		expect(Object.keys(p.properties)).toEqual(["questions", "answers", "metadata"]);
+		expect(Object.keys(p.properties)).toEqual(["questions", "answers", "annotations", "metadata"]);
 		expect(p.required).toEqual(["questions"]);
 		expect(p.properties.questions.minItems).toBe(1);
 		expect(p.properties.questions.maxItems).toBe(4);
 		const item = p.properties.questions.items;
-		expect(item.required.sort()).toEqual(["header", "multiSelect", "options", "question"]);
+		expect(item.required).toEqual(["question", "header", "options", "multiSelect"]);
 		expect(item.properties.options.minItems).toBe(2);
 		expect(item.properties.options.maxItems).toBe(4);
-		expect(item.properties.options.items.required.sort()).toEqual(["description", "label"]);
+		expect(Object.keys(item.properties.options.items.properties)).toEqual(["label", "description", "preview"]);
+		expect(tool.description).toMatch(/^Use this tool only when you are blocked on a decision/);
 	});
 
-	const host = vi.fn(async () => ({}));
+	it("reports a single-option question with Claude Code's steer and zod issue dump", () => {
+		const { prepare } = setup();
+		expect(() => prepare({ questions: [q("1?", { options: [opt("A")] })] })).toThrow(
+			`InputValidationError: ${SINGLE_OPTION_STEER}\n\n${JSON.stringify(
+				[{ origin: "array", code: "too_small", minimum: 2, inclusive: true, path: ["questions", 0, "options"], message: "Too small: expected array to have >=2 items" }],
+				null,
+				2,
+			)}`,
+		);
+	});
+
 	it.each([
-		["no questions", { questions: [] }, /1-4 questions/],
-		["too many questions", { questions: [q("1?"), q("2?"), q("3?"), q("4?"), q("5?")] }, /1-4 questions/],
-		["too few options", { questions: [q("1?", { options: [opt("A")] })] }, /2-4 options/],
-		["too many options", { questions: [q("1?", { options: ["A", "B", "C", "D", "E"].map(opt) })] }, /2-4 options/],
-		["header too long", { questions: [q("1?", { header: "Thirteen char" })] }, /too long \(max 12/],
-		["duplicate labels", { questions: [q("1?", { options: [opt("A"), opt("A")] })] }, /labels must be unique/],
-		["duplicate questions", { questions: [q("Same?"), q("Same?")] }, /question texts must be unique/],
-	])("rejects %s", async (_name, params, re) => {
-		const { run } = setup({ onAskUserQuestion: host });
-		await expect(run(params)).rejects.toThrow(re);
-		expect(host).not.toHaveBeenCalled();
+		["no questions", { questions: [] }, /"code": "too_small"[\s\S]*expected array to have >=1 items/],
+		["too many questions", { questions: [q("1?"), q("2?"), q("3?"), q("4?"), q("5?")] }, /expected array to have <=4 items/],
+		["too many options", { questions: [q("1?", { options: ["A", "B", "C", "D", "E"].map(opt) })] }, /"path": \[\s*"questions",\s*0,\s*"options"/],
+		["duplicate labels", { questions: [q("1?", { options: [opt("A"), opt("A")] })] }, /Question texts must be unique, option labels must be unique within each question/],
+		["duplicate questions", { questions: [q("Same?"), q("Same?")] }, /Question texts must be unique/],
+		["missing header", { questions: [{ question: "x?", multiSelect: false, options: [opt("A"), opt("B")] }] }, /^InputValidationError: AskUserQuestion failed due to the following issue:\nThe required parameter `questions\[0\]\.header` is missing$/],
+		["unknown key", { questions: [q("1?")], extra: 1 }, /An unexpected parameter `extra` was provided/],
+	])("rejects %s", (_name, params, re) => {
+		const { prepare } = setup();
+		expect(() => prepare(params)).toThrow(re);
 	});
 
-	it("accepts a 12-char header and the optional answers/metadata fields", async () => {
-		const { run } = setup({ onAskUserQuestion: async () => ({ "1?": "A" }) });
-		const r = await run({ questions: [q("1?", { header: "Twelve chars" })], answers: {}, metadata: { source: "x" } });
-		expect(resultText(r)).toContain('"1?"="A"');
+	it("accepts long headers, previews, a missing multiSelect and the optional fields", () => {
+		const { prepare } = setup();
+		const out = prepare({
+			questions: [{ question: "1?", header: "A very long header", options: [{ ...opt("A"), preview: "x" }, opt("B")] }],
+			answers: {},
+			annotations: { "1?": { notes: "n" } },
+			metadata: { source: "x" },
+		});
+		expect(out.questions[0].multiSelect).toBe(false);
+	});
+
+	it("end-to-end: validation errors reach the model with Claude Code's text", async () => {
+		const host = vi.fn(async () => ({}));
+		const t = await createTestSession({
+			responses: [fauxAssistantMessage(fauxToolCall("AskUserQuestion", { questions: [q("Only?", { options: [opt("A")] })] }), { stopReason: "toolUse" }), fauxAssistantMessage("ok")],
+			claudeCode: { onAskUserQuestion: host, subagents: false },
+		});
+		await t.session.prompt("go");
+		expect(t.toolResults()[0]).toMatchObject({ toolName: "AskUserQuestion", isError: true });
+		expect(t.toolResults()[0].text).toMatch(/^InputValidationError: This call included a question with fewer than 2 options/);
+		expect(host).not.toHaveBeenCalled();
+		t.dispose();
+	});
+});
+
+describe("AskUserQuestion result text", () => {
+	const qs = [q("Which library?"), q("Which features?", { multiSelect: true, options: [opt("Auth"), opt("Logging"), opt("a, b")] })];
+
+	it("option answers", () => {
+		expect(formatAnswers(qs, { "Which library?": "A", "Which features?": joinLabels(["Auth", "a, b"]) })).toBe(
+			'Your questions have been answered: "Which library?"="A", "Which features?"="Auth, "a, b"". You can now continue with these answers in mind.',
+		);
+	});
+
+	it("free-text answers and notes ask the model to read carefully", () => {
+		expect(formatAnswers(qs, { "Which library?": "date-fns" })).toBe(
+			'The user answered: "Which library?"="date-fns". Read the answers carefully — they may request clarification, changes, or that you not proceed — and follow what they actually say.',
+		);
+		expect(formatAnswers(qs, { "Which library?": "A" }, { "Which library?": { preview: "P", notes: "careful" }, "Which features?": { notes: "none fit" } })).toBe(
+			'The user answered: "Which library?"="A" selected preview:\nP notes: careful, "Which features?"=(no option selected) notes: none fit. Read the answers carefully — they may request clarification, changes, or that you not proceed — and follow what they actually say.',
+		);
+	});
+
+	it("no answers / a typed response", () => {
+		expect(formatAnswers(qs, {})).toBe("The user did not answer the questions.");
+		expect(formatAnswers(qs, { "Which library?": "A" }, undefined, "stop, use moment")).toBe("The user responded: stop, use moment");
 	});
 });
 
 describe("AskUserQuestion execution", () => {
 	it("passes questions to the host callback and formats answers", async () => {
-		const host = vi.fn(async (_qs: AskUserQuestionItem[], _ctx: any) => ({
-			"Which library?": "date-fns",
-			"Which features?": "Auth, Logging",
-		}));
+		const host = vi.fn(async (_qs: AskUserQuestionItem[], _ctx: any) => ({ "Which library?": "A", "Which features?": "A, B" }));
 		const { run } = setup({ onAskUserQuestion: host });
 		const questions = [q("Which library?"), q("Which features?", { multiSelect: true, header: "Features" })];
 		const r = await run({ questions });
 		expect(host).toHaveBeenCalledTimes(1);
 		expect(host.mock.calls[0][0]).toEqual(questions);
 		expect(host.mock.calls[0][1]).toMatchObject({ toolCallId: "call-1" });
-		expect(resultText(r)).toBe(
-			'User has answered your questions: "Which library?"="date-fns", "Which features?"="Auth, Logging". You can now continue with the user\'s answers in mind.',
-		);
-		expect(r.details).toEqual({
-			questions,
-			answers: { "Which library?": "date-fns", "Which features?": "Auth, Logging" },
-			unanswered: [],
-		});
+		expect(resultText(r)).toBe('Your questions have been answered: "Which library?"="A", "Which features?"="A, B". You can now continue with these answers in mind.');
+		expect(r.details).toEqual({ questions, answers: { "Which library?": "A", "Which features?": "A, B" }, unanswered: [] });
 	});
 
-	it("marks missing answers as unanswered and joins array answers", async () => {
-		const { run } = setup({ onAskUserQuestion: async () => ({ "Two?": ["X", "Y"] as any }) });
+	it("leaves missing answers out, joins array answers and accepts the structured host result", async () => {
+		const { run } = setup({ onAskUserQuestion: async () => ({ "Two?": ["A", "B"] as any }) });
 		const r = await run({ questions: [q("One?"), q("Two?", { multiSelect: true })] });
-		expect(resultText(r)).toContain('"One?"=(unanswered), "Two?"="X, Y"');
+		expect(resultText(r)).toBe('Your questions have been answered: "Two?"="A, B". You can now continue with these answers in mind.');
 		expect((r.details as any).unanswered).toEqual(["One?"]);
+
+		const { run: run2 } = setup({ onAskUserQuestion: async () => ({ answers: { "One?": "A" }, annotations: { "One?": { notes: "hmm" } } }) as any });
+		const r2 = await run2({ questions: [q("One?")] });
+		expect(resultText(r2)).toMatch(/^The user answered: "One\?"="A" notes: hmm\./);
+		expect((r2.details as any).annotations).toEqual({ "One?": { notes: "hmm" } });
 	});
 
 	it("turns host errors into tool errors", async () => {
@@ -116,27 +165,20 @@ describe("AskUserQuestion execution", () => {
 		const input = vi.fn(async () => "custom thing");
 		const ctx = fakeCtx("/tmp", { hasUI: true, ui: { select, input } as any });
 		const { run } = setup();
-		const r = await run(
-			{
-				questions: [
-					q("Single?"),
-					q("Multi?", { multiSelect: true, options: [opt("X"), opt("Y"), opt("Z")] }),
-				],
-			},
-			{ ctx },
-		);
+		const r = await run({ questions: [q("Single?"), q("Multi?", { multiSelect: true, options: [opt("X"), opt("Y"), opt("Z")] })] }, { ctx });
 		expect(select.mock.calls[0][1]).toEqual(["A", "B", "Other (type your own answer)"]);
 		// second multi-select round excludes the picked label and offers Done
 		expect(select.mock.calls[2][1]).toEqual(["Y", "Z", "Other (type your own answer)", "Done"]);
 		expect(input).toHaveBeenCalledTimes(1);
 		expect((r.details as any).answers).toEqual({ "Single?": "B", "Multi?": "X, custom thing" });
+		expect(resultText(r)).toMatch(/^The user answered:/);
 	});
 
 	it("UI dismissal leaves the question unanswered", async () => {
 		const ctx = fakeCtx("/tmp", { hasUI: true, ui: { select: async () => undefined, input: async () => undefined } as any });
 		const { run } = setup();
 		const r = await run({ questions: [q("One?")] }, { ctx });
-		expect(resultText(r)).toContain('"One?"=(unanswered)');
+		expect(resultText(r)).toBe("The user did not answer the questions.");
 	});
 
 	it("end-to-end through a session", async () => {
@@ -148,7 +190,7 @@ describe("AskUserQuestion execution", () => {
 		await t.session.prompt("go");
 		const r = t.toolResults()[0];
 		expect(r).toMatchObject({ toolName: "AskUserQuestion", isError: false });
-		expect(r.text).toContain('"Pick?"="A"');
+		expect(r.text).toBe('Your questions have been answered: "Pick?"="A". You can now continue with these answers in mind.');
 		t.dispose();
 	});
 

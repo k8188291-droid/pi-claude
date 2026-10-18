@@ -1,5 +1,7 @@
 # pi 補齊 Claude Code 工具：確定範圍
 
+> **註：** 這是專案初期的範圍規劃。之後已改為比照目前的 Claude Code（例如 TodoWrite 改為 TaskCreate／TaskUpdate 等、Task 改名 Agent、BashOutput／KillShell 改為背景輸出檔＋TaskStop、Edit 不再支援 `edits[]`）。目前的工具與行為以 [README](README.md) 為準。
+
 對象：`@mariozechner/pi-coding-agent` v0.73.1，以 SDK 方式使用；不處理 CLI / TUI 呈現。
 
 ## 已決定的原則

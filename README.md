@@ -5,22 +5,26 @@
 
 ## 工具
 
+對照目標是目前的 Claude Code（`@anthropic-ai/claude-agent-sdk` 0.3.302 附帶的 2.1.302）。工具的描述、參數與結果文字都比照它，並用 `parity/` 的重播測試逐步驗證。
+
 | 工具 | 說明 |
 |---|---|
-| `Read` | `cat -n` 格式、預設 2000 行、圖片（自動縮放）、PDF（`pages`，需 poppler）、`.ipynb` |
-| `Write` | 覆寫既有檔案前必須先 Read；讀後被外部改動會要求重讀 |
-| `Edit` | `old_string/new_string/replace_all`，另支援 `edits[]` 一次多處（全有或全無）；保留 CRLF / BOM；彎引號容錯 |
-| `Grep` | ripgrep；`output_mode`（content / files_with_matches / count）、`-A/-B/-C/-n/-i/-o`、`type`、`glob`、`multiline`、`head_limit/offset` |
-| `Glob` | 依修改時間新到舊排序，最多 100 筆 |
-| `Bash` | timeout 毫秒（預設 2 分、上限 10 分）、`description`、`cd` 後的工作目錄跨呼叫保留、`run_in_background` |
-| `BashOutput` / `KillShell` | 讀背景 shell 的新輸出（可 regex 過濾）／停止；背景結束時自動通知模型 |
-| `TodoWrite` | 待辦存在 session（跟著 fork / tree 分支走），長時間未更新會提醒模型 |
-| `AskUserQuestion` | 透過 host callback `onAskUserQuestion` 取得答案 |
-| `Task` | 同程序 subagent：`general-purpose`、`Explore`、`Plan`＋`.claude/agents/*.md`＋自訂；平行、背景、`resume` |
-| `tool_search` | 使用 pi 內建的 tool search：`deferredTools` 列出的工具以 pi 原生 `exposure: "deferred"` 註冊，模型用 `tool_search` 找到後才載入（同一輪內即生效） |
+| `Read` | `N\t內容` 格式；沒給 `limit` 時超過 256KB 拒讀（`allow_large` 可放寬），超過 25,000 tokens 時分頁並標示；重讀沒改過的檔案回「Wasted call」；圖片、PDF（`pages`，需 poppler）、`.ipynb` |
+| `Write` | 不需先 Read；但讀過之後被外部改動，就拒絕覆寫。保留原檔編碼（CRLF、BOM、UTF-16） |
+| `Edit` | `old_string/new_string/replace_all`；不需先 Read，檔案在讀取後被外部改動時，只有能乾淨套用才成功；彎引號與 `\uXXXX` 容錯；`.ipynb` 請用 NotebookEdit |
+| `NotebookEdit` | 以 cell id 或 `cell-N` 取代／插入／刪除 notebook cell |
+| `Grep` | ripgrep；`output_mode`（content / files_with_matches / count）、`-A/-B/-C/context/-n/-i/-o`、`type`、`glob`、`multiline`、`head_limit/offset` |
+| `Glob` | 相對路徑、依修改時間舊到新；包含 `node_modules`、隱藏檔與 gitignore 的檔案；最多 100 筆 |
+| `Bash` | timeout 毫秒（預設 2 分、上限 10 分），逾時改轉背景執行；`cd` 後工作目錄保留並提醒模型；`run_in_background` 的輸出寫到檔案，用 Read 讀取，結束時通知模型 |
+| `TaskStop` | 停止背景 Bash 指令或背景 agent |
+| `TaskCreate` / `TaskGet` / `TaskList` / `TaskUpdate` | 工作清單（相依、owner、metadata）；存在 session，跟著分支走；和前景 subagent 共用；長時間未使用會提醒模型 |
+| `AskUserQuestion` | 透過 host callback `onAskUserQuestion` 取得答案（可含 annotations） |
+| `Agent` | 同程序 subagent：`general-purpose`、`Explore`、`Plan`＋`.claude/agents/*.md`＋自訂。預設背景執行、完成時以通知回報；`run_in_background: false` 時同步回傳；支援 `fork`、`isolation: "worktree"`、`effort` |
+| `tool_search` | pi 內建的工具搜尋：`deferredTools` 列出的工具以 pi 原生 `exposure: "deferred"` 註冊，模型用 `tool_search` 找到後才載入 |
 
-另外有**大輸出寫檔**：任何工具（含其他 extension、SDK customTools、Task）文字輸出超過 30000 字元時，
-完整內容寫到暫存檔，模型拿到預覽＋路徑，可再用 Read / Grep 查看（Read 本身除外）。
+**大輸出寫檔：** 任何工具（含其他 extension、SDK customTools、Agent）的文字輸出超過門檻時，完整內容寫到暫存檔，模型拿到 2KB 預覽和路徑。門檻比照 Claude Code：Grep 20,000、Bash 30,000、其他 50,000 字元；Read 不寫檔。
+
+**背景工作通知：** 背景 Bash 或 agent 結束時，`<task-notification>` 會附在下一個工具結果後面；agent 閒置時則直接開始新的一輪。
 
 ## 使用方式
 
@@ -40,7 +44,7 @@ const { session } = await createClaudeCodeSession({
   modelRuntime,
   claudeCode: {
     onAskUserQuestion: async (questions) => ({ [questions[0].question]: "選項 A" }),
-    onEvent: (e) => { /* todos_updated, background_shell_*, subagent_*, output_spilled, tools_activated */ },
+    onEvent: (e) => { /* tasks_updated, todos_updated, background_shell_*, subagent_*, output_spilled */ },
     agents: { reviewer: { description: "...", prompt: "...", tools: ["Read", "Grep"] } },
     deferredTools: ["Glob", "Grep"],   // 先藏起來，模型用 tool_search 找到才載入
   },
@@ -73,14 +77,14 @@ const { session } = await createAgentSession({ cwd, modelRuntime, resourceLoader
 |---|---|---|
 | `onAskUserQuestion` | — | AskUserQuestion 的 host callback；未提供時（且無 UI）工具回錯誤讓模型自行判斷 |
 | `onEvent` | — | host 事件通知 |
-| `outputSpill` | `{ maxChars: 30000, previewChars: 2000 }` | `false` 關閉；可設 `dir`、`exclude` |
+| `outputSpill` | 依工具（見上） | `false` 關閉；`maxChars` 會覆蓋所有工具的門檻；可設 `dir`、`exclude` |
 | `agents` | — | 自訂 subagent，覆蓋同名內建／磁碟定義 |
 | `loadAgentsFromDisk` | `true` | 讀 `~/.claude/agents`、`<cwd>/.claude/agents` |
-| `subagents` | `true` | 是否提供 `Task` |
+| `subagents` | `true` | 是否提供 `Agent` |
 | `subagentExtensions` | — | 額外裝進每個 subagent session 的 extension（例如你的自訂工具或 MCP） |
 | `deferredTools` | `[]` | 以 pi 原生 `exposure: "deferred"` 註冊的本套件工具；有任何延遲載入工具（含你自己或 MCP 的）時會自動啟用 `tool_search` |
 | `modelRuntime` | 由 `createClaudeCodeSession` 帶入 | subagent 使用的 ModelRuntime（憑證與模型目錄） |
-| `bash` | `{ defaultTimeoutMs: 120000, maxTimeoutMs: 600000 }` | Bash timeout |
+| `bash` | `{ defaultTimeoutMs: 120000, maxTimeoutMs: 600000 }` | Bash 前景 timeout（背景工作的時間上限另計：預設 30 分、最多 2 小時） |
 
 ## Hooks
 
@@ -89,13 +93,16 @@ const { session } = await createAgentSession({ cwd, modelRuntime, resourceLoader
 
 ## 與 Claude Code 的差異
 
-- 不含權限系統。
-- Bash 不載入使用者 shell profile（alias / function 不可用）；同一則回覆中平行的 Bash 共用工作目錄。
-- Glob 不讀 `.gitignore`（但預設跳過 `node_modules`、`.git` 等）。
-- PDF 需要系統安裝 poppler（`pdftotext`、`pdfinfo`，掃描頁轉圖需 `pdftoppm`）。
-- 待辦提醒是暫時注入（只出現在該次 LLM 呼叫），不寫入 session。
-- Subagent 使用記憶體內預設設定與 `getAgentDir()`（拿不到父 session 的 settingsManager）；憑證與模型目錄共用父 session 的 ModelRuntime。
-- 工具搜尋用 pi 內建的 `tool_search`（參數 `query`、`limit`），不是 Claude Code 的 `ToolSearch`（`select:` 語法）。
+- 不含權限系統，也沒有 SendMessage、Cron、Workflow、Monitor 等 Claude Code 的其他工具。
+- 工具搜尋用 pi 內建的 `tool_search`（參數 `query`、`limit`），不是 Claude Code 的 `ToolSearch`。
+- Grep 的 content／count 模式依路徑排序；Claude Code 直接沿用多執行緒 ripgrep 的輸出順序，每次可能不同。
+- Read 圖片時，pi 的 Anthropic provider 會在純圖片的工具結果前加一段「(see attached image)」文字。
+- 整份 PDF 以頁面圖片（或 pdftotext 文字）提供給模型，不是 Claude Code 的 PDF document block；需要系統安裝 poppler。
+- Read 的 token 數用估算（字元數 ÷ 4），Claude Code 會向 API 精算。
+- pi 送出工具 schema 時會拿掉 `additionalProperties: false`。
+- Bash 不載入使用者 shell profile（alias / function 不可用）。
+- Subagent 使用記憶體內預設設定與 `getAgentDir()`；憑證與模型目錄共用父 session 的 ModelRuntime。不支援接續已完成的 agent（Claude Code 改用 SendMessage）。
+- 工作清單的提醒是暫時注入（只出現在該次 LLM 呼叫），不寫入 session。
 
 ## 與 Claude Code 的差異測試（parity）
 
@@ -111,7 +118,11 @@ npx tsx parity/run.ts --only grep-modes,glob # 只跑部分情境
 npx tsx parity/debug.ts edit-guards claude  # 印出單一情境、單一 harness 的請求紀錄
 ```
 
-新增情境：在 `parity/scenarios/` 加一個 `Scenario`。路徑寫成 `{{cwd}}`；兩邊工具名稱或參數不同時，用 `claude` / `pi` 覆寫；參數可以寫成函式，從前面的工具結果取值（例如背景工作 id）。子 agent 的劇本放在 `subagents`，並在 Task/Agent 的 prompt 裡寫 `[[sub:名稱]]`。
+新增情境：在 `parity/scenarios/` 加一個 `Scenario`。路徑寫成 `{{cwd}}`；兩邊工具名稱或參數不同時，用 `claude` / `pi` 覆寫；參數可以寫成函式，從前面的工具結果取值（例如背景工作 id）。子 agent 的劇本放在 `subagents`，並在 Agent 的 prompt 裡寫 `[[sub:名稱]]`。
+
+```bash
+npx tsx parity/debug.ts <情境> claude --full  # 印出完整（未截斷）的工具結果
+```
 
 ## 開發
 

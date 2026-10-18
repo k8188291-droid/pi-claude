@@ -90,7 +90,7 @@ describe("deferred tools via pi's built-in tool_search", () => {
 				agents: { finder: { description: "finds files", prompt: "CHILD", tools: ["Glob", "Read"] } },
 			},
 			responses: [
-				toolUse(fauxToolCall("Task", { description: "find files", prompt: "go", subagent_type: "finder" })),
+				toolUse(fauxToolCall("Agent", { description: "find files", prompt: "go", subagent_type: "finder", run_in_background: false })),
 				(ctx) => {
 					child = names(ctx);
 					return toolUse(fauxToolCall("tool_search", { query: "glob file pattern" }));

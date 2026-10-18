@@ -14,6 +14,8 @@ export interface CCContext {
 	/** Background-task notifications: attached to the next tool result, or start a turn when idle. */
 	notifications: Pick<NotificationQueue, "enqueue" | "discard">;
 	emit(event: ClaudeCodeHostEvent): void;
+	/** The session's task list (set by the task tools; passed to subagents). */
+	taskStore?: import("../tools/task-tools.js").TaskStore;
 }
 
 /** `pi` is needed for notifications; unit tests may omit it (notifications are then dropped). */

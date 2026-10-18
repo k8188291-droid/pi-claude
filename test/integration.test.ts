@@ -18,11 +18,11 @@ describe("integration: all modules together", () => {
 			],
 		});
 		await t.session.prompt("hi");
-		expect(names).toEqual(["AskUserQuestion", "Bash", "BashOutput", "Edit", "Glob", "Grep", "KillShell", "Read", "Task", "TodoWrite", "Write"]);
+		expect(names).toEqual(["Agent", "AskUserQuestion", "Bash", "Edit", "Glob", "Grep", "NotebookEdit", "Read", "TaskCreate", "TaskGet", "TaskList", "TaskStop", "TaskUpdate", "Write"]);
 		t.dispose();
 	});
 
-	it("Read → Edit → Bash big output spilled → Read the spill file → TodoWrite", async () => {
+	it("Edit → Read → Edit → Bash big output spilled → Read the spill file → TaskCreate", async () => {
 		const events: ClaudeCodeHostEvent[] = [];
 		const t = await createTestSession({
 			responses: [],
@@ -34,7 +34,7 @@ describe("integration: all modules together", () => {
 		t.faux.setResponses([
 			toolUse(fauxToolCall("Edit", { file_path: file, old_string: "hello", new_string: "bye" })),
 			toolUse(fauxToolCall("Read", { file_path: file })),
-			toolUse(fauxToolCall("Edit", { file_path: file, old_string: "hello", new_string: "bye" })),
+			toolUse(fauxToolCall("Edit", { file_path: file, old_string: "world", new_string: "all" })),
 			toolUse(fauxToolCall("Bash", { command: "seq 1 20000" })),
 			(ctx) => {
 				const last = ctx.messages.at(-1) as any;
@@ -42,20 +42,20 @@ describe("integration: all modules together", () => {
 				spillPath = /Full output saved to: (\S+)/.exec(text)?.[1] ?? "";
 				return toolUse(fauxToolCall("Read", { file_path: spillPath, offset: 19999, limit: 2 }));
 			},
-			toolUse(
-				fauxToolCall("TodoWrite", {
-					todos: [{ content: "Check output", activeForm: "Checking output", status: "completed" }],
-				}),
-			),
+			toolUse(fauxToolCall("TaskCreate", { subject: "Check output", description: "Check the output", activeForm: "Checking output" })),
 			fauxAssistantMessage("done"),
 		]);
 		await t.session.prompt("go");
 		const r = t.toolResults();
-		expect(r[0]).toMatchObject({ toolName: "Edit", isError: true });
-		expect(r[0].text).toMatch(/has not been read/);
+		// Claude Code no longer requires a Read before Edit; the file-state note needs a full read
+		expect(r[0]).toMatchObject({ toolName: "Edit", isError: false, text: `The file ${file} has been updated successfully.` });
 		expect(r[1]).toMatchObject({ toolName: "Read", isError: false });
-		expect(r[2]).toMatchObject({ toolName: "Edit", isError: false });
-		expect(readFileSync(file, "utf8")).toBe("bye world\n");
+		expect(r[2]).toMatchObject({
+			toolName: "Edit",
+			isError: false,
+			text: `The file ${file} has been updated successfully. (file state is current in your context — no need to Read it back)`,
+		});
+		expect(readFileSync(file, "utf8")).toBe("bye all\n");
 		expect(r[3].toolName).toBe("Bash");
 		expect(r[3].text.length).toBeLessThan(10000);
 		expect(spillPath).not.toBe("");
@@ -63,15 +63,15 @@ describe("integration: all modules together", () => {
 		expect(r[4].text).toMatch(/19999\t19999/);
 		expect(r[4].text).toMatch(/20000\t20000/);
 		expect(events.some((e) => e.type === "output_spilled")).toBe(true);
-		expect(events.some((e) => e.type === "todos_updated" && e.todos.length === 1)).toBe(true);
+		expect(events.some((e) => e.type === "todos_updated" && e.todos.length === 1 && e.todos[0].content === "Check output")).toBe(true);
 		t.dispose();
 	});
 
-	it("subagentExtensions are installed in Task child sessions", async () => {
+	it("subagentExtensions are installed in Agent child sessions", async () => {
 		let childTools: string[] = [];
 		const t = await createTestSession({
 			responses: [
-				toolUse(fauxToolCall("Task", { description: "check tools", prompt: "list tools", subagent_type: "general-purpose" })),
+				toolUse(fauxToolCall("Agent", { description: "check tools", prompt: "list tools", subagent_type: "general-purpose", run_in_background: false })),
 				(ctx) => {
 					childTools = (ctx.tools ?? []).map((x: any) => x.name);
 					return fauxAssistantMessage("child done");
@@ -96,7 +96,7 @@ describe("integration: all modules together", () => {
 		});
 		await t.session.prompt("go");
 		expect(childTools).toContain("HostTool");
-		expect(childTools).not.toContain("Task");
+		expect(childTools).not.toContain("AskUserQuestion");
 		expect(t.toolResults()[0].text).toMatch(/child done/);
 		t.dispose();
 	});

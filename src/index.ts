@@ -13,7 +13,7 @@ import { registerNotebookEdit } from "./tools/notebook-edit.js";
 import { registerTaskStop } from "./tools/task-stop.js";
 import { registerAskUserQuestion } from "./tools/ask-user-question.js";
 import { registerToolSearchActivation, withDeferredExposure } from "./deferred-tools.js";
-import { registerTask } from "./subagent/index.js";
+import { registerTask, registerUnknownToolErrors } from "./subagent/index.js";
 
 export * from "./shared/types.js";
 export { createClaudeCodeSession, type CreateClaudeCodeSessionOptions } from "./sdk.js";
@@ -38,6 +38,8 @@ export function createClaudeCodeExtension(options: ClaudeCodeToolsOptions = {}):
 		registerTaskStop(pi, cc);
 		if (!options.isSubagent) registerAskUserQuestion(pi, cc);
 		if (!options.isSubagent && options.subagents !== false) registerTask(pi, cc);
+		// Claude Code wording for calls to tools that are not available
+		if (!options.isSubagent) registerUnknownToolErrors(realPi);
 		registerToolSearchActivation(realPi);
 		if (options.outputSpill !== false) registerOutputSpill(pi, cc);
 		// after spill, so notifications are never spilled into a file

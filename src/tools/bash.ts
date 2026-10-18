@@ -1,47 +1,70 @@
 import { randomBytes } from "node:crypto";
-import { existsSync, readFileSync, rmSync, statSync } from "node:fs";
+import { closeSync, existsSync, openSync, readFileSync, realpathSync, rmSync, statSync, writeSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, isAbsolute, join, relative } from "node:path";
 import type { AgentToolResult, ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
+import { newTaskId, type BackgroundTask } from "../shared/background.js";
 import type { CCContext } from "../shared/context.js";
-import { sendReminder } from "../shared/reminders.js";
+import { formatTaskNotification } from "../shared/notifications.js";
 import { textResult } from "../shared/text.js";
-import {
-	OutputBuffer,
-	buildScript,
-	formatDuration,
-	normalizeOutput,
-	spawnShell,
-	type SpawnedShell,
-} from "./bash-process.js";
+import { claudeInputValidator, type Spec } from "./input-validation.js";
+import { OutputBuffer, buildScript, formatClaudeDuration, spawnShell, type SpawnedShell } from "./bash-process.js";
 
 const DEFAULT_TIMEOUT_MS = 120_000;
 const MAX_TIMEOUT_MS = 600_000;
+/** With run_in_background, `timeout` is how long the command may run in the background. */
+const BACKGROUND_DEFAULT_TIMEOUT_MS = 1_800_000;
+const BACKGROUND_MAX_TIMEOUT_MS = 7_200_000;
+/** Output kept in memory for a failed command's result (Claude Code's BASH_MAX_OUTPUT_LENGTH). */
+const MAX_OUTPUT_CHARS = 30_000;
+/** Claude Code truncates tool error text to this many characters (head + tail). */
+const MAX_ERROR_CHARS = 10_000;
+/** Exit code Claude Code reports for a foreground command killed at its timeout. */
+const TIMEOUT_EXIT_CODE = 143;
 const UPDATE_THROTTLE_MS = 100;
 /** Max characters sent in a single streaming progress update. */
 const UPDATE_TAIL_CHARS = 50_000;
 
-export type BackgroundShellStatus = "running" | "completed" | "failed" | "killed";
+const NO_OUTPUT = "(Bash completed with no output)";
+const ABORTED = "<error>Command was aborted before completion</error>";
+const BG_CWD_NOTE = "directory changes made by the backgrounded command do not apply to subsequent commands.";
+const DEADLINE_NOTE =
+	"If the work in progress still needs it, start it again with `run_in_background` and a longer `timeout`. If it already had the longest `timeout` allowed, do not restart it. Either way, report that it was stopped.";
 
-export interface BackgroundShell {
-	id: string;
+/** Commands whose first word keeps them from being moved to the background at their timeout. */
+const NO_AUTO_BACKGROUND = new Set(["sleep"]);
+/** Commands for which exit code 1 is not an error (only >= 2 is). Keyed by the last command's first word. */
+const EXIT_1_OK = new Set(["grep", "rg", "egrep", "fgrep", "find", "diff", "test", "["]);
+const CD_COMMANDS = new Set(["cd", "pushd", "popd", "chdir"]);
+/** Formatter/fixer commands after which Claude Code checks for previously read files they modified. */
+const FORMATTER_RE = new RegExp(
+	[
+		"--write", "--fix", "--in-place", "--auto-correct", "\\brun\\s+format\\b", "\\brun\\s+fix\\b", "\\b(yarn|pnpm)\\s+format\\b",
+		"\\blint:file\\b", "\\blint:fix\\b", "\\bblack\\b", "\\bisort\\b", "\\bruff\\s+format\\b", "\\bcargo\\s+(fmt|fix)\\b",
+		"\\brustfmt\\b", "\\bgo\\s+fmt\\b", "\\bterraform\\s+fmt\\b", "\\bdprint\\s+fmt\\b", "\\bswiftformat\\b", "\\bphpcbf\\b",
+	].join("|"),
+);
+
+/** Claude Code's zod schema for Bash input (strict: unknown keys are rejected). */
+const BashSpec: Spec = {
+	kind: "object",
+	strict: true,
+	props: {
+		command: { spec: { kind: "string" } },
+		timeout: { spec: { kind: "unknown" }, optional: true },
+		description: { spec: { kind: "string" }, optional: true },
+		run_in_background: { spec: { kind: "boolean" }, optional: true },
+		dangerouslyDisableSandbox: { spec: { kind: "boolean" }, optional: true },
+	},
+};
+
+interface BashInput {
 	command: string;
+	timeout?: unknown;
 	description?: string;
-	cwd: string;
-	startTime: number;
-	endTime?: number;
-	status: BackgroundShellStatus;
-	exitCode: number | null;
-	signal: NodeJS.Signals | null;
-	output: OutputBuffer;
-	/** Absolute offset into `output` up to which the model has read. */
-	cursor: number;
-	/** The model has seen the final status via BashOutput (no completion notice needed). */
-	finalSeen?: boolean;
-	/** Exited while the agent was running; notify at agent_end unless finalSeen by then. */
-	notifyPending?: boolean;
-	proc: SpawnedShell;
+	run_in_background?: boolean;
+	dangerouslyDisableSandbox?: boolean;
 }
 
 export interface BashDetails {
@@ -51,7 +74,233 @@ export interface BashDetails {
 	timedOut?: boolean;
 	interrupted?: boolean;
 	backgroundTaskId?: string;
-	droppedChars?: number;
+	outputFile?: string;
+}
+
+const BASH_DESCRIPTION = `Executes a given bash command and returns its output.
+
+The working directory persists between commands, but shell state does not. The shell environment is initialized from the user's profile (bash or zsh).
+
+IMPORTANT: Avoid using this tool to run \`find\`, \`grep\`, \`cat\`, \`head\`, \`tail\`, \`sed\`, \`awk\`, or \`echo\` commands, unless explicitly instructed or after you have verified that a dedicated tool cannot accomplish your task. Instead, use the appropriate dedicated tool as this will provide a much better experience for the user:
+
+ - File search: Use Glob (NOT find or ls)
+ - Content search: Use Grep (NOT grep or rg)
+ - Read files: Use Read (NOT cat/head/tail)
+ - Edit files: Use Edit (NOT sed/awk)
+ - Write files: Use Write (NOT echo >/cat <<EOF)
+ - Communication: Output text directly (NOT echo/printf)
+While the Bash tool can do similar things, it’s better to use the built-in tools as they provide a better user experience and make it easier to review tool calls and give permission.
+
+# Instructions
+ - If your command will create new directories or files, first use this tool to run \`ls\` to verify the parent directory exists and is the correct location.
+ - Always quote file paths that contain spaces with double quotes in your command (e.g., cd "path with spaces/file.txt")
+ - Try to maintain your current working directory throughout the session by using absolute paths and avoiding usage of \`cd\`. You may use \`cd\` if the User explicitly requests it. In particular, never prepend \`cd <current-directory>\` to a \`git\` command — \`git\` already operates on the current working tree, and the compound triggers a permission prompt.
+ - You may specify an optional timeout in milliseconds (up to {MAX} for a foreground command). By default, your command will timeout after {DEF}.
+ - You can use the \`run_in_background\` parameter to run the command in the background. Only use this if you don't need the result immediately and are OK being notified when the command completes later. You do not need to check the output right away - you'll be notified when it finishes. You do not need to use '&' at the end of the command when using this parameter. With \`run_in_background\` the timeout is instead how long the command may run in the background (default {BGDEF}, max {BGMAX}); at that limit it is stopped and you are notified.
+ - For git commands:
+  - Prefer to create a new commit rather than amending an existing commit.
+  - Before running destructive operations (e.g., git reset --hard, git push --force, git checkout --), consider whether there is a safer alternative that achieves the same goal. Only use destructive operations when they are truly the best approach.
+  - Never skip hooks (--no-verify) or bypass signing (--no-gpg-sign, -c commit.gpgsign=false) unless the user has explicitly asked for it. If a hook fails, investigate and fix the underlying issue.
+ - Avoid unnecessary \`sleep\` commands:
+  - Do not sleep between commands that can run immediately — just run them.
+  - If your command is long running and you would like to be notified when it finishes — use \`run_in_background\`. No sleep needed.
+  - Do not retry failing commands in a sleep loop — diagnose the root cause.
+  - If waiting for a background task you started with \`run_in_background\`, you will be notified when it completes — do not poll.
+  - If you must poll an external process, use a check command (e.g. \`gh run view\`) rather than sleeping first.
+  - If you must sleep, keep the duration short to avoid blocking the user.
+
+
+# Committing changes with git
+
+Only create commits when requested by the user. If unclear, ask first. When the user asks you to create a new git commit, follow these steps carefully:
+
+You can call multiple tools in a single response. When multiple independent pieces of information are requested and all commands are likely to succeed, run multiple tool calls in parallel for optimal performance. The numbered steps below indicate which commands should be batched in parallel.
+
+Git Safety Protocol:
+- NEVER update the git config
+- NEVER run destructive git commands (push --force, reset --hard, checkout ., restore ., clean -f, branch -D) unless the user explicitly requests these actions. Taking unauthorized destructive actions is unhelpful and can result in lost work, so it's best to ONLY run these commands when given direct instructions 
+- NEVER skip hooks (--no-verify, --no-gpg-sign, etc) unless the user explicitly requests it
+- NEVER run force push to main/master, warn the user if they request it
+- CRITICAL: Always create NEW commits rather than amending, unless the user explicitly requests a git amend. When a pre-commit hook fails, the commit did NOT happen — so --amend would modify the PREVIOUS commit, which may result in destroying work or losing previous changes. Instead, after hook failure, fix the issue, re-stage, and create a NEW commit
+- When staging files, prefer adding specific files by name rather than using "git add -A" or "git add .", which can accidentally include sensitive files (.env, credentials) or large binaries
+- NEVER commit changes unless the user explicitly asks you to. It is VERY IMPORTANT to only commit when explicitly asked, otherwise the user will feel that you are being too proactive
+
+1. Run the following bash commands in parallel, each using the Bash tool:
+  - Run a git status command to see all untracked files. IMPORTANT: Never use the -uall flag as it can cause memory issues on large repos.
+  - Run a git diff command to see both staged and unstaged changes that will be committed.
+  - Run a git log command to see recent commit messages, so that you can follow this repository's commit message style.
+2. Analyze all staged changes (both previously staged and newly added) and draft a commit message:
+  - Summarize the nature of the changes (eg. new feature, enhancement to an existing feature, bug fix, refactoring, test, docs, etc.). Ensure the message accurately reflects the changes and their purpose (i.e. "add" means a wholly new feature, "update" means an enhancement to an existing feature, "fix" means a bug fix, etc.).
+  - Do not commit files that likely contain secrets (.env, credentials.json, etc). Warn the user if they specifically request to commit those files
+  - Draft a concise (1-2 sentences) commit message that focuses on the "why" rather than the "what"
+  - Ensure it accurately reflects the changes and their purpose
+3. Run the following commands in parallel:
+   - Add relevant untracked files to the staging area.
+   - Create the commit with a message, ending with the attribution lines given in the conversation's system-reminder, when one is present.
+   - Run git status after the commit completes to verify success.
+   Note: git status depends on the commit completing, so run it sequentially after the commit.
+4. If the commit fails due to pre-commit hook: fix the issue and create a NEW commit
+
+Important notes:
+- NEVER run additional commands to read or explore code, besides git bash commands
+- NEVER use the TaskCreate or Agent tools
+- DO NOT push to the remote repository unless the user explicitly asks you to do so
+- IMPORTANT: Never use git commands with the -i flag (like git rebase -i or git add -i) since they require interactive input which is not supported.
+- IMPORTANT: Do not use --no-edit with git rebase commands, as the --no-edit flag is not a valid option for git rebase.
+- If there are no changes to commit (i.e., no untracked files and no modifications), do not create an empty commit
+- In order to ensure good formatting, ALWAYS pass the commit message via a HEREDOC, a la this example:
+<example>
+git commit -m "$(cat <<'EOF'
+   Commit message here.
+   EOF
+   )"
+</example>
+
+# Creating pull requests
+Use the gh command via the Bash tool for ALL GitHub-related tasks including working with issues, pull requests, checks, and releases. If given a Github URL use the gh command to get the information needed.
+
+IMPORTANT: When the user asks you to create a pull request, follow these steps carefully:
+
+1. Run the following bash commands in parallel using the Bash tool, in order to understand the current state of the branch since it diverged from the main branch:
+   - Run a git status command to see all untracked files (never use -uall flag)
+   - Run a git diff command to see both staged and unstaged changes that will be committed
+   - Check if the current branch tracks a remote branch and is up to date with the remote, so you know if you need to push to the remote
+   - Run a git log command and \`git diff [base-branch]...HEAD\` to understand the full commit history for the current branch (from the time it diverged from the base branch)
+2. Analyze all changes that will be included in the pull request, making sure to look at all relevant commits (NOT just the latest commit, but ALL commits that will be included in the pull request!!!), and draft a pull request title and summary:
+   - Keep the PR title short (under 70 characters)
+   - Use the description/body for details, not the title
+3. Run the following commands in parallel:
+   - Create new branch if needed
+   - Push to remote with -u flag if needed
+   - Create PR using gh pr create with the format below. Use a HEREDOC to pass the body to ensure correct formatting. End the body with the attribution lines given in the conversation's system-reminder, when one is present.
+<example>
+gh pr create --title "the pr title" --body "$(cat <<'EOF'
+## Summary
+<1-3 bullet points>
+
+## Test plan
+[Bulleted markdown checklist of TODOs for testing the pull request...]
+EOF
+)"
+</example>
+
+Important:
+- DO NOT use the TaskCreate or Agent tools
+- Return the PR URL when you're done, so the user can see it
+
+# Other common operations
+- View comments on a Github PR: gh api repos/foo/bar/pulls/123/comments`;
+
+function minutesLabel(ms: number): string {
+	const min = ms / 60000;
+	if (min >= 60 && min % 60 === 0) return `${min / 60} ${min === 60 ? "hour" : "hours"}`;
+	const n = Number.isInteger(min) ? String(min) : String(Math.round(min * 10) / 10);
+	return `${n} ${min === 1 ? "minute" : "minutes"}`;
+}
+
+function bashDescription(defMs: number, maxMs: number): string {
+	return BASH_DESCRIPTION.replace("{MAX}", `${maxMs}ms / ${minutesLabel(maxMs)}`)
+		.replace("{DEF}", `${defMs}ms (${minutesLabel(defMs)})`)
+		.replace("{BGDEF}", `${BACKGROUND_DEFAULT_TIMEOUT_MS}ms / ${minutesLabel(BACKGROUND_DEFAULT_TIMEOUT_MS)}`)
+		.replace("{BGMAX}", `${BACKGROUND_MAX_TIMEOUT_MS}ms / ${minutesLabel(BACKGROUND_MAX_TIMEOUT_MS)}`);
+}
+
+const DESCRIPTION_PARAM = `Clear, concise description of what this command does in active voice. Never use words like "complex" or "risk" in the description - just describe what it does.
+
+Say what the command does in plain words: do not echo the command's text, its flags, or file paths - the user reads this description, often without seeing the command.
+
+For simple commands (git, npm, standard CLI tools), keep it brief (5-10 words):
+- ls → "List files in current directory"
+- git status → "Show working tree status"
+- npm install → "Install package dependencies"
+
+For commands that are harder to parse at a glance (piped commands, obscure flags, etc.), add enough context to clarify what it does:
+- find . -name "*.tmp" -exec rm {} \; → "Find and delete all .tmp files recursively"
+- git reset --hard origin/main → "Discard all local changes and match remote main"
+- curl -s url | jq '.data[]' → "Fetch JSON from URL and extract data array elements"`;
+
+// ------------------------------------------------------------------ command analysis
+
+/** Split a command line into simple commands at unquoted `&&`, `||`, `;`, `|`, `&` and newlines. */
+export function splitCommands(command: string): string[] {
+	const parts: string[] = [];
+	let cur = "";
+	let quote: "'" | '"' | undefined;
+	for (let i = 0; i < command.length; i++) {
+		const ch = command[i];
+		if (quote) {
+			cur += ch;
+			if (ch === "\\" && quote === '"' && i + 1 < command.length) cur += command[++i];
+			else if (ch === quote) quote = undefined;
+			continue;
+		}
+		if (ch === "\\" && i + 1 < command.length) {
+			cur += ch + command[++i];
+			continue;
+		}
+		if (ch === "'" || ch === '"') {
+			quote = ch;
+			cur += ch;
+			continue;
+		}
+		if (ch === ";" || ch === "|" || ch === "&" || ch === "\n" || ch === "\r") {
+			if ((ch === "|" || ch === "&") && command[i + 1] === ch) i++;
+			if (cur.trim()) parts.push(cur.trim());
+			cur = "";
+			continue;
+		}
+		cur += ch;
+	}
+	if (cur.trim()) parts.push(cur.trim());
+	return parts;
+}
+
+const firstWord = (s: string) => s.trim().split(/\s+/)[0] ?? "";
+
+/** Claude Code's exit-code interpretation: for grep/find/diff/test (and git diff/grep), exit 1 is not an error. */
+export function isErrorExit(command: string, exitCode: number): boolean {
+	if (exitCode === 0) return false;
+	const last = splitCommands(command).at(-1) ?? command;
+	const words = last.trim().split(/\s+/);
+	let exit1Ok = EXIT_1_OK.has(words[0] ?? "");
+	if (words[0] === "git") {
+		for (let i = 1; i < words.length; i++) {
+			const w = words[i];
+			if (w.startsWith("-")) {
+				if (w === "-C" || w === "-c") i++;
+				continue;
+			}
+			exit1Ok = w === "diff" || w === "grep";
+			break;
+		}
+	}
+	return exit1Ok ? exitCode >= 2 : true;
+}
+
+function canAutoBackground(command: string): boolean {
+	const first = splitCommands(command)[0];
+	return first === undefined || !NO_AUTO_BACKGROUND.has(firstWord(first));
+}
+
+function changesDirectory(command: string): boolean {
+	return splitCommands(command).some((c) => CD_COMMANDS.has(firstWord(c)));
+}
+
+/** Claude Code's tool-error truncation: keep the first and last 5000 characters. */
+export function truncateError(text: string, max = MAX_ERROR_CHARS): string {
+	if (text.length <= max) return text;
+	const half = Math.floor(max / 2);
+	return `${text.slice(0, half)}\n\n... [${text.length - max} characters truncated] ...\n\n${text.slice(-half)}`;
+}
+
+function escapeXml(s: string): string {
+	return s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+}
+
+/** Claude Code's exit code for a process that ended by signal. */
+function exitCodeOf(exit: { exitCode: number | null; signal: NodeJS.Signals | null }): number {
+	if (exit.exitCode !== null) return exit.exitCode;
+	return exit.signal === "SIGTERM" ? 144 : 1;
 }
 
 function isDir(p: string): boolean {
@@ -62,62 +311,66 @@ function isDir(p: string): boolean {
 	}
 }
 
-const BASH_DESCRIPTION = `Executes a given bash command and returns its output (stdout and stderr combined).
-
-The working directory persists between commands, but shell state does not: environment variables, aliases and functions set in one command are NOT available in the next. The shell environment is initialized from the process environment.
-
-IMPORTANT: Avoid using this tool to run \`find\`, \`grep\`, \`cat\`, \`head\`, \`tail\`, \`sed\`, \`awk\`, or \`echo\` commands, unless explicitly instructed or after you have verified that a dedicated tool cannot accomplish your task. Instead, use the appropriate dedicated tool as this will provide a much better experience:
-- File search: Use Glob (NOT find or ls)
-- Content search: Use Grep (NOT grep or rg)
-- Read files: Use Read (NOT cat/head/tail)
-- Edit files: Use Edit (NOT sed/awk)
-- Write files: Use Write (NOT echo >/cat <<EOF)
-- Communication: Output text directly (NOT echo/printf)
-
-# Instructions
-- If your command will create new directories or files, first verify the parent directory exists and is the correct location.
-- Always quote file paths that contain spaces with double quotes (e.g. cd "path with spaces/file.txt").
-- Try to maintain your current working directory throughout the session by using absolute paths and avoiding usage of \`cd\`. You may use \`cd\` if the user explicitly requests it.
-- You may specify an optional timeout in milliseconds (up to {MAX}ms / {MAXMIN} minutes). By default, your command will timeout after {DEF}ms ({DEFMIN} minutes).
-- Commands run non-interactively with stdin connected to /dev/null. Interactive flags (e.g. \`git rebase -i\`, \`git add -i\`) are not supported.
-- If the output is very long it may be saved to a file and only a preview returned; read the file for the full output.
-- You can use the \`run_in_background\` parameter to run the command in the background. Only use this if you don't need the result immediately and are OK being notified when the command completes later. You do not need to check the output right away - you'll be notified when it finishes. Use BashOutput to read the output and KillShell to stop it. You do not need to use '&' at the end of the command when using this parameter.
-- Write a clear, concise description of what your command does in the \`description\` parameter.
-- When issuing multiple commands:
-  - If the commands are independent and can run in parallel, make multiple Bash tool calls in a single message.
-  - If the commands depend on each other and must run sequentially, use a single Bash call with '&&' to chain them together.
-  - Use ';' only when you need to run commands sequentially but don't care if earlier commands fail.
-  - DO NOT use newlines to separate commands (newlines are ok in quoted strings).
-- A non-zero exit code is reported as an error, together with the command's output.
-- Avoid unnecessary \`sleep\` commands: do not sleep between commands that can run immediately, and do not retry failing commands in a sleep loop - diagnose the root cause instead.
-
-# Git
-- Commit or push only when the user asks. Prefer creating a new commit rather than amending an existing one.
-- Never run destructive git commands (push --force, reset --hard, checkout ., clean -f, branch -D) unless the user explicitly requests them, and never skip hooks (--no-verify) unless asked.
-- When staging files, prefer adding specific files by name rather than "git add -A" or "git add .".
-- Use the gh CLI for GitHub tasks (pull requests, issues, checks, releases).`;
-
-function bashDescription(defMs: number, maxMs: number): string {
-	const min = (ms: number) => String(Math.round((ms / 60000) * 10) / 10);
-	return BASH_DESCRIPTION.replace("{MAX}", String(maxMs))
-		.replace("{MAXMIN}", min(maxMs))
-		.replace("{DEF}", String(defMs))
-		.replace("{DEFMIN}", min(defMs));
+function isGitRepo(dir: string): boolean {
+	for (let d = dir; ; d = dirname(d)) {
+		if (existsSync(join(d, ".git"))) return true;
+		if (dirname(d) === d) return false;
+	}
 }
 
-const BASH_OUTPUT_DESCRIPTION = `- Retrieves output from a running or completed background bash shell
-- Takes a bash_id parameter identifying the shell
-- Always returns only new output since the last check
-- Returns the output (stdout and stderr combined) along with shell status and exit code
-- Supports optional regex filtering to show only lines matching a pattern
-- Use this tool when you need to monitor or check the output of a long-running shell
-- Shell IDs are returned by the Bash tool when run_in_background is true`;
+function realpathOr(p: string): string {
+	try {
+		return realpathSync(p);
+	} catch {
+		return p;
+	}
+}
 
-const KILL_SHELL_DESCRIPTION = `- Kills a running background bash shell by its ID
-- Takes a shell_id parameter identifying the shell to kill
-- Returns a success or failure status
-- Use this tool when you need to terminate a long-running shell
-- Shell IDs are returned by the Bash tool when run_in_background is true`;
+function isWithin(child: string, parent: string): boolean {
+	const rel = relative(parent, child);
+	return rel === "" || (!rel.startsWith("..") && !isAbsolute(rel));
+}
+
+// ------------------------------------------------------------------ running commands
+
+/** A spawned command whose output is buffered in memory and, once it runs in the background, written to a file. */
+interface ShellRun {
+	proc: SpawnedShell;
+	output: OutputBuffer;
+	/** First MAX_OUTPUT_CHARS characters of output (what a failed command's result shows). */
+	head: string;
+	/** Output file descriptor once the command became a background task. */
+	fd?: number;
+	onData?: (text: string) => void;
+	done: Promise<{ exitCode: number | null; signal: NodeJS.Signals | null }>;
+}
+
+function startRun(script: string, cwd: string): ShellRun {
+	const run = { output: new OutputBuffer(), head: "" } as ShellRun;
+	run.proc = spawnShell(script, cwd, (text) => {
+		if (run.fd !== undefined) {
+			try {
+				writeSync(run.fd, text);
+			} catch {
+				// output file gone; keep running
+			}
+		} else {
+			run.output.append(text);
+			if (run.head.length < MAX_OUTPUT_CHARS) run.head += text.slice(0, MAX_OUTPUT_CHARS - run.head.length);
+		}
+		run.onData?.(text);
+	});
+	run.done = run.proc.done.catch((err: Error) => {
+		const text = `${err.message}\n`;
+		if (run.fd !== undefined) {
+			try {
+				writeSync(run.fd, text);
+			} catch {}
+		} else run.output.append(text);
+		return { exitCode: 127, signal: null };
+	});
+	return run;
+}
 
 export function registerBash(pi: ExtensionAPI, cc: CCContext): void {
 	const maxTimeout = Math.max(cc.options.bash?.maxTimeoutMs ?? MAX_TIMEOUT_MS, 1);
@@ -125,39 +378,141 @@ export function registerBash(pi: ExtensionAPI, cc: CCContext): void {
 
 	/** Persistent shell cwd for this session (undefined until the first command). */
 	let shellCwd: string | undefined;
-	const shells = new Map<string, BackgroundShell>();
-	let nextShellId = 1;
+	/** Working directory the model was last told about (environment-update reminders). */
+	let announcedCwd: string | undefined;
+	const live = new Set<ShellRun>();
 	let shuttingDown = false;
-	let agentRunning = false;
 
-	function resolveCwd(baseCwd: string): { cwd: string; resetNote?: string } {
-		if (shellCwd && isDir(shellCwd)) return { cwd: shellCwd };
-		const prev = shellCwd;
-		shellCwd = baseCwd;
-		return { cwd: baseCwd, resetNote: prev ? `Shell cwd was reset to ${baseCwd} (previous directory ${prev} no longer exists)` : undefined };
+	function resolveCwd(baseCwd: string): string {
+		announcedCwd ??= baseCwd;
+		if (!shellCwd || !isDir(shellCwd)) shellCwd = baseCwd;
+		return shellCwd;
 	}
 
-	function clampTimeout(t: number | undefined): number {
-		if (t === undefined || !Number.isFinite(t) || t <= 0) return defaultTimeout;
-		return Math.min(Math.max(Math.floor(t), 1), maxTimeout);
+	function clampTimeout(t: number | undefined, def: number, max: number): number {
+		if (t === undefined || !Number.isFinite(t) || t <= 0) return Math.min(def, max);
+		return Math.min(Math.max(Math.floor(t), 1), max);
 	}
 
-	function knownIds(): string {
-		return shells.size ? [...shells.keys()].join(", ") : "(none)";
+	/** "# Environment update" reminder when the shell cwd changed since the model was last told. */
+	function environmentUpdate(): string | undefined {
+		if (!shellCwd || !announcedCwd || shellCwd === announcedCwd) return undefined;
+		const lines = [` - Primary working directory: ${shellCwd} (was ${announcedCwd})`];
+		const wasGit = isGitRepo(announcedCwd);
+		const isGit = isGitRepo(shellCwd);
+		if (wasGit !== isGit) lines.push(` - Is a git repository: ${isGit} (was ${wasGit})`);
+		announcedCwd = shellCwd;
+		return `<system-reminder>\n# Environment update\n${lines.join("\n")}\n</system-reminder>`;
 	}
 
-	// ---------------------------------------------------------------- Bash (foreground)
+	/** After a formatter/fixer, name previously read files it modified (they must be re-read before editing). */
+	function staleReadHint(command: string, startedAt: number): string | undefined {
+		if (!FORMATTER_RE.test(command)) return undefined;
+		const changed = cc.fileState.changedSinceRead().filter((p) => {
+			try {
+				return statSync(p).mtimeMs > startedAt;
+			} catch {
+				return false;
+			}
+		});
+		if (changed.length === 0) return undefined;
+		const base = shellCwd ?? process.cwd();
+		const names = changed.slice(0, 5).map((p) => (isWithin(p, base) ? relative(base, p) || p : p));
+		const more = changed.length > 5 ? ` and ${changed.length - 5} more` : "";
+		return `[This command modified ${changed.length} ${changed.length === 1 ? "file" : "files"} you've previously read: ${names.join(", ")}${more}. Call Read before editing.]`;
+	}
+
+	/** Turn a running command into a background task (output file, TaskStop, completion notification). */
+	function adoptAsTask(run: ShellRun, opts: { command: string; description?: string; toolCallId: string; limitMs: number; cleanup?: () => void }): BackgroundTask {
+		const id = newTaskId("local_bash");
+		const outputFile = cc.tasks.outputPath(id);
+		run.fd = openSync(outputFile, "w");
+		const buffered = run.output.toString();
+		if (buffered) writeSync(run.fd, buffered);
+		let stopped = false;
+		let deadlineHit = false;
+		let finish!: () => void;
+		const finished = new Promise<void>((r) => (finish = r));
+		const task = cc.tasks.add({
+			id,
+			type: "local_bash",
+			label: opts.command,
+			status: "running",
+			outputFile,
+			toolUseId: opts.toolCallId,
+			async stop() {
+				stopped = true;
+				run.proc.kill();
+				await finished;
+			},
+		});
+		live.add(run);
+		cc.emit({ type: "background_shell_started", shellId: id, command: opts.command });
+		const deadline = setTimeout(() => {
+			deadlineHit = true;
+			run.proc.kill();
+		}, opts.limitMs);
+		deadline.unref?.();
+
+		void run.done.then((exit) => {
+			clearTimeout(deadline);
+			live.delete(run);
+			opts.cleanup?.();
+			const killed = stopped || deadlineHit || shuttingDown;
+			const code = exitCodeOf(exit);
+			try {
+				writeSync(run.fd!, killed ? "\n[killed]\n" : `\n[exited with code ${code}]\n`);
+				closeSync(run.fd!);
+			} catch {
+				// ignore
+			}
+			task.status = killed ? "killed" : code === 0 ? "completed" : "failed";
+			cc.emit({ type: "background_shell_exited", shellId: id, exitCode: exit.exitCode, signal: exit.signal });
+			finish();
+			if (stopped || shuttingDown) return; // stopped on purpose: no notification
+			const label = `Background command "${opts.description || opts.command}"`;
+			const summary = deadlineHit
+				? `${label} was stopped after reaching its background time limit`
+				: code === 0
+					? `${label} completed (exit code ${code})`
+					: `${label} failed with exit code ${code}`;
+			cc.notifications.enqueue(
+				formatTaskNotification({
+					taskId: id,
+					toolUseId: opts.toolCallId,
+					outputFile,
+					status: task.status as "completed" | "failed" | "killed",
+					summary: escapeXml(summary),
+					note: deadlineHit ? escapeXml(DEADLINE_NOTE) : undefined,
+				}),
+			);
+		});
+		return task;
+	}
+
+	// ---------------------------------------------------------------- foreground
 	async function runForeground(
-		command: string,
-		timeoutMs: number,
+		params: { command: string; description?: string; timeout?: number },
+		toolCallId: string,
 		baseCwd: string,
 		signal: AbortSignal | undefined,
 		onUpdate: ((r: AgentToolResult<BashDetails>) => void) | undefined,
 	): Promise<AgentToolResult<BashDetails>> {
-		if (signal?.aborted) throw new Error("Command was aborted before execution");
-		const { cwd, resetNote } = resolveCwd(baseCwd);
+		const { command } = params;
+		if (signal?.aborted) throw new Error(ABORTED);
+		const timeoutMs = clampTimeout(params.timeout, defaultTimeout, maxTimeout);
+		const cwd = resolveCwd(baseCwd);
 		const cwdFile = join(tmpdir(), `pi-cc-cwd-${process.pid}-${randomBytes(6).toString("hex")}`);
-		const output = new OutputBuffer();
+		const removeCwdFile = () => {
+			try {
+				rmSync(cwdFile, { force: true });
+			} catch {
+				// ignore
+			}
+		};
+		const startedAt = Math.floor(Date.now() / 1000) * 1000;
+		const run = startRun(buildScript(command, cwdFile), cwd);
+		live.add(run);
 
 		let updateTimer: NodeJS.Timeout | undefined;
 		let lastUpdate = 0;
@@ -165,146 +520,104 @@ export function registerBash(pi: ExtensionAPI, cc: CCContext): void {
 			updateTimer = undefined;
 			lastUpdate = Date.now();
 			try {
-				onUpdate?.({ content: [{ type: "text", text: output.tail(UPDATE_TAIL_CHARS) }], details: { cwd } });
+				onUpdate?.({ content: [{ type: "text", text: run.output.tail(UPDATE_TAIL_CHARS) }], details: { cwd } });
 			} catch {
 				// progress consumers must not break execution
 			}
 		};
-		const onData = (text: string) => {
-			output.append(text);
-			if (!onUpdate || updateTimer) return;
-			const delay = UPDATE_THROTTLE_MS - (Date.now() - lastUpdate);
-			if (delay <= 0) flushUpdate();
-			else updateTimer = setTimeout(flushUpdate, delay);
-		};
-
-		const proc = spawnShell(buildScript(command, cwdFile), cwd, onData);
-		let timedOut = false;
-		let interrupted = false;
-		const timer = setTimeout(() => {
-			timedOut = true;
-			proc.kill();
-		}, timeoutMs);
-		const onAbort = () => {
-			interrupted = true;
-			proc.kill();
-		};
-		signal?.addEventListener("abort", onAbort, { once: true });
-
-		let exit: { exitCode: number | null; signal: NodeJS.Signals | null };
-		try {
-			exit = await proc.done;
-		} finally {
-			clearTimeout(timer);
-			if (updateTimer) clearTimeout(updateTimer);
-			signal?.removeEventListener("abort", onAbort);
+		if (onUpdate) {
+			run.onData = () => {
+				if (run.fd !== undefined || updateTimer) return;
+				const delay = UPDATE_THROTTLE_MS - (Date.now() - lastUpdate);
+				if (delay <= 0) flushUpdate();
+				else updateTimer = setTimeout(flushUpdate, delay);
+			};
 		}
 
-		// Update the persistent cwd from the side channel (written by the EXIT trap).
+		let onAbort: (() => void) | undefined;
+		let timer: NodeJS.Timeout | undefined;
+		const outcome = await new Promise<"exit" | "timeout" | "abort">((resolve) => {
+			run.done.then(() => resolve("exit"));
+			timer = setTimeout(() => resolve("timeout"), timeoutMs);
+			onAbort = () => resolve("abort");
+			signal?.addEventListener("abort", onAbort, { once: true });
+		});
+		clearTimeout(timer);
+		if (onAbort) signal?.removeEventListener("abort", onAbort);
+		if (updateTimer) clearTimeout(updateTimer);
+		run.onData = undefined;
+		live.delete(run);
+
+		if (outcome === "timeout" && canAutoBackground(command)) {
+			// Claude Code does not kill a command at its timeout: it keeps running as a background task.
+			const task = adoptAsTask(run, {
+				command,
+				description: params.description,
+				toolCallId,
+				limitMs: BACKGROUND_DEFAULT_TIMEOUT_MS,
+				cleanup: removeCwdFile,
+			});
+			const text =
+				`Command did not complete within its ${Math.max(1, Math.round(timeoutMs / 1000))}s timeout and was moved to the background (ID: ${task.id}). ` +
+				`Output is being written to: ${task.outputFile}. You will be notified when it completes. ` +
+				`If it is still running after ${formatClaudeDuration(BACKGROUND_DEFAULT_TIMEOUT_MS, true)} in the background, it will be stopped and you will be notified. ` +
+				`To check interim output, use Read on that file path.`;
+			return textResult<BashDetails>(text, { backgroundTaskId: task.id, outputFile: task.outputFile, timedOut: true, cwd });
+		}
+
+		if (outcome !== "exit") run.proc.kill();
+		const exit = await run.done;
+		let newCwd: string | undefined;
 		try {
-			if (existsSync(cwdFile)) {
-				const newCwd = readFileSync(cwdFile, "utf8").trim();
-				if (newCwd && isDir(newCwd)) shellCwd = newCwd;
-			}
+			if (existsSync(cwdFile)) newCwd = readFileSync(cwdFile, "utf8").trim() || undefined;
 		} catch {
 			// ignore
-		} finally {
-			try {
-				rmSync(cwdFile, { force: true });
-			} catch {
-				// ignore
+		}
+		removeCwdFile();
+
+		if (outcome === "abort") {
+			throw new Error([run.output.toString().trim(), ABORTED].filter(Boolean).join("\n"));
+		}
+		if (outcome === "timeout") {
+			const text = [`Exit code ${TIMEOUT_EXIT_CODE}`, `Command timed out after ${formatClaudeDuration(timeoutMs)}`, run.head].join("\n").trim();
+			throw new Error(truncateError(text));
+		}
+
+		const exitCode = exitCodeOf(exit);
+		if (isErrorExit(command, exitCode)) {
+			throw new Error(truncateError([`Exit code ${exitCode}`, run.head].filter(Boolean).join("\n").trim()));
+		}
+
+		let resetNote: string | undefined;
+		if (newCwd && isDir(newCwd)) {
+			if (isWithin(newCwd, baseCwd) || isWithin(newCwd, realpathOr(baseCwd))) shellCwd = newCwd;
+			else {
+				// Claude Code keeps the shell inside the project: leaving it resets to the original directory.
+				shellCwd = baseCwd;
+				resetNote = `Shell cwd was reset to ${baseCwd}`;
 			}
 		}
+		let text = [run.output.toString().trim(), resetNote, staleReadHint(command, startedAt)].filter(Boolean).join("\n") || NO_OUTPUT;
+		const env = environmentUpdate();
+		if (env) text += `\n\n${env}`;
+		return textResult<BashDetails>(text, { exitCode, signal: exit.signal, cwd: shellCwd });
+	}
 
-		let text = normalizeOutput(output.toString());
-		if (output.droppedChars > 0) {
-			text = `[... ${output.droppedChars} characters of earlier output dropped (in-memory limit) ...]\n${text}`;
-		}
-		const notes = resetNote ? [resetNote] : [];
-
-		if (interrupted) throw new Error(joinParts(text, "Command was aborted before completion", ...notes));
-		if (timedOut) throw new Error(joinParts(text, `Command timed out after ${formatDuration(timeoutMs)}`, ...notes));
-		if (exit.exitCode !== 0) {
-			const status = exit.exitCode === null ? `Command terminated by signal ${exit.signal ?? "unknown"}` : `Exit code ${exit.exitCode}`;
-			throw new Error([status, text, ...notes].filter(Boolean).join("\n"));
-		}
-		return textResult<BashDetails>(joinParts(text, ...notes) || "(No output)", {
-			exitCode: exit.exitCode,
-			cwd: shellCwd,
-			droppedChars: output.droppedChars || undefined,
+	// ---------------------------------------------------------------- background
+	function startBackground(params: { command: string; description?: string; timeout?: number }, toolCallId: string, baseCwd: string): AgentToolResult<BashDetails> {
+		const cwd = resolveCwd(baseCwd);
+		const run = startRun(buildScript(params.command), cwd);
+		const task = adoptAsTask(run, {
+			command: params.command,
+			description: params.description,
+			toolCallId,
+			limitMs: clampTimeout(params.timeout, BACKGROUND_DEFAULT_TIMEOUT_MS, BACKGROUND_MAX_TIMEOUT_MS),
 		});
-	}
-
-	// ---------------------------------------------------------------- Bash (background)
-	function startBackground(command: string, description: string | undefined, baseCwd: string): AgentToolResult<BashDetails> {
-		const { cwd } = resolveCwd(baseCwd);
-		const id = `bash_${nextShellId++}`;
-		const output = new OutputBuffer();
-		const proc = spawnShell(buildScript(command), cwd, (t) => output.append(t));
-		const shell: BackgroundShell = {
-			id,
-			command,
-			description,
-			cwd,
-			startTime: Date.now(),
-			status: "running",
-			exitCode: null,
-			signal: null,
-			output,
-			cursor: 0,
-			proc,
-		};
-		shells.set(id, shell);
-		cc.emit({ type: "background_shell_started", shellId: id, command });
-
-		proc.done.then(
-			({ exitCode, signal }) => onBackgroundExit(shell, exitCode, signal),
-			(err: Error) => {
-				output.append(`\n${err.message}\n`);
-				onBackgroundExit(shell, null, null);
-			},
-		);
-
-		return textResult<BashDetails>(
-			`Command running in background with ID: ${id}. Use the BashOutput tool with bash_id "${id}" to read its output, and KillShell to stop it. You will be notified when it completes.`,
-			{ backgroundTaskId: id, cwd },
-		);
-	}
-
-	function onBackgroundExit(shell: BackgroundShell, exitCode: number | null, signal: NodeJS.Signals | null): void {
-		shell.endTime = Date.now();
-		shell.exitCode = exitCode;
-		shell.signal = signal;
-		const wasKilled = shell.status === "killed";
-		if (!wasKilled) shell.status = exitCode === 0 ? "completed" : "failed";
-		cc.emit({ type: "background_shell_exited", shellId: shell.id, exitCode, signal });
-		// No wake-up for shells the model (or shutdown) killed on purpose.
-		if (wasKilled || shuttingDown) return;
-		// While the agent is running, the model may still pick up the result with BashOutput;
-		// defer the wake-up to agent_end so we don't trigger a redundant extra turn.
-		if (agentRunning) {
-			shell.notifyPending = true;
-			return;
-		}
-		notifyExit(shell);
-	}
-
-	function notifyExit(shell: BackgroundShell): void {
-		shell.notifyPending = false;
-		const { exitCode, signal } = shell;
-		const how =
-			exitCode === null
-				? `was terminated by signal ${signal ?? "unknown"}`
-				: `has ${exitCode === 0 ? "completed" : "failed"} with exit code ${exitCode}`;
-		try {
-			sendReminder(
-				pi,
-				`Background Bash ${shell.id} (command: ${truncateCmd(shell.command)}) ${how}. Use BashOutput with bash_id "${shell.id}" to read the output.`,
-				{ wake: true, details: { shellId: shell.id, exitCode, signal } },
-			);
-		} catch {
-			// session may already be gone
-		}
+		let text =
+			`Command running in background with ID: ${task.id}. Output is being written to: ${task.outputFile}. ` +
+			`You will be notified when it completes. To check interim output, use Read on that file path.`;
+		if (changesDirectory(params.command)) text += `\nSession cwd remains ${cwd}; ${BG_CWD_NOTE}`;
+		return textResult<BashDetails>(text, { backgroundTaskId: task.id, outputFile: task.outputFile, cwd });
 	}
 
 	pi.registerTool({
@@ -312,154 +625,35 @@ export function registerBash(pi: ExtensionAPI, cc: CCContext): void {
 		label: "Bash",
 		description: bashDescription(defaultTimeout, maxTimeout),
 		promptSnippet: "Execute shell commands (persistent working directory, optional background execution)",
-		parameters: Type.Object({
-			command: Type.String({ description: "The command to execute" }),
-			timeout: Type.Optional(Type.Number({ description: `Optional timeout in milliseconds (max ${maxTimeout})` })),
-			description: Type.Optional(
-				Type.String({
-					description: `Clear, concise description of what this command does in active voice. Never use words like "complex" or "risk" in the description - just describe what it does.
-
-For simple commands (git, npm, standard CLI tools), keep it brief (5-10 words):
-- ls → "List files in current directory"
-- git status → "Show working tree status"
-- npm install → "Install package dependencies"
-
-For commands that are harder to parse at a glance (piped commands, obscure flags, etc.), add enough context to clarify what it does:
-- find . -name "*.tmp" -exec rm {} \\; → "Find and delete all .tmp files recursively"
-- git reset --hard origin/main → "Discard all local changes and match remote main"
-- curl -s url | jq '.data[]' → "Fetch JSON from URL and extract data array elements"`,
-				}),
-			),
-			run_in_background: Type.Optional(
-				Type.Boolean({ description: "Set to true to run this command in the background. Use BashOutput to read the output later." }),
-			),
-		}),
-		async execute(_toolCallId, params, signal, onUpdate, ctx) {
-			const command = params.command;
-			if (typeof command !== "string" || !command.trim()) throw new Error("command must be a non-empty string");
-			if (params.run_in_background) return startBackground(command, params.description, ctx.cwd);
-			return runForeground(command, clampTimeout(params.timeout), ctx.cwd, signal, onUpdate as any);
+		parameters: Type.Object(
+			{
+				command: Type.String({ description: "The command to execute" }),
+				timeout: Type.Optional(Type.Number({ description: `Optional timeout in milliseconds (max ${maxTimeout} for a foreground command)` })),
+				description: Type.Optional(Type.String({ description: DESCRIPTION_PARAM })),
+				run_in_background: Type.Optional(
+					Type.Boolean({
+						description: `Set to true to run this command in the background. With it, \`timeout\` limits how long the command may run in the background before it is stopped (default ${BACKGROUND_DEFAULT_TIMEOUT_MS} ms, max ${BACKGROUND_MAX_TIMEOUT_MS} ms).`,
+					}),
+				),
+				dangerouslyDisableSandbox: Type.Optional(
+					Type.Boolean({ description: "Set this to true to dangerously override sandbox mode and run commands without sandboxing." }),
+				),
+			},
+			{ additionalProperties: false },
+		),
+		prepareArguments: claudeInputValidator<BashInput>("Bash", BashSpec) as any,
+		async execute(toolCallId, rawParams, signal, onUpdate, ctx) {
+			const input = rawParams as BashInput;
+			const timeout = input.timeout === undefined || input.timeout === null || input.timeout === "" ? undefined : Number(input.timeout);
+			const params = { command: input.command, description: input.description, timeout: Number.isFinite(timeout) ? timeout : undefined };
+			if (input.run_in_background) return startBackground(params, toolCallId, ctx.cwd);
+			return runForeground(params, toolCallId, ctx.cwd, signal, onUpdate as any);
 		},
-	});
-
-	// ---------------------------------------------------------------- BashOutput
-	pi.registerTool({
-		name: "BashOutput",
-		label: "BashOutput",
-		description: BASH_OUTPUT_DESCRIPTION,
-		parameters: Type.Object({
-			bash_id: Type.String({ description: "The ID of the background shell to retrieve output from" }),
-			filter: Type.Optional(
-				Type.String({
-					description:
-						"Optional regular expression to filter the output lines. Only lines matching this regex will be included in the result. Any lines that do not match will no longer be available to read.",
-				}),
-			),
-		}),
-		async execute(_toolCallId, params) {
-			const shell = shells.get(params.bash_id);
-			if (!shell) throw new Error(`No background shell found with ID: ${params.bash_id}. Known shell IDs: ${knownIds()}`);
-
-			let regex: RegExp | undefined;
-			if (params.filter) {
-				try {
-					regex = new RegExp(params.filter);
-				} catch (e) {
-					throw new Error(`Invalid filter regex: ${(e as Error).message}`);
-				}
-			}
-
-			// Snapshot status before reading so "completed" always comes with the complete output.
-			const status = shell.status;
-			const { text: raw, lost } = shell.output.readFrom(shell.cursor);
-			let consumed = raw;
-			if (regex && status === "running") {
-				// Hold back an incomplete trailing line so a partially written line isn't filtered prematurely.
-				const nl = raw.lastIndexOf("\n");
-				consumed = nl === -1 ? "" : raw.slice(0, nl + 1);
-			}
-			shell.cursor = shell.output.end - (raw.length - consumed.length);
-
-			let newOutput = consumed;
-			if (regex) {
-				const lines = consumed.split("\n");
-				if (lines.at(-1) === "") lines.pop();
-				newOutput = lines.filter((line) => regex!.test(line)).join("\n");
-			}
-			newOutput = newOutput.replace(/^(?:[ \t]*\r?\n)+/, "").trimEnd();
-
-			const parts = [`<status>${status}</status>`];
-			if (status !== "running") {
-				shell.finalSeen = true;
-				shell.notifyPending = false;
-				parts.push(shell.exitCode === null ? `<signal>${shell.signal ?? "unknown"}</signal>` : `<exit_code>${shell.exitCode}</exit_code>`);
-			}
-			if (lost > 0) parts.push(`<warning>${lost} characters of output were dropped before they could be read (in-memory limit)</warning>`);
-			parts.push(newOutput ? `<output>\n${newOutput}\n</output>` : "<output>(No new output)</output>");
-			parts.push(`<timestamp>${new Date().toISOString()}</timestamp>`);
-			return textResult(parts.join("\n\n"), {
-				shellId: shell.id,
-				status,
-				exitCode: shell.exitCode,
-				command: shell.command,
-			});
-		},
-	});
-
-	// ---------------------------------------------------------------- KillShell
-	pi.registerTool({
-		name: "KillShell",
-		label: "KillShell",
-		description: KILL_SHELL_DESCRIPTION,
-		parameters: Type.Object({
-			shell_id: Type.String({ description: "The ID of the background shell to kill" }),
-		}),
-		async execute(_toolCallId, params) {
-			const shell = shells.get(params.shell_id);
-			if (!shell) throw new Error(`No background shell found with ID: ${params.shell_id}. Known shell IDs: ${knownIds()}`);
-			if (shell.status !== "running") {
-				const how =
-					shell.status === "killed"
-						? "was already killed"
-						: `has already finished (status: ${shell.status}, ${shell.exitCode === null ? `signal: ${shell.signal}` : `exit code: ${shell.exitCode}`})`;
-				throw new Error(`Shell ${shell.id} is not running: it ${how}.`);
-			}
-			shell.status = "killed";
-			shell.proc.kill();
-			return textResult(`Successfully killed shell: ${shell.id} (${truncateCmd(shell.command)})`, { shellId: shell.id });
-		},
-	});
-
-	pi.on("agent_start", async () => {
-		agentRunning = true;
-	});
-	pi.on("agent_end", async () => {
-		agentRunning = false;
-		// Defer so the agent loop has fully settled (idle) before we possibly start a new turn.
-		setTimeout(() => {
-			if (shuttingDown || agentRunning) return;
-			for (const shell of shells.values()) {
-				if (shell.notifyPending && !shell.finalSeen) notifyExit(shell);
-			}
-		}, 0);
 	});
 
 	pi.on("session_shutdown", async () => {
 		shuttingDown = true;
-		for (const shell of shells.values()) {
-			if (shell.status === "running") {
-				shell.status = "killed";
-				shell.proc.kill();
-			}
-		}
+		for (const run of live) run.proc.kill();
+		live.clear();
 	});
-}
-
-function joinParts(...parts: Array<string | undefined>): string {
-	return parts.filter(Boolean).join("\n\n");
-}
-
-function truncateCmd(cmd: string, max = 200): string {
-	const one = cmd.replace(/\s+/g, " ").trim();
-	return one.length > max ? `${one.slice(0, max)}…` : one;
 }

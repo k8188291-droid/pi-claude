@@ -5,7 +5,8 @@ import { ModelRegistry } from "@earendil-works/pi-coding-agent";
 import { createTestModelRuntime } from "./helpers.js";
 import { beforeAll, describe, expect, it } from "vitest";
 import { BUILT_IN_AGENTS, loadAgentDefinitions, parseAgentMarkdown } from "../src/subagent/agents.js";
-import { buildTaskDescription } from "../src/subagent/index.js";
+import { formatAgentListingReminder } from "../src/subagent/agents.js";
+import { foregroundResultText, frameHandback, validateAgentInput } from "../src/subagent/prompt.js";
 import { resolveSubagentModel } from "../src/subagent/models.js";
 import { tempDir } from "./helpers.js";
 
@@ -17,11 +18,11 @@ function writeAgent(dir: string, file: string, content: string) {
 describe("agent definitions", () => {
 	it("has the built-in agents", () => {
 		expect(Object.keys(BUILT_IN_AGENTS).sort()).toEqual(["Explore", "Plan", "general-purpose"]);
-		expect(BUILT_IN_AGENTS["general-purpose"].tools).toBeUndefined();
-		expect(BUILT_IN_AGENTS.Explore.tools).toEqual(expect.arrayContaining(["Read", "Grep", "Glob", "Bash"]));
-		expect(BUILT_IN_AGENTS.Explore.tools).not.toContain("Write");
+		expect(BUILT_IN_AGENTS["general-purpose"].tools).toEqual(["*"]);
+		expect(BUILT_IN_AGENTS.Explore.tools).toBeUndefined();
+		expect(BUILT_IN_AGENTS.Explore.disallowedTools).toEqual(expect.arrayContaining(["Agent", "Edit", "Write", "NotebookEdit"]));
 		expect(BUILT_IN_AGENTS.Explore.prompt).toMatch(/READ-ONLY/);
-		expect(BUILT_IN_AGENTS.Plan.tools).not.toContain("Edit");
+		expect(BUILT_IN_AGENTS.Plan.disallowedTools).toContain("Edit");
 	});
 
 	it("parses markdown frontmatter (tools as string or list, model aliases, inherit)", () => {
@@ -67,14 +68,57 @@ describe("agent definitions", () => {
 		expect([...noDisk.keys()].sort()).toEqual(["Explore", "Plan", "general-purpose"]);
 	});
 
-	it("lists agent types in the Task description, filtering unknown tools", () => {
-		const defs = loadAgentDefinitions({ cwd: tempDir(), homeDir: tempDir(), loadAgentsFromDisk: false, agents: { mine: { description: "My agent", prompt: "p" } } });
-		const desc = buildTaskDescription(defs, new Set(["Read", "Grep", "Glob", "Bash", "Write"]));
-		expect(desc).toContain("- general-purpose: General-purpose agent");
-		expect(desc).toContain("- Explore: Fast agent specialized for exploring codebases");
-		expect(desc).toContain("(Tools: Read, Grep, Glob, Bash)");
-		expect(desc).toContain("- mine: My agent (Tools: *)");
-		expect(desc).not.toContain("WebFetch");
+	it("parses disallowedTools, effort and background frontmatter", () => {
+		const a = parseAgentMarkdown("---\nname: r\ndescription: d\ndisallowedTools: Write, Edit\neffort: high\nbackground: true\n---\nBody", "/x/r.md", "project")!;
+		expect(a).toMatchObject({ disallowedTools: ["Write", "Edit"], effort: "high", background: true });
+	});
+
+	it("lists agent types like Claude Code's system reminder", () => {
+		const defs = loadAgentDefinitions({
+			cwd: tempDir(),
+			homeDir: tempDir(),
+			loadAgentsFromDisk: false,
+			agents: { mine: { description: "My agent", prompt: "p" }, reader: { description: "Reads", prompt: "p", tools: ["Read", "Grep"] } },
+		});
+		const text = formatAgentListingReminder(defs);
+		expect(text.startsWith("Available agent types for the Agent tool:\n- Explore: Fast read-only search agent")).toBe(true);
+		expect(text).toContain("(Tools: All tools except Agent, Artifact, ArtifactComments, ArtifactData, ArtifactCheck, ExitPlanMode, Edit, Write, NotebookEdit)");
+		expect(text).toContain("- general-purpose: General-purpose agent for researching complex questions");
+		expect(text).toContain("- mine: My agent (Tools: All tools)");
+		expect(text).toContain("- reader: Reads (Tools: Read, Grep)");
+		// sorted case-insensitively
+		const names = [...text.matchAll(/^- ([^:]+):/gm)].map((m) => m[1]);
+		expect(names).toEqual(["Explore", "general-purpose", "mine", "Plan", "reader"]);
+		expect(text.endsWith("send them in a single message with multiple tool uses so they run concurrently.")).toBe(true);
+	});
+});
+
+describe("Agent tool texts", () => {
+	it("frames foreground reports and appends agentId/usage except for Explore/Plan", () => {
+		expect(frameHandback("a\nb")).toMatch(/The report follows:\n {2}a\n {2}b$/);
+		const usage = { totalTokens: 120, toolUses: 1, durationMs: 5 };
+		expect(foregroundResultText({ report: "done", agentId: "a1", agentType: "general-purpose", usage })).toMatch(
+			/ {2}done\nagentId: a1\n<usage>subagent_tokens: 120\ntool_uses: 1\nduration_ms: 5<\/usage>$/,
+		);
+		expect(foregroundResultText({ report: "found", agentId: "a1", agentType: "Explore", usage })).toMatch(/The report follows:\n {2}found$/);
+		expect(foregroundResultText({ report: "", agentId: "a1", agentType: "Plan", usage })).toContain("  (Subagent completed but returned no output.)");
+		expect(foregroundResultText({ report: "x", agentId: "a1", agentType: "Plan", usage, worktree: { worktreePath: "/w", worktreeBranch: "b" } })).toContain(
+			"agentId: a1\nworktreePath: /w\nworktreeBranch: b\n<usage>",
+		);
+	});
+
+	it("reports input errors in Claude Code's InputValidationError wording", () => {
+		expect(validateAgentInput({ description: "d", prompt: "p" })).toBeUndefined();
+		expect(validateAgentInput({ description: "d", prompt: "p", name: "x", team_name: "t", mode: "m" })).toBeUndefined();
+		expect(validateAgentInput({ description: "d" })).toBe("InputValidationError: Agent failed due to the following issue:\nThe required parameter `prompt` is missing");
+		expect(validateAgentInput({ description: "d", prompt: 1 })).toBe(
+			"InputValidationError: Agent failed due to the following issue:\nThe parameter `prompt` type is expected as `string` but provided as `number`",
+		);
+		const bad = validateAgentInput({ description: "d", prompt: "p", model: "gpt-5" })!;
+		expect(bad.startsWith("InputValidationError: [")).toBe(true);
+		expect(JSON.parse(bad.slice("InputValidationError: ".length))).toEqual([
+			{ code: "invalid_value", values: ["sonnet", "opus", "haiku", "fable"], path: ["model"], message: 'Invalid option: expected one of "sonnet"|"opus"|"haiku"|"fable"' },
+		]);
 	});
 });
 

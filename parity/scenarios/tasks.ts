@@ -1,67 +1,149 @@
-import type { Scenario } from "../types.js";
+import type { Scenario, ScenarioTurn } from "../types.js";
+
+type Step = [label: string, tool: string, input: Record<string, unknown>];
+
+/** One call per turn (keeps ordering deterministic), followed by a final text turn. */
+function steps(...calls: Step[]): ScenarioTurn[] {
+	return [...calls.map(([label, tool, input]) => ({ calls: [{ label, tool, input }] })), { text: "done" }];
+}
+
+const q = (question: string, header: string, labels: string[], multiSelect = false) => ({
+	question,
+	header,
+	multiSelect,
+	options: labels.map((l) => ({ label: l, description: `${l} option` })),
+});
+
+const nb = (cells: unknown[], nbformat_minor = 5) => JSON.stringify({ cells, metadata: { language_info: { name: "python" } }, nbformat: 4, nbformat_minor });
+const code = (id: string | undefined, source: string | string[]) => ({ cell_type: "code", ...(id ? { id } : {}), metadata: {}, source, outputs: [{ output_type: "stream", name: "stdout", text: ["out\n"] }], execution_count: 3 });
+const md = (id: string | undefined, source: string | string[]) => ({ cell_type: "markdown", ...(id ? { id } : {}), metadata: {}, source });
 
 export const taskScenarios: Scenario[] = [
 	{
 		name: "ask-user",
-		description: "AskUserQuestion answered by the host (first option).",
+		description: "AskUserQuestion answered by the host (first option), plus input validation.",
 		prompt: "Ask me something.",
-		turns: [
-			{
-				calls: [
-					{
-						label: "two questions",
-						tool: "AskUserQuestion",
-						input: {
-							questions: [
-								{ question: "Which database?", header: "DB", multiSelect: false, options: [{ label: "Postgres", description: "SQL" }, { label: "Mongo", description: "NoSQL" }] },
-								{ question: "Which features?", header: "Features", multiSelect: true, options: [{ label: "Auth", description: "login" }, { label: "Billing", description: "payments" }] },
-							],
-						},
-					},
-				],
-			},
-			{ calls: [{ label: "invalid (1 option)", tool: "AskUserQuestion", input: { questions: [{ question: "Only one?", header: "One", multiSelect: false, options: [{ label: "A", description: "a" }] }] } }] },
-			{ text: "done" },
-		],
+		turns: steps(
+			["two questions", "AskUserQuestion", { questions: [q("Which database?", "DB", ["Postgres", "Mongo"]), q("Which features?", "Features", ["Auth", "Billing"], true)] }],
+			["invalid (1 option)", "AskUserQuestion", { questions: [q("Only one?", "One", ["A"])] }],
+			["invalid (5 options)", "AskUserQuestion", { questions: [q("Too many?", "Many", ["A", "B", "C", "D", "E"])] }],
+			["invalid (0 questions)", "AskUserQuestion", { questions: [] }],
+			["invalid (5 questions)", "AskUserQuestion", { questions: ["1", "2", "3", "4", "5"].map((n) => q(`Q${n}?`, `H${n}`, ["A", "B"])) }],
+			["multiSelect omitted", "AskUserQuestion", { questions: [{ question: "Pick?", header: "Pick", options: [{ label: "A", description: "a" }, { label: "B", description: "b" }] }] }],
+			["duplicate question texts", "AskUserQuestion", { questions: [q("Same?", "S1", ["A", "B"]), q("Same?", "S2", ["C", "D"])] }],
+			["duplicate option labels", "AskUserQuestion", { questions: [q("Dup?", "Dup", ["A", "A"])] }],
+			["long header", "AskUserQuestion", { questions: [q("Header?", "A very long header text", ["A", "B"])] }],
+			["missing header", "AskUserQuestion", { questions: [{ question: "No header?", multiSelect: false, options: [{ label: "A", description: "a" }, { label: "B", description: "b" }] }] }],
+			["unknown key", "AskUserQuestion", { questions: [q("Key?", "Key", ["A", "B"])], extra: true }],
+			["option preview", "AskUserQuestion", { questions: [{ ...q("Preview?", "Prev", ["A", "B"]), options: [{ label: "A", description: "a", preview: "```\na\n```" }, { label: "B", description: "b" }] }] }],
+			["questions as string", "AskUserQuestion", { questions: "Which one?" }],
+		),
 	},
 	{
 		name: "todos",
-		description: "Task tracking: pi-claude's TodoWrite vs Claude Code's TaskCreate/TaskUpdate/TaskList.",
+		description: "Task tracking: TaskCreate / TaskGet / TaskList / TaskUpdate, dependencies, deletion, errors and input coercion.",
 		prompt: "Track tasks.",
-		turns: [
-			{
-				calls: [
-					{
-						label: "create todos",
-						tool: "TodoWrite",
-						input: { todos: [{ content: "Write code", activeForm: "Writing code", status: "in_progress" }, { content: "Test", activeForm: "Testing", status: "pending" }] },
-						claude: { tool: "TaskCreate", input: { subject: "Write code", description: "Write code" } },
-					},
-				],
-			},
-			{
-				calls: [
-					{
-						label: "complete first",
-						tool: "TodoWrite",
-						input: { todos: [{ content: "Write code", activeForm: "Writing code", status: "completed" }, { content: "Test", activeForm: "Testing", status: "in_progress" }] },
-						claude: { tool: "TaskUpdate", input: { taskId: "1", status: "completed" } },
-					},
-				],
-			},
-			{ calls: [{ label: "list", tool: "TodoWrite", input: { todos: [] }, claude: { tool: "TaskList", input: {} } }] },
-			{ text: "done" },
-		],
+		turns: steps(
+			["create #1", "TaskCreate", { subject: "Write code", description: "Write the code", activeForm: "Writing code" }],
+			["create #2", "TaskCreate", { subject: "Test", description: "Run the tests" }],
+			["create #3 with metadata", "TaskCreate", { subject: "Ship", description: "Ship it", metadata: { prio: 1 } }],
+			["list (all pending)", "TaskList", {}],
+			["start #1", "TaskUpdate", { taskId: "1", status: "in_progress" }],
+			["#3 blocked by #1,#2", "TaskUpdate", { taskId: "3", addBlockedBy: ["1", "2"] }],
+			["#2 blocks #3 again (no-op)", "TaskUpdate", { taskId: "2", addBlocks: ["3"] }],
+			["list (blocked)", "TaskList", {}],
+			["get #3", "TaskGet", { taskId: "3" }],
+			["get #1", "TaskGet", { taskId: "1" }],
+			["complete #1 + subject + owner", "TaskUpdate", { taskId: "1", status: "completed", subject: "Write the code", owner: "me", description: "Write the code" }],
+			["list (owner, resolved blocker)", "TaskList", {}],
+			["get #3 (still lists #1)", "TaskGet", { taskId: "3" }],
+			["delete #2", "TaskUpdate", { taskId: "2", status: "deleted", subject: "ignored" }],
+			["list after delete", "TaskList", {}],
+			["create after delete (no id reuse, backfilled description)", "TaskCreate", { subject: "Docs" }],
+			["get deleted", "TaskGet", { taskId: "2" }],
+			["update unknown", "TaskUpdate", { taskId: "99", status: "completed" }],
+			["delete unknown", "TaskUpdate", { taskId: "99", status: "deleted" }],
+			["invalid status", "TaskUpdate", { taskId: "3", status: "done" }],
+			["missing taskId", "TaskUpdate", { status: "completed" }],
+			["numeric taskId", "TaskUpdate", { taskId: 3, status: "pending" }],
+			["no changes", "TaskUpdate", { taskId: "3" }],
+			["same status (no change)", "TaskUpdate", { taskId: "3", status: "pending" }],
+			["addBlocks unknown id", "TaskUpdate", { taskId: "3", addBlocks: ["99"] }],
+			["alias id/active_form", "TaskUpdate", { id: "3", active_form: "Shipping" }],
+			["metadata merge/delete", "TaskUpdate", { taskId: "3", metadata: { prio: null, team: "core" } }],
+			["create with aliases + extra keys", "TaskCreate", { title: "Lint", content: "Run the linter", priority: "high" }],
+			["create with only description", "TaskCreate", { description: "Refactor the parser module so that it is easier to test and also faster than before, finally" }],
+			["create with multi-line description", "TaskCreate", { description: "**Fix** the `login` flow\nThen make sure that the second line of this description is long enough to be cut" }],
+			["create with leading blank line", "TaskCreate", { description: "\n\n  Leading blank lines\r\nsecond" }],
+			["create with task string wrapper", "TaskCreate", { task: "Write the changelog" }],
+			["create with task object wrapper", "TaskCreate", { task: { title: "Bump version", content: "Bump the package version" } }],
+			["create with agent params", "TaskCreate", { prompt: "do it", subagent_type: "general-purpose" }],
+			["create with todos array", "TaskCreate", { todos: [{ content: "x" }] }],
+			["create missing both", "TaskCreate", { activeForm: "Doing" }],
+			["create wrong type", "TaskCreate", { subject: 5, description: "x" }],
+			["list with extra key", "TaskList", { foo: 1 }],
+			["get missing id", "TaskGet", {}],
+			["final list", "TaskList", {}],
+		),
+	},
+	{
+		name: "task-reminder",
+		description: "The periodic task-tools reminder after 10 turns without TaskCreate/TaskUpdate (stripped from comparison; inspect with debug.ts).",
+		prompt: "Work.",
+		turns: steps(
+			["create", "TaskCreate", { subject: "Work", description: "Do the work" }],
+			...Array.from({ length: 12 }, (_, i): Step => [`list ${i + 1}`, "TaskList", {}]),
+			["update (resets the count)", "TaskUpdate", { taskId: "1", status: "in_progress" }],
+			...Array.from({ length: 11 }, (_, i): Step => [`get ${i + 1}`, "TaskGet", { taskId: "1" }]),
+		),
 	},
 	{
 		name: "notebook-edit",
-		description: "NotebookEdit exists in Claude Code but not in pi-claude.",
-		files: { "nb.ipynb": JSON.stringify({ cells: [{ cell_type: "code", id: "c1", metadata: {}, source: ["x = 1"], outputs: [], execution_count: null }], metadata: {}, nbformat: 4, nbformat_minor: 5 }) },
+		description: "NotebookEdit: replace/insert/delete, cell-N ids, read-before-edit and validation errors.",
+		files: {
+			"nb.ipynb": JSON.stringify({ cells: [{ cell_type: "code", id: "c1", metadata: {}, source: ["x = 1"], outputs: [], execution_count: null }], metadata: {}, nbformat: 4, nbformat_minor: 5 }),
+			"old.ipynb": nb([code(undefined, ["a = 1\n", "b = 2"]), md(undefined, "# Title")], 4),
+			"multi.ipynb": nb([code("aa", "print(1)"), md("bb", ["# Head\n", "text"]), code("cc", "z = 3")]),
+			"crlf.ipynb": nb([code("k1", "v = 1")]).replace(/,/g, ",\r\n"),
+			"unread.ipynb": nb([code("u1", "u")]),
+			"bad.ipynb": "{not json",
+			"nocells.ipynb": JSON.stringify({ metadata: {}, nbformat: 4, nbformat_minor: 5 }),
+			"notes.txt": "hello\n",
+		},
 		prompt: "Edit the notebook.",
-		turns: [
-			{ calls: [{ label: "Read notebook", tool: "Read", input: { file_path: "{{cwd}}/nb.ipynb" } }] },
-			{ calls: [{ label: "replace cell", tool: "NotebookEdit", input: { notebook_path: "{{cwd}}/nb.ipynb", cell_id: "c1", new_source: "x = 2" } }] },
-			{ text: "done" },
-		],
+		turns: steps(
+			["Read notebook", "Read", { file_path: "{{cwd}}/nb.ipynb" }],
+			["replace cell", "NotebookEdit", { notebook_path: "{{cwd}}/nb.ipynb", cell_id: "c1", new_source: "x = 2" }],
+			["replace again without re-read", "NotebookEdit", { notebook_path: "{{cwd}}/nb.ipynb", cell_id: "c1", new_source: "x = 3", edit_mode: "replace" }],
+			["edit unread notebook", "NotebookEdit", { notebook_path: "{{cwd}}/unread.ipynb", cell_id: "u1", new_source: "v" }],
+			["Read multi", "Read", { file_path: "{{cwd}}/multi.ipynb" }],
+			["replace code→markdown", "NotebookEdit", { notebook_path: "{{cwd}}/multi.ipynb", cell_id: "aa", new_source: "## now markdown", cell_type: "markdown" }],
+			["replace markdown→code", "NotebookEdit", { notebook_path: "{{cwd}}/multi.ipynb", cell_id: "bb", new_source: "y = 2", cell_type: "code" }],
+			["delete cell", "NotebookEdit", { notebook_path: "{{cwd}}/multi.ipynb", cell_id: "cc", new_source: "", edit_mode: "delete" }],
+			["replace by cell-N index", "NotebookEdit", { notebook_path: "{{cwd}}/multi.ipynb", cell_id: "cell-0", new_source: "# zero" }],
+			["unknown cell id", "NotebookEdit", { notebook_path: "{{cwd}}/multi.ipynb", cell_id: "nope", new_source: "x" }],
+			["cell-N out of range", "NotebookEdit", { notebook_path: "{{cwd}}/multi.ipynb", cell_id: "cell-9", new_source: "x" }],
+			["replace without cell_id", "NotebookEdit", { notebook_path: "{{cwd}}/multi.ipynb", new_source: "x" }],
+			["insert without cell_type", "NotebookEdit", { notebook_path: "{{cwd}}/multi.ipynb", cell_id: "aa", new_source: "x", edit_mode: "insert" }],
+			["invalid edit_mode", "NotebookEdit", { notebook_path: "{{cwd}}/multi.ipynb", cell_id: "aa", new_source: "x", edit_mode: "append" }],
+			["invalid cell_type", "NotebookEdit", { notebook_path: "{{cwd}}/multi.ipynb", cell_id: "aa", new_source: "x", cell_type: "raw" }],
+			["missing new_source", "NotebookEdit", { notebook_path: "{{cwd}}/multi.ipynb", cell_id: "aa" }],
+			["Read old (nbformat 4.4)", "Read", { file_path: "{{cwd}}/old.ipynb" }],
+			["insert at start (4.4, no id)", "NotebookEdit", { notebook_path: "{{cwd}}/old.ipynb", new_source: "import os", cell_type: "code", edit_mode: "insert" }],
+			["insert after cell-1 (markdown)", "NotebookEdit", { notebook_path: "{{cwd}}/old.ipynb", cell_id: "cell-1", new_source: "note", cell_type: "markdown", edit_mode: "insert" }],
+			["replace cell-3 (4.4)", "NotebookEdit", { notebook_path: "{{cwd}}/old.ipynb", cell_id: "cell-3", new_source: "the end" }],
+			["delete cell-0 (4.4)", "NotebookEdit", { notebook_path: "{{cwd}}/old.ipynb", cell_id: "cell-0", new_source: "", edit_mode: "delete" }],
+			["Read crlf", "Read", { file_path: "{{cwd}}/crlf.ipynb" }],
+			["replace in CRLF notebook", "NotebookEdit", { notebook_path: "{{cwd}}/crlf.ipynb", cell_id: "k1", new_source: "v = 2" }],
+			["not a notebook", "NotebookEdit", { notebook_path: "{{cwd}}/notes.txt", cell_id: "x", new_source: "x" }],
+			["missing notebook", "NotebookEdit", { notebook_path: "{{cwd}}/missing.ipynb", cell_id: "x", new_source: "x" }],
+			["relative path", "NotebookEdit", { notebook_path: "multi.ipynb", cell_id: "aa", new_source: "rel" }],
+			["Read bad json", "Read", { file_path: "{{cwd}}/bad.ipynb" }],
+			["edit bad json", "NotebookEdit", { notebook_path: "{{cwd}}/bad.ipynb", cell_id: "x", new_source: "x" }],
+			["Read nocells", "Read", { file_path: "{{cwd}}/nocells.ipynb" }],
+			["edit nocells", "NotebookEdit", { notebook_path: "{{cwd}}/nocells.ipynb", cell_id: "x", new_source: "x" }],
+			["rewrite externally (same content)", "Bash", { command: "sleep 1; cp nb.ipynb nb.tmp && mv nb.tmp nb.ipynb" }],
+			["edit after external rewrite", "NotebookEdit", { notebook_path: "{{cwd}}/nb.ipynb", cell_id: "c1", new_source: "x = 4" }],
+		),
 	},
 ];

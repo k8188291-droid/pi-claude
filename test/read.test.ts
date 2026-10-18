@@ -1,10 +1,10 @@
-import { mkdirSync, writeFileSync } from "node:fs";
+import { mkdirSync, utimesSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import type { ExtensionAPI, ToolDefinition } from "@earendil-works/pi-coding-agent";
 import { beforeEach, describe, expect, it } from "vitest";
 import { createCCContext, type CCContext } from "../src/shared/context.js";
 import { registerEdit } from "../src/tools/edit.js";
-import { formatNumberedLine, parsePageRange, registerRead, splitLines } from "../src/tools/read.js";
+import { addLineNumbers, coerceReadInput, formatBytes, formatNumberedLine, parsePageRange, registerRead, selectLines, validatePages, WASTED_CALL_MESSAGE } from "../src/tools/read.js";
 import { registerWrite } from "../src/tools/write.js";
 import { captureTools, fakeCtx, resultText, tempDir } from "./helpers.js";
 
@@ -58,150 +58,202 @@ beforeEach(() => {
 	}));
 });
 
+const withUsage = (tokens: number | null, contextWindow: number) => fakeCtx(dir, { getContextUsage: () => ({ tokens, contextWindow, percent: null }) } as any);
+const readCtx = (params: any, ctx: any) => tools.get("Read")!.execute("id", params, undefined, undefined, ctx) as Promise<any>;
+const lines = (n: number, f = (i: number) => `line ${i}`) => Array.from({ length: n }, (_, i) => f(i + 1)).join("\n") + "\n";
+
 describe("Read schema", () => {
-	it("has Claude Code name and params", () => {
+	it("has Claude Code name, params and description", () => {
 		const t = tools.get("Read")!;
 		expect(t.name).toBe("Read");
 		const props = (t.parameters as any).properties;
-		expect(Object.keys(props).sort()).toEqual(["file_path", "limit", "offset", "pages"]);
+		expect(Object.keys(props).sort()).toEqual(["allow_large", "file_path", "limit", "offset", "pages"]);
 		expect((t.parameters as any).required).toEqual(["file_path"]);
-		expect(t.description).toContain("cat -n");
+		expect((t.parameters as any).additionalProperties).toBe(false);
+		expect(t.description).toContain("To list files in a directory, use the registered shell tool.");
+		expect(t.description).toContain("Do NOT re-read a file you just edited to verify");
+	});
+
+	it("coerces input like Claude Code", () => {
+		expect(coerceReadInput({ file_path: "a", offset: [3], limit: [2] })).toEqual({ file_path: "a", offset: 3, limit: 2 });
+		expect(coerceReadInput({ file_path: "a", offset: -1, limit: 0 })).toEqual({ file_path: "a" });
+		expect(coerceReadInput({ file_path: "a", length: 5, description: "x" })).toEqual({ file_path: "a", limit: 5 });
+		expect(coerceReadInput({ file_path: "a", offset: "4", allow_large: "true" })).toEqual({ file_path: "a", offset: 4, allow_large: true });
 	});
 });
 
 describe("helpers", () => {
-	it("formats cat -n lines", () => {
-		expect(formatNumberedLine(1, "x")).toBe("     1\tx");
-		expect(formatNumberedLine(123456, "y")).toBe("123456\ty");
-		expect(formatNumberedLine(1234567, "z")).toBe("1234567\tz");
+	it("formats numbered lines without padding", () => {
+		expect(formatNumberedLine(1, "x")).toBe("1\tx");
+		expect(formatNumberedLine(123456, "y\r")).toBe("123456\ty");
+		expect(addLineNumbers("a\nb\n", 1)).toBe("1\ta\n2\tb\n3\t");
+		expect(addLineNumbers("", 1)).toBe("");
 	});
-	it("splits lines", () => {
-		expect(splitLines("")).toEqual([]);
-		expect(splitLines("a")).toEqual(["a"]);
-		expect(splitLines("a\n")).toEqual(["a"]);
-		expect(splitLines("a\r\nb\r\n")).toEqual(["a", "b"]);
-		expect(splitLines("a\n\n")).toEqual(["a", ""]);
-		expect(splitLines("\n")).toEqual([""]);
+	it("selects lines like Claude Code", () => {
+		expect(selectLines("a\r\nb\r\n", 0, undefined)).toEqual({ content: "a\nb\n", lineCount: 3, totalLines: 3 });
+		expect(selectLines("﻿a", 0, undefined)).toEqual({ content: "a", lineCount: 1, totalLines: 1 });
+		expect(selectLines("a\nb\nc\n", 1, 1)).toEqual({ content: "b", lineCount: 1, totalLines: 4 });
+		expect(selectLines("", 4, undefined)).toEqual({ content: "", lineCount: 0, totalLines: 1 });
 	});
-	it("parses page ranges", () => {
-		expect(parsePageRange("3")).toEqual({ first: 3, last: 3 });
-		expect(parsePageRange(" 1 - 5 ")).toEqual({ first: 1, last: 5 });
-		expect(parsePageRange("4-")).toEqual({ first: 4, last: undefined });
-		expect(() => parsePageRange("0")).toThrow(/start at 1/);
-		expect(() => parsePageRange("5-2")).toThrow(/end page/);
-		expect(() => parsePageRange("abc")).toThrow(/Invalid pages/);
-		expect(() => parsePageRange("1,3")).toThrow(/Invalid pages/);
+	it("formats byte sizes", () => {
+		expect(formatBytes(500)).toBe("500 bytes");
+		expect(formatBytes(262144)).toBe("256KB");
+		expect(formatBytes(262145)).toBe("256KB");
+		expect(formatBytes(420045)).toBe("410.2KB");
+		expect(formatBytes(1.5 * 1024 * 1024)).toBe("1.5MB");
+	});
+	it("parses and validates page ranges", () => {
+		expect(parsePageRange("3")).toEqual({ firstPage: 3, lastPage: 3 });
+		expect(parsePageRange(" 1 - 5 ")).toEqual({ firstPage: 1, lastPage: 5 });
+		expect(parsePageRange("4-")).toEqual({ firstPage: 4, lastPage: Infinity });
+		expect(parsePageRange("0")).toBeNull();
+		expect(parsePageRange("5-2")).toBeNull();
+		expect(parsePageRange("1,3")).toBeNull();
+		expect(validatePages("1,3")).toMatch(/^Invalid pages parameter: "1,3"\. Give one page/);
+		expect(validatePages("1-25")).toBe('Page range "1-25" exceeds maximum of 20 pages per request. Please use a smaller range.');
+		expect(validatePages("4-")).toMatch(/exceeds maximum of 20 pages/);
+		expect(validatePages("2-21")).toBeUndefined();
 	});
 });
 
 describe("Read text", () => {
-	it("returns cat -n formatted content and records the read", async () => {
+	it("numbers lines like Claude Code (trailing newline = extra numbered line) and records the read", async () => {
 		const p = join(dir, "a.txt");
 		writeFileSync(p, "alpha\n\tbeta\ngamma\n");
 		const r = await read({ file_path: p });
-		expect(resultText(r)).toBe("     1\talpha\n     2\t\tbeta\n     3\tgamma");
-		expect(r.details).toMatchObject({ kind: "text", startLine: 1, numLines: 3, totalLines: 3, truncated: false });
-		expect(cc.fileState.has(p)).toBe(true);
-		expect(cc.fileState.checkCanModify(p)).toBeUndefined();
+		expect(resultText(r)).toBe("1\talpha\n2\t\tbeta\n3\tgamma\n4\t");
+		expect(r.details).toMatchObject({ kind: "text", startLine: 1, numLines: 4, totalLines: 4, truncated: false });
+		expect(cc.fileState.get(p)).toMatchObject({ source: "read", offset: 1, limit: undefined, partial: false, truncated: false });
 	});
 
-	it("strips CR from CRLF files and a BOM", async () => {
-		const p = join(dir, "crlf.txt");
-		writeFileSync(p, "﻿one\r\ntwo\r\n");
-		expect(resultText(await read({ file_path: p }))).toBe("     1\tone\n     2\ttwo");
+	it("strips CR and a BOM, keeps files without trailing newline", async () => {
+		writeFileSync(join(dir, "crlf.txt"), "﻿one\r\ntwo\r\n");
+		expect(resultText(await read({ file_path: join(dir, "crlf.txt") }))).toBe("1\tone\n2\ttwo\n3\t");
+		writeFileSync(join(dir, "b.txt"), "x\n\ny");
+		expect(resultText(await read({ file_path: join(dir, "b.txt") }))).toBe("1\tx\n2\t\n3\ty");
 	});
 
-	it("keeps a file without trailing newline and preserves blank lines", async () => {
-		const p = join(dir, "b.txt");
-		writeFileSync(p, "x\n\ny");
-		expect(resultText(await read({ file_path: p }))).toBe("     1\tx\n     2\t\n     3\ty");
+	it("does not cap lines or line length", async () => {
+		const p = join(dir, "big.txt");
+		writeFileSync(p, lines(2500));
+		const text = resultText(await read({ file_path: p }));
+		expect(text.split("\n")).toHaveLength(2501);
+		expect(text).toContain("2500\tline 2500");
+		const q = join(dir, "long.txt");
+		writeFileSync(q, `${"x".repeat(5000)}\n`);
+		expect(resultText(await read({ file_path: q }))).toBe(`1\t${"x".repeat(5000)}\n2\t`);
 	});
 
 	it("resolves relative paths against ctx.cwd", async () => {
 		mkdirSync(join(dir, "sub"));
 		writeFileSync(join(dir, "sub", "rel.txt"), "hi\n");
-		expect(resultText(await read({ file_path: "sub/rel.txt" }))).toBe("     1\thi");
+		expect(resultText(await read({ file_path: "sub/rel.txt" }))).toBe("1\thi\n2\t");
 	});
 
-	it("honors offset and limit and reports remaining lines", async () => {
+	it("honors offset and limit without any notice; offset 0 numbers from 0", async () => {
 		const p = join(dir, "n.txt");
-		writeFileSync(p, Array.from({ length: 10 }, (_, i) => `line${i + 1}`).join("\n") + "\n");
+		writeFileSync(p, lines(10));
 		const r = await read({ file_path: p, offset: 3, limit: 2 });
-		const text = resultText(r);
-		expect(text.startsWith("     3\tline3\n     4\tline4")).toBe(true);
-		expect(text).toContain("Showing lines 3-4 of 10. Use offset=5");
-		expect(r.details).toMatchObject({ startLine: 3, numLines: 2, totalLines: 10, truncated: true });
-		// partial reads still allow modification
-		expect(cc.fileState.checkCanModify(p)).toBeUndefined();
+		expect(resultText(r)).toBe("3\tline 3\n4\tline 4");
+		expect(r.details).toMatchObject({ startLine: 3, numLines: 2, totalLines: 11 });
+		expect(cc.fileState.get(p)).toMatchObject({ offset: 3, limit: 2, partial: true });
+		expect(resultText(await read({ file_path: p, offset: 0, limit: 2 }))).toBe("0\tline 1\n1\tline 2");
+		expect(resultText(await read({ file_path: p, offset: 11 }))).toBe("11\t");
+		expect(resultText(await read({ file_path: p, limit: 50 }))).toContain("10\tline 10\n11\t");
+		expect(cc.fileState.get(p)?.partial).toBe(false);
 	});
 
-	it("treats offset 0 and 1 as the beginning", async () => {
-		const p = join(dir, "o.txt");
-		writeFileSync(p, "a\nb\n");
-		expect(resultText(await read({ file_path: p, offset: 0 }))).toBe("     1\ta\n     2\tb");
-		expect(resultText(await read({ file_path: p, offset: 1 }))).toBe("     1\ta\n     2\tb");
-	});
-
-	it("reads at most 2000 lines by default", async () => {
-		const p = join(dir, "big.txt");
-		writeFileSync(p, Array.from({ length: 2500 }, (_, i) => `L${i + 1}`).join("\n"));
-		const r = await read({ file_path: p });
-		const text = resultText(r);
-		expect(text).toContain("  2000\tL2000");
-		expect(text).not.toContain("L2001\n");
-		expect(text).toContain("Showing lines 1-2000 of 2500. Use offset=2001");
-		const r2 = await read({ file_path: p, offset: 2001 });
-		expect(resultText(r2)).toContain("  2500\tL2500");
-		expect(r2.details.numLines).toBe(500);
-	});
-
-	it("truncates lines longer than 2000 characters", async () => {
-		const p = join(dir, "long.txt");
-		writeFileSync(p, "x".repeat(5000) + "\nshort\n");
-		const text = resultText(await read({ file_path: p }));
-		const first = text.split("\n")[0];
-		expect(first.startsWith("     1\t" + "x".repeat(2000))).toBe(true);
-		expect(first).not.toContain("x".repeat(2001));
-		expect(first).toContain("line truncated, 5000 chars total");
-		expect(text).toContain("     2\tshort");
-	});
-
-	it("caps total output size", async () => {
-		const p = join(dir, "wide.txt");
-		writeFileSync(p, Array.from({ length: 1500 }, () => "y".repeat(1500)).join("\n"));
-		const r = await read({ file_path: p });
-		const text = resultText(r);
-		expect(text.length).toBeLessThan(101_000);
-		expect(text).toMatch(/Output truncated at line \d+ of 1500/);
-		expect(r.details.truncated).toBe(true);
-	});
-
-	it("warns on empty files", async () => {
+	it("warns on empty files and offsets past EOF (single-line reminders)", async () => {
 		const p = join(dir, "empty.txt");
 		writeFileSync(p, "");
+		expect(resultText(await read({ file_path: p }))).toBe("<system-reminder>Warning: the file exists but the contents are empty.</system-reminder>");
+		expect(resultText(await read({ file_path: p, offset: 5 }))).toBe(
+			"<system-reminder>Warning: the file exists but is shorter than the provided offset (5). The file has 1 lines.</system-reminder>",
+		);
+		const q = join(dir, "short.txt");
+		writeFileSync(q, "a\nb\n");
+		expect(resultText(await read({ file_path: q, offset: 10 }))).toBe(
+			"<system-reminder>Warning: the file exists but is shorter than the provided offset (10). The file has 3 lines.</system-reminder>",
+		);
+	});
+
+	it("notes NUL bytes and invalid UTF-8, decodes UTF-16LE", async () => {
+		writeFileSync(join(dir, "nul.txt"), Buffer.from("ab\u0000c\n", "latin1"));
+		expect(resultText(await read({ file_path: join(dir, "nul.txt") }))).toMatch(/^1\tab\u0000c\n2\t\n\n\[This file has NUL bytes in its first 8 KB/);
+		writeFileSync(join(dir, "l1.txt"), Buffer.from([0x63, 0x61, 0x66, 0xe9, 0x0a]));
+		expect(resultText(await read({ file_path: join(dir, "l1.txt") }))).toContain("Its undecodable bytes show above as U+FFFD.");
+		writeFileSync(join(dir, "u16.txt"), Buffer.concat([Buffer.from([0xff, 0xfe]), Buffer.from("hi\n", "utf16le")]));
+		expect(resultText(await read({ file_path: join(dir, "u16.txt") }))).toBe("1\thi\n2\t");
+	});
+
+	it("refuses files over 256KB without a limit, with the allow_large hint when there is room", async () => {
+		const p = join(dir, "big.txt");
+		writeFileSync(p, "z".repeat(262145));
+		await expect(read({ file_path: p })).rejects.toThrow(
+			/^File content \(256KB\) exceeds maximum allowed size \(256KB\)\. Use offset and limit parameters to read specific portions of the file, or search for specific content instead of reading the whole file\.$/,
+		);
+		await expect(readCtx({ file_path: p }, withUsage(10000, 200000))).rejects.toThrow(/To read it anyway, up to what still fits in your context, call Read again with allow_large: true/);
+		await expect(readCtx({ file_path: p }, withUsage(150000, 200000))).rejects.toThrow(/Even with allow_large, this is more than fits/);
+		await expect(read({ file_path: p, allow_large: true })).rejects.toThrow(/allow_large is not available where this read runs/);
+		// a limit lifts the byte cap, but the token cap still applies (a 256KB line ≈ 65k tokens)
+		await expect(read({ file_path: p, limit: 1 })).rejects.toThrow(/^File content \(65536 tokens\) exceeds maximum allowed tokens \(25000\)\./);
+	});
+
+	it("reads large files with allow_large when the context has room", async () => {
+		const p = join(dir, "big.txt");
+		writeFileSync(p, lines(30000, (i) => `row ${i}`));
+		await expect(read({ file_path: p })).rejects.toThrow(/exceeds maximum allowed size/);
+		const r = await readCtx({ file_path: p, offset: 29999, allow_large: true }, withUsage(10000, 200000));
+		expect(resultText(r)).toBe("29999\trow 29999\n30000\trow 30000\n30001\t");
+	});
+
+	it("streams files over 10MB (the size reported is what was read before giving up)", async () => {
+		const p = join(dir, "huge.txt");
+		writeFileSync(p, `${"h".repeat(11 * 1024 * 1024)}\ntail\n`);
+		await expect(read({ file_path: p })).rejects.toThrow(/^File content \(512KB\) exceeds maximum allowed size \(256KB\)/);
+		await expect(read({ file_path: p, offset: 2, limit: 1 })).resolves.toMatchObject({ content: [{ text: "2\ttail" }] });
+	});
+
+	it("pages whole-file reads over the token cap and marks the record as truncated", async () => {
+		const p = join(dir, "tokens.txt");
+		writeFileSync(p, lines(4000, (i) => `${"w".repeat(40)} ${i}`)); // ~180k chars ≈ 45k tokens
 		const r = await read({ file_path: p });
-		expect(resultText(r)).toContain("<system-reminder>");
-		expect(resultText(r)).toContain("the file exists but the contents are empty");
-		expect(cc.fileState.has(p)).toBe(true);
+		const text = resultText(r);
+		expect(text.startsWith("1\t")).toBe(true);
+		expect(text).toMatch(/<system-reminder>\n\[Truncated: PARTIAL view — .*tokens\.txt: showing lines 1-\d+ of 4001 total \(\d+ tokens, cap 25000\)\. Call Read with offset=\d+ limit=\d+ for the next page, or Grep to find a specific section\. Do NOT answer/);
+		expect(r.details.truncated).toBe(true);
+		expect(cc.fileState.get(p)).toMatchObject({ truncated: true, partial: true });
+		// partial reads over the cap are an error instead
+		await expect(read({ file_path: p, offset: 2 })).rejects.toThrow(/^File content \(\d+ tokens\) exceeds maximum allowed tokens \(25000\)/);
 	});
 
-	it("warns when offset is beyond EOF", async () => {
-		const p = join(dir, "short.txt");
-		writeFileSync(p, "a\nb\n");
-		const r = await read({ file_path: p, offset: 10 });
-		expect(resultText(r)).toContain("shorter than the provided offset (10). The file has 2 lines.");
-	});
-
-	it("errors on directories", async () => {
-		await expect(read({ file_path: dir })).rejects.toThrow(/directory.*ls command via the Bash tool/s);
-	});
-
-	it("errors on missing files and suggests similar names", async () => {
+	it("errors on directories and missing files like Claude Code", async () => {
+		await expect(read({ file_path: dir })).rejects.toThrow(`EISDIR: illegal operation on a directory, read '${dir}'`);
 		writeFileSync(join(dir, "config.json"), "{}");
-		await expect(read({ file_path: join(dir, "config.jsn") })).rejects.toThrow(/does not exist[\s\S]*Did you mean .*config\.json/);
-		await expect(read({ file_path: join(dir, "Config.json") })).rejects.toThrow(/Did you mean .*config\.json/);
-		await expect(read({ file_path: join(dir, "nothing-like-it.md") })).rejects.toThrow(/does not exist/);
-		await expect(read({ file_path: join(dir, "nope", "x.txt") })).rejects.toThrow(/does not exist/);
+		await expect(read({ file_path: join(dir, "config.txt") })).rejects.toThrow(
+			`File does not exist. Note: your current working directory is ${dir}. Did you mean config.json?`,
+		);
+		await expect(read({ file_path: join(dir, "nothing-like-it.md") })).rejects.toThrow(/^File does not exist\. Note: your current working directory is .*\.$/);
+		mkdirSync(join(dir, "proj", "src"), { recursive: true });
+		writeFileSync(join(dir, "proj", "src", "x.ts"), "x");
+		await expect(read({ file_path: join(dir, "src", "x.ts") }, { cwd: join(dir, "proj") })).rejects.toThrow(`Did you mean ${join(dir, "proj", "src", "x.ts")}?`);
+	});
+
+	it("refuses binary extensions (even missing files) and blocking devices", async () => {
+		await expect(read({ file_path: join(dir, "x.zip") })).rejects.toThrow(
+			"This tool cannot read binary files. The file appears to be a binary .zip file. Use a skill for this file type if one is available, or a shell command or script that can read the format.",
+		);
+		await expect(read({ file_path: "/dev/zero" })).rejects.toThrow("Cannot read '/dev/zero': this device file would block or produce infinite output.");
+		// binary content with a text extension is read, with a note
+		writeFileSync(join(dir, "blob.txt"), Buffer.from([1, 2, 0, 3]));
+		expect(resultText(await read({ file_path: join(dir, "blob.txt") }))).toContain("[This file has NUL bytes");
+	});
+
+	it("validates pages even for text files and otherwise ignores it", async () => {
+		const p = join(dir, "t.txt");
+		writeFileSync(p, "data\n");
+		await expect(read({ file_path: p, pages: "1,3" })).rejects.toThrow(/Invalid pages parameter/);
+		expect(resultText(await read({ file_path: p, pages: "2" }))).toBe("1\tdata\n2\t");
 	});
 
 	it("finds macOS screenshot names with a narrow no-break space", async () => {
@@ -209,12 +261,6 @@ describe("Read text", () => {
 		writeFileSync(real, Buffer.from(PNG_1x1, "base64"));
 		const r = await read({ file_path: join(dir, "Screenshot 2024-01-01 at 10.00.00 AM.png") });
 		expect(r.content.some((c: any) => c.type === "image")).toBe(true);
-	});
-
-	it("refuses binary files", async () => {
-		const p = join(dir, "blob.bin");
-		writeFileSync(p, Buffer.from([1, 2, 0, 3, 4]));
-		await expect(read({ file_path: p })).rejects.toThrow(/cannot read binary files/);
 	});
 
 	it("rejects when aborted", async () => {
@@ -226,87 +272,104 @@ describe("Read text", () => {
 	});
 });
 
+describe("Read unchanged-file detection", () => {
+	it("answers a repeated read of the same range with the wasted-call note", async () => {
+		const p = join(dir, "f.txt");
+		writeFileSync(p, lines(6));
+		await read({ file_path: p });
+		expect(resultText(await read({ file_path: p }))).toBe(WASTED_CALL_MESSAGE);
+		expect(resultText(await read({ file_path: p, offset: 1 }))).toBe(WASTED_CALL_MESSAGE);
+		expect(resultText(await read({ file_path: p, limit: 2 }))).toBe("1\tline 1\n2\tline 2");
+		expect(resultText(await read({ file_path: p, limit: 2 }))).toBe(WASTED_CALL_MESSAGE);
+		expect(resultText(await read({ file_path: p }))).toContain("6\tline 6");
+	});
+
+	it("reads again after the mtime changes or after Edit", async () => {
+		const p = join(dir, "g.txt");
+		writeFileSync(p, lines(3));
+		await read({ file_path: p });
+		utimesSync(p, new Date("2020-01-01"), new Date("2020-01-01"));
+		expect(resultText(await read({ file_path: p }))).toContain("1\tline 1");
+		await call("Edit", { file_path: p, old_string: "line 2", new_string: "LINE 2" });
+		expect(resultText(await read({ file_path: p }))).toContain("2\tLINE 2");
+		expect(resultText(await read({ file_path: p }))).toBe(WASTED_CALL_MESSAGE);
+	});
+
+	it("does not dedup images; dedups notebooks regardless of offset", async () => {
+		const img = join(dir, "p.png");
+		writeFileSync(img, Buffer.from(PNG_1x1, "base64"));
+		await read({ file_path: img });
+		expect((await read({ file_path: img })).content[0].type).toBe("image");
+		const nb = join(dir, "n.ipynb");
+		writeFileSync(nb, JSON.stringify({ cells: [{ cell_type: "markdown", source: "x" }] }));
+		await read({ file_path: nb });
+		expect(resultText(await read({ file_path: nb, offset: 5 }))).toBe(WASTED_CALL_MESSAGE);
+	});
+});
+
 describe("Read images", () => {
-	it("returns image content for PNG", async () => {
+	it("returns only the image", async () => {
 		const p = join(dir, "pixel.png");
 		writeFileSync(p, Buffer.from(PNG_1x1, "base64"));
 		const r = await read({ file_path: p });
-		const img = r.content.find((c: any) => c.type === "image");
-		expect(img).toBeDefined();
-		expect(img.mimeType).toBe("image/png");
-		expect(typeof img.data).toBe("string");
-		expect(Buffer.from(img.data, "base64").subarray(1, 4).toString()).toBe("PNG");
-		expect(resultText(r)).toContain("Read image file");
+		expect(r.content).toHaveLength(1);
+		expect(r.content[0]).toMatchObject({ type: "image", mimeType: "image/png" });
 		expect(r.details.kind).toBe("image");
+		expect(cc.fileState.has(p)).toBe(false);
 	});
 
-	it("detects images by content, not extension", async () => {
-		const p = join(dir, "pixel.dat");
-		writeFileSync(p, Buffer.from(PNG_1x1, "base64"));
-		const r = await read({ file_path: p });
-		expect(r.content.find((c: any) => c.type === "image")?.mimeType).toBe("image/png");
+	it("detects extensionless images by content; other extensions are text", async () => {
+		writeFileSync(join(dir, "pixel"), Buffer.from(PNG_1x1, "base64"));
+		expect((await read({ file_path: join(dir, "pixel") })).content[0].type).toBe("image");
+		writeFileSync(join(dir, "pixel.txt"), Buffer.from(PNG_1x1, "base64"));
+		expect((await read({ file_path: join(dir, "pixel.txt") })).content[0].type).toBe("text");
+	});
+
+	it("errors on empty or invalid image files", async () => {
+		writeFileSync(join(dir, "e.png"), "");
+		await expect(read({ file_path: join(dir, "e.png") })).rejects.toThrow(`Image file is empty: ${join(dir, "e.png")}`);
+		writeFileSync(join(dir, "f.png"), "not an image\n");
+		await expect(read({ file_path: join(dir, "f.png") })).rejects.toThrow(
+			`File has an image extension but its content is not a valid PNG/JPEG/GIF/WebP. Detected: unrecognized bytes (hex: 6e 6f 74 20 61 6e 20 69). This usually means a download saved an error/login page instead of the image. Use \`file "${join(dir, "f.png")}"\` to confirm, or read it as text with Bash (e.g. \`head -c 500\`).`,
+		);
 	});
 });
 
 describe("Read PDF", () => {
-	it("extracts text per page", async () => {
+	it("reads whole PDFs (header text + rendered pages)", async () => {
 		const p = join(dir, "doc.pdf");
 		writeFileSync(p, makePdf(["Hello page one", "Second page here"]));
 		const r = await read({ file_path: p });
-		const text = resultText(r);
-		expect(text).toContain("2 pages total");
-		expect(text).toMatch(/<page number="1">\s*Hello page one\s*<\/page>/);
-		expect(text).toMatch(/<page number="2">\s*Second page here\s*<\/page>/);
-		expect(r.details).toMatchObject({ kind: "pdf", totalPages: 2, pages: [1, 2] });
+		expect(r.content[0]).toEqual({ type: "text", text: expect.stringMatching(new RegExp(`^PDF file read: ${p} \\(\\d+ bytes\\)$`)) });
+		expect(r.content.filter((c: any) => c.type === "image")).toHaveLength(2);
+		expect(r.details).toMatchObject({ kind: "pdf", totalPages: 2 });
 	});
 
-	it("supports page ranges", async () => {
+	it("extracts page ranges as images", async () => {
 		const p = join(dir, "doc.pdf");
 		writeFileSync(p, makePdf(Array.from({ length: 15 }, (_, i) => `Content of page ${i + 1}`)));
 		const r = await read({ file_path: p, pages: "3-4" });
-		const text = resultText(r);
-		expect(text).toContain("Content of page 3");
-		expect(text).toContain("Content of page 4");
-		expect(text).not.toContain("Content of page 5");
-		expect(text).toContain('<page number="3">');
-		const single = resultText(await read({ file_path: p, pages: "15" }));
-		expect(single).toContain("Content of page 15");
-		expect(single).toContain("Showing page 15.");
-		const open = await read({ file_path: p, pages: "12-" });
-		expect(open.details.pages).toEqual([12, 15]);
+		expect(resultText(r)).toMatch(new RegExp(`^PDF pages extracted: 2 page\\(s\\) from ${p} \\(`));
+		expect(r.content.filter((c: any) => c.type === "image")).toHaveLength(2);
+		expect(r.details.pages).toEqual([3, 4]);
 	});
 
-	it("requires pages for PDFs over 10 pages", async () => {
+	it("requires pages for PDFs over 10 pages and rejects out-of-range pages", async () => {
 		const p = join(dir, "long.pdf");
 		writeFileSync(p, makePdf(Array.from({ length: 11 }, (_, i) => `P${i + 1}`)));
-		await expect(read({ file_path: p })).rejects.toThrow(/11 pages.*pages parameter/s);
+		await expect(read({ file_path: p })).rejects.toThrow(
+			'This PDF has 11 pages, which is too many to read at once. Use the pages parameter to read specific page ranges (e.g., pages: "1-5"). Maximum 20 pages per request.',
+		);
+		await expect(read({ file_path: p, pages: "15" })).rejects.toThrow(
+			'Requested page 15 is outside the document (PDF has 11 pages). Use a range within 1-11, maximum 20 pages per request (e.g. pages: "1-11").',
+		);
+		await expect(read({ file_path: p, pages: "10-" })).rejects.toThrow(/exceeds maximum of 20 pages/);
 	});
 
-	it("validates page ranges", async () => {
-		const p = join(dir, "doc.pdf");
-		writeFileSync(p, makePdf(Array.from({ length: 30 }, (_, i) => `P${i + 1}`)));
-		await expect(read({ file_path: p, pages: "1-25" })).rejects.toThrow(/at most 20 pages/);
-		await expect(read({ file_path: p, pages: "40" })).rejects.toThrow(/only has 30 pages/);
-		await expect(read({ file_path: p, pages: "x" })).rejects.toThrow(/Invalid pages/);
-		const ok = await read({ file_path: p, pages: "25-40" });
-		expect(ok.details.pages).toEqual([25, 30]);
-	});
-
-	it("renders pages without text as images", async () => {
-		const p = join(dir, "scan.pdf");
-		writeFileSync(p, makePdf(["Real text on page one", null]));
-		const r = await read({ file_path: p });
-		const text = resultText(r);
-		expect(text).toContain("Real text on page one");
-		expect(text).toContain('<page number="2">');
-		const img = r.content.find((c: any) => c.type === "image");
-		expect(img?.mimeType).toMatch(/^image\//);
-	});
-
-	it("errors clearly on corrupt PDFs", async () => {
+	it("errors on files without a PDF header", async () => {
 		const p = join(dir, "bad.pdf");
-		writeFileSync(p, "%PDF-1.4\ngarbage");
-		await expect(read({ file_path: p })).rejects.toThrow(/PDF/);
+		writeFileSync(p, "garbage");
+		await expect(read({ file_path: p })).rejects.toThrow(`File is not a valid PDF (missing %PDF- header): ${p}`);
 	});
 });
 
@@ -344,44 +407,56 @@ describe("Read notebooks", () => {
 		],
 	};
 
-	it("renders cells, outputs and images", async () => {
+	it("renders cells and outputs like Claude Code", async () => {
 		const p = join(dir, "nb.ipynb");
 		writeFileSync(p, JSON.stringify(nb, null, 1));
 		const r = await read({ file_path: p });
-		const text = resultText(r);
-		expect(text).toContain('<cell id="md1"><cell_type>markdown</cell_type># Title\nSome text</cell id="md1">');
-		expect(text).toContain("<cell id=\"c1\">print('hi')\n1+1</cell id=\"c1\">");
-		expect(text).toMatch(/<outputs cell_id="c1">\nhi\n2\n<\/outputs>/);
-		expect(text).toContain('<cell id="cell-2">plot()</cell id="cell-2">');
-		expect(text).toContain("<Figure>");
-		expect(text).toContain("ZeroDivisionError: division by zero\nTraceback\nline 1");
-		expect(text).not.toContain("\u001b");
-		const imgIdx = r.content.findIndex((c: any) => c.type === "image");
-		expect(imgIdx).toBeGreaterThan(0);
+		expect(r.content.map((c: any) => c.type)).toEqual(["text", "image", "text"]);
+		expect(r.content[0].text).toBe(
+			'<cell id="md1"><cell_type>markdown</cell_type># Title\nSome text</cell id="md1">\n' +
+				"<cell id=\"c1\">print('hi')\n1+1</cell id=\"c1\">\n\nhi\n\n\n2\n" +
+				'<cell id="cell-2">plot()</cell id="cell-2">\n\n<Figure>',
+		);
+		expect(r.content[2].text).toBe('<cell id="err">1/0</cell id="err">\n\nZeroDivisionError: division by zero\n\u001b[31mTraceback\u001b[0m\nline 1');
 		expect(r.details).toMatchObject({ kind: "notebook", cells: 4 });
-		expect(cc.fileState.has(p)).toBe(true);
+		expect(cc.fileState.get(p)).toMatchObject({ source: "read", offset: 1 });
 	});
 
-	it("marks non-python code cells with language", async () => {
+	it("marks non-python code cells with language_info.name only", async () => {
 		const p = join(dir, "r.ipynb");
-		writeFileSync(p, JSON.stringify({ metadata: { kernelspec: { language: "R" } }, cells: [{ cell_type: "code", source: "x <- 1", outputs: [] }] }));
-		expect(resultText(await read({ file_path: p }))).toContain("<language>R</language>x <- 1");
+		writeFileSync(p, JSON.stringify({ metadata: { language_info: { name: "R" } }, cells: [{ cell_type: "code", source: "x <- 1", outputs: [] }] }));
+		expect(resultText(await read({ file_path: p }))).toBe('<cell id="cell-0"><language>R</language>x <- 1</cell id="cell-0">');
+		const q = join(dir, "k.ipynb");
+		writeFileSync(q, JSON.stringify({ metadata: { kernelspec: { language: "R" } }, cells: [{ cell_type: "code", source: "y", outputs: [] }] }));
+		expect(resultText(await read({ file_path: q }))).toBe('<cell id="cell-0">y</cell id="cell-0">');
 	});
 
-	it("allows Edit after reading a notebook", async () => {
+	it("replaces too-large outputs with a jq hint", async () => {
+		const p = join(dir, "big.ipynb");
+		writeFileSync(p, JSON.stringify({ cells: [{ cell_type: "code", source: "s", outputs: [{ output_type: "stream", text: "x".repeat(12000) }] }] }));
+		expect(resultText(await read({ file_path: p }))).toBe(
+			"<cell id=\"cell-0\">s</cell id=\"cell-0\">\n\nOutputs are too large to include. Use Bash with: cat <notebook_path> | jq '.cells[0].outputs'",
+		);
+	});
+
+	it("refuses Edit on a notebook after reading it (NotebookEdit's job)", async () => {
 		const p = join(dir, "nb.ipynb");
 		writeFileSync(p, JSON.stringify(nb, null, 1));
 		await read({ file_path: p });
-		const r = await call("Edit", { file_path: p, old_string: "print('hi')", new_string: "print('bye')" });
-		expect(resultText(r)).toContain("has been updated");
+		await expect(call("Edit", { file_path: p, old_string: "print('hi')", new_string: "print('bye')" })).rejects.toThrow(/NotebookEdit/);
 	});
 
-	it("errors on invalid JSON and warns on empty notebooks", async () => {
+	it("errors on invalid notebooks; empty notebooks have no output", async () => {
 		const bad = join(dir, "bad.ipynb");
 		writeFileSync(bad, "{not json");
-		await expect(read({ file_path: bad })).rejects.toThrow(/Failed to parse Jupyter notebook/);
+		await expect(read({ file_path: bad })).rejects.toThrow(
+			"Notebook file is not valid JSON (it may be truncated, corrupted, or still being written): JSON Parse error: Expected '}'",
+		);
+		const nocells = join(dir, "nocells.ipynb");
+		writeFileSync(nocells, "{}");
+		await expect(read({ file_path: nocells })).rejects.toThrow(/top-level "cells" must be an array/);
 		const empty = join(dir, "empty.ipynb");
 		writeFileSync(empty, JSON.stringify({ cells: [] }));
-		expect(resultText(await read({ file_path: empty }))).toContain("contains no cells");
+		expect(resultText(await read({ file_path: empty }))).toBe("(Read completed with no output)");
 	});
 });
