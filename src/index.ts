@@ -8,7 +8,9 @@ import { registerEdit } from "./tools/edit.js";
 import { registerGrep } from "./tools/grep.js";
 import { registerGlob } from "./tools/glob.js";
 import { registerBash } from "./tools/bash.js";
-import { registerTodoWrite } from "./tools/todo-write.js";
+import { registerTaskTools } from "./tools/task-tools.js";
+import { registerNotebookEdit } from "./tools/notebook-edit.js";
+import { registerTaskStop } from "./tools/task-stop.js";
 import { registerAskUserQuestion } from "./tools/ask-user-question.js";
 import { registerToolSearchActivation, withDeferredExposure } from "./deferred-tools.js";
 import { registerTask } from "./subagent/index.js";
@@ -23,7 +25,7 @@ export { createClaudeCodeSession, type CreateClaudeCodeSessionOptions } from "./
  */
 export function createClaudeCodeExtension(options: ClaudeCodeToolsOptions = {}): ExtensionFactory {
 	return (realPi: ExtensionAPI) => {
-		const cc = createCCContext(options);
+		const cc = createCCContext(options, realPi);
 		const pi = withDeferredExposure(realPi, new Set(options.deferredTools ?? []));
 		registerRead(pi, cc);
 		registerWrite(pi, cc);
@@ -31,10 +33,14 @@ export function createClaudeCodeExtension(options: ClaudeCodeToolsOptions = {}):
 		registerGrep(pi, cc);
 		registerGlob(pi, cc);
 		registerBash(pi, cc);
-		registerTodoWrite(pi, cc);
+		registerNotebookEdit(pi, cc);
+		registerTaskTools(pi, cc);
+		registerTaskStop(pi, cc);
 		if (!options.isSubagent) registerAskUserQuestion(pi, cc);
 		if (!options.isSubagent && options.subagents !== false) registerTask(pi, cc);
 		registerToolSearchActivation(realPi);
 		if (options.outputSpill !== false) registerOutputSpill(pi, cc);
+		// after spill, so notifications are never spilled into a file
+		(cc.notifications as { attachToToolResults?: () => void }).attachToToolResults?.();
 	};
 }

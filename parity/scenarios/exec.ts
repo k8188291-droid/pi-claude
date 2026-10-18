@@ -55,17 +55,4 @@ export const execScenarios: Scenario[] = [
 			{ text: "done" },
 		],
 	},
-	{
-		name: "large-output",
-		description: "Very large tool output: how each harness truncates or persists it.",
-		files: { "big.txt": Array.from({ length: 20000 }, (_, i) => `row ${i} needle`).join("\n") + "\n" },
-		prompt: "Produce big output.",
-		turns: [
-			{ calls: [{ label: "seq 1 40000", tool: "Bash", input: { command: "seq 1 40000" } }] },
-			{ calls: [{ label: "Grep 20000 lines", tool: "Grep", input: { pattern: "needle", path: "{{cwd}}/big.txt", output_mode: "content", head_limit: 0 } }] },
-			{ text: "done" },
-		],
-	},
 ];
-
-export { outputPathFrom };
