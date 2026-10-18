@@ -4,6 +4,10 @@
  *   ANTHROPIC_API_KEY=... npx tsx parity/record.ts --name review-pi-claude \
  *     --prompt "Review this codebase ..." [--model claude-sonnet-5-5] [--ref HEAD] [--repo .]
  *
+ * Any Anthropic-compatible upstream works, e.g. a translating proxy serving other models:
+ *   NODE_USE_ENV_PROXY=1 npx tsx parity/record.ts --upstream https://proxy.example --upstream-model gpt-5.6-sol ...
+ * (--upstream-model is what the upstream receives; Claude Code itself is told --model.)
+ *
  * Writes parity/recordings/<name>.json; `npx tsx parity/run.ts --only <name>` then replays the
  * recorded model turns against both Claude Code and pi-claude.
  */
@@ -22,20 +26,28 @@ const arg = (name: string) => {
 const name = arg("name");
 const prompt = arg("prompt");
 if (!name || !prompt) throw new Error("usage: record.ts --name <name> --prompt <prompt> [--model m] [--ref HEAD] [--repo .] [--description d]");
+const upstream = arg("upstream");
+const upstreamModel = arg("upstream-model");
 const apiKey = process.env.ANTHROPIC_API_KEY;
-if (!apiKey) throw new Error("ANTHROPIC_API_KEY is required for recording");
+if (!apiKey && !upstream) throw new Error("ANTHROPIC_API_KEY is required for recording (or pass --upstream for a proxy that injects credentials)");
 const model = arg("model") ?? "claude-sonnet-5-5";
 const repo = resolve(arg("repo") ?? ".");
 const fixture = { repo, commit: resolveCommit(repo, arg("ref") ?? "HEAD") };
 
 const mock = new MockAnthropicServer();
 const baseUrl = await mock.start();
-mock.startRecording({ apiKey });
-const scenario = recordingToScenario({ name, description: "", prompt, model, recordedAt: "", fixture, recordedCwd: "", conversations: [{ name: "main", turns: [], toolResults: [] }] });
+mkdirSync(join(import.meta.dirname, "recordings"), { recursive: true });
+mock.startRecording({ apiKey, upstream, model: upstreamModel, liveFile: join(import.meta.dirname, "recordings", `${name}.raw.json`) });
+const scenario = { ...recordingToScenario({ name, description: "", prompt, model, recordedAt: "", fixture, recordedCwd: "", conversations: [{ name: "main", turns: [], toolResults: [] }] }), maxTurns: Number(arg("max-turns") ?? 100) };
 process.stderr.write(`recording ${name} with ${model} (fixture ${fixture.commit.slice(0, 7)})…\n`);
 const outcome = await runClaude(scenario, mock, baseUrl, model);
 await mock.stop();
 if (outcome.error) process.stderr.write(`claude run ended with: ${outcome.error.slice(0, 500)}\n`);
+
+// save the raw capture first, so a post-processing error never loses a (long, paid) recording
+const dir = join(import.meta.dirname, "recordings");
+mkdirSync(dir, { recursive: true });
+writeFileSync(join(dir, `${name}.raw.json`), JSON.stringify({ prompt, model, upstreamModel, fixture, cwd: outcome.cwd, conversations: [...mock.recording.values()] }));
 
 // main conversation = the one whose first user message contains the prompt
 const convs = [...mock.recording.values()];
@@ -43,27 +55,30 @@ const main = convs.find((c) => c.firstUser.includes(prompt));
 if (!main) throw new Error("main conversation not found in recording");
 const agentPrompts = convs.flatMap((c) => c.turns.flatMap((t) => (t?.content ?? []).filter((b) => b.type === "tool_use" && b.name === "Agent").map((b) => String(b.input?.prompt ?? ""))));
 const subs = convs.filter((c) => c !== main);
-const matchFor = (firstUser: string) => {
-	const p = agentPrompts.find((ap) => ap && firstUser.includes(ap));
-	if (!p) return undefined;
-	// a distinctive line of the agent prompt that doesn't contain the (run-specific) workspace path
-	return p.split("\n").filter((l) => l.trim().length > 20 && !l.includes(outcome.cwd)).sort((a, b) => b.length - a.length)[0] ?? p.slice(0, 80);
-};
+// route replayed subagent requests by the full Agent prompt (workspace path templated as {{cwd}});
+// the longest prompt contained in the child's first message wins
+const matchFor = (firstUser: string) =>
+	agentPrompts
+		.filter((ap) => ap && firstUser.includes(ap))
+		.sort((a, b) => b.length - a.length)[0]
+		?.replaceAll(outcome.cwd, "{{cwd}}");
+const unmatched = subs.filter((c) => !matchFor(c.firstUser)).length;
+const matches = subs.map((c) => matchFor(c.firstUser)).filter(Boolean);
+if (unmatched) process.stderr.write(`warning: ${unmatched} subagent conversation(s) have no matching Agent prompt and will not replay\n`);
+if (new Set(matches).size !== matches.length) process.stderr.write("warning: several subagents share the same Agent prompt; replay routes them to the first\n");
 const recording: Recording = {
 	name,
 	description: arg("description") ?? `Recorded session: ${prompt.slice(0, 120)}`,
 	prompt,
-	model,
+	model: upstreamModel ? `${upstreamModel} (via ${upstream})` : model,
 	recordedAt: new Date().toISOString(),
 	fixture,
 	recordedCwd: outcome.cwd,
 	conversations: [
 		{ name: "main", turns: main.turns.map((t) => t ?? null), toolResults: main.toolResults },
-		...subs.map((c, i) => ({ name: `sub${i}`, match: matchFor(c.firstUser), turns: c.turns.map((t) => t ?? null), toolResults: c.toolResults })),
+		...subs.map((c, i) => ({ name: `sub${i}`, match: matchFor(c.firstUser), firstUser: c.firstUser.replaceAll(outcome.cwd, "{{cwd}}"), turns: c.turns.map((t) => t ?? null), toolResults: c.toolResults })),
 	],
 };
-const dir = join(import.meta.dirname, "recordings");
-mkdirSync(dir, { recursive: true });
 const file = join(dir, `${name}.json`);
 writeFileSync(file, JSON.stringify(recording, null, 2));
 const calls = recording.conversations.reduce((n, c) => n + c.turns.reduce((m, t) => m + (t?.content.filter((b) => b.type === "tool_use").length ?? 0), 0), 0);

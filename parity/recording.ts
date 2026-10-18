@@ -16,8 +16,10 @@ export interface Recording {
 	conversations: Array<{
 		/** "main" or "sub<N>". */
 		name: string;
-		/** Substring of the subagent's first user message used to route replay requests. */
+		/** Agent prompt that started this subagent ({{cwd}}-templated); routes replay requests. */
 		match?: string;
+		/** The subagent's first user message as recorded ({{cwd}}-templated), for reference. */
+		firstUser?: string;
 		turns: Array<{ content: any[] } | null>;
 		toolResults: Array<{ toolUseId: string; text: string; isError: boolean }>;
 	}>;
@@ -87,13 +89,14 @@ export function recordingToScenario(rec: Recording): Scenario {
 		subagents: Object.fromEntries(subs.map((c) => [c.name, toTurns(rec, c)])),
 		subagentRoutes: subs.filter((c) => c.match).map((c) => ({ name: c.name, match: c.match! })),
 		compareFiles: [],
+		maxTurns: Math.max(60, main.turns.length + 10),
 	};
 }
 
 export function loadRecordings(dir = join(import.meta.dirname, "recordings")): Scenario[] {
 	let files: string[] = [];
 	try {
-		files = readdirSync(dir).filter((f) => f.endsWith(".json"));
+		files = readdirSync(dir).filter((f) => f.endsWith(".json") && !f.endsWith(".raw.json"));
 	} catch {
 		return [];
 	}

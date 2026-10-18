@@ -2,3 +2,4 @@ node_modules
 dist
 *.log
 parity/out
+parity/recordings/*.raw.json

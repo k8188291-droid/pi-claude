@@ -18,7 +18,7 @@ export async function runClaude(s: Scenario, mock: MockAnthropicServer, baseUrl:
 		{
 			main: toMockTurns(s.turns, "claude", cwd),
 			subagents: Object.fromEntries(Object.entries(s.subagents ?? {}).map(([k, v]) => [k, toMockTurns(v, "claude", cwd)])),
-			subagentRoutes: s.subagentRoutes,
+			subagentRoutes: s.subagentRoutes?.map((r) => ({ ...r, match: r.match.replaceAll("{{cwd}}", cwd) })),
 		},
 		"claude",
 	);
@@ -34,7 +34,7 @@ export async function runClaude(s: Scenario, mock: MockAnthropicServer, baseUrl:
 				tools: CLAUDE_TOOLS,
 				settingSources: [],
 				persistSession: false,
-				maxTurns: 60,
+				maxTurns: s.maxTurns ?? 60,
 				permissionMode: "default",
 				// allow everything; answer AskUserQuestion with each question's first option
 				canUseTool: async (name, input) =>

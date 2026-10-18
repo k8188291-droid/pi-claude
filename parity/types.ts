@@ -38,6 +38,8 @@ export interface Scenario {
 	subagents?: Record<string, ScenarioTurn[]>;
 	/** Routes subagent requests without a `[[sub:NAME]]` marker (recordings): first user message contains `match`. */
 	subagentRoutes?: Array<{ name: string; match: string }>;
+	/** Claude Code maxTurns for this scenario (default 60). */
+	maxTurns?: number;
 	/** Files whose final content is compared after the run (default: every file in the workspace). */
 	compareFiles?: string[];
 }

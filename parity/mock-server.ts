@@ -10,6 +10,7 @@
  */
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
 import type { AddressInfo } from "node:net";
+import { writeFileSync } from "node:fs";
 import { gunzipSync } from "node:zlib";
 
 export interface ScriptedCall {
@@ -85,12 +86,16 @@ export class MockAnthropicServer {
 	private script?: MockScript;
 	readonly requests: CapturedRequest[] = [];
 	private idPrefix = "run";
-	private recorder?: { upstream: string; apiKey: string };
+	private recorder?: { upstream: string; apiKey?: string; model?: string; liveFile?: string };
 	readonly recording = new Map<string, RecordedConversation>();
 
-	/** Record mode: forward every request to the real API and capture the model's turns. */
-	startRecording(opts: { upstream?: string; apiKey: string }): void {
-		this.recorder = { upstream: opts.upstream ?? "https://api.anthropic.com", apiKey: opts.apiKey };
+	/**
+	 * Record mode: forward agent requests to a real Anthropic-compatible API and capture the model's turns.
+	 * `apiKey` may be omitted when the upstream injects credentials (e.g. via an egress proxy);
+	 * `model` overrides the model id sent upstream (e.g. a non-Claude model behind a translating proxy).
+	 */
+	startRecording(opts: { upstream?: string; apiKey?: string; model?: string; liveFile?: string }): void {
+		this.recorder = { upstream: (opts.upstream ?? "https://api.anthropic.com").replace(/\/$/, ""), apiKey: opts.apiKey, model: opts.model, liveFile: opts.liveFile };
 		this.recording.clear();
 	}
 
@@ -119,7 +124,6 @@ export class MockAnthropicServer {
 		let buf = Buffer.concat(chunks);
 		if (req.headers["content-encoding"] === "gzip") buf = gunzipSync(buf);
 		const raw = buf.toString("utf8");
-		if (this.recorder) return this.proxy(req, res, url, raw);
 		if (req.method === "POST" && /\/v1\/messages\/count_tokens/.test(url)) {
 			return json(res, 200, { input_tokens: 100 });
 		}
@@ -132,11 +136,17 @@ export class MockAnthropicServer {
 		} catch {
 			return json(res, 400, { type: "error", error: { type: "invalid_request_error", message: "bad json" } });
 		}
+		// record mode: real model for agent turns; helper requests (titles, quota checks) stay local
+		if (this.recorder && (body.tools?.length ?? 0) > 0) return this.proxy(req, res, url, raw);
 		const messages: any[] = body.messages ?? [];
 		const tools: any[] = body.tools ?? [];
 		const firstUser = textOf(messages.find((m) => m.role === "user")?.content);
 		const last = messages.at(-1);
-		const sub = SUB_MARKER.exec(firstUser)?.[1] ?? this.script?.subagentRoutes?.find((r) => firstUser.includes(r.match))?.name;
+		const sub =
+			SUB_MARKER.exec(firstUser)?.[1] ??
+			this.script?.subagentRoutes
+				?.filter((r) => firstUser.includes(r.match))
+				.sort((a, b) => b.match.length - a.match.length)[0]?.name;
 		const hasTools = tools.length > 0;
 		const route = !hasTools ? "side" : sub ?? "main";
 		const turnIndex = messages.filter((m) => m.role === "assistant").length;
@@ -186,8 +196,15 @@ export class MockAnthropicServer {
 
 	/** Record mode: pass the request through to the real API and capture the assistant turn. */
 	private async proxy(req: IncomingMessage, res: ServerResponse, url: string, raw: string): Promise<void> {
+		if (/\/count_tokens/.test(url)) return json(res, 200, { input_tokens: 100 });
 		const rec = this.recorder!;
-		const headers: Record<string, string> = { "content-type": "application/json", "x-api-key": rec.apiKey };
+		const headers: Record<string, string> = { "content-type": "application/json" };
+		if (rec.apiKey) headers["x-api-key"] = rec.apiKey;
+		if (rec.model) {
+			const b = JSON.parse(raw);
+			b.model = rec.model;
+			raw = JSON.stringify(b);
+		}
 		for (const h of ["anthropic-version", "anthropic-beta", "accept"]) {
 			const v = req.headers[h];
 			if (typeof v === "string") headers[h] = v;
@@ -223,6 +240,14 @@ export class MockAnthropicServer {
 			.filter((m) => m.role === "user" && Array.isArray(m.content))
 			.flatMap((m) => m.content.filter((b: any) => b?.type === "tool_result"))
 			.map((b: any) => ({ toolUseId: b.tool_use_id, text: textOf(b.content), isError: !!b.is_error }));
+		// checkpoint after every captured turn, so an interrupted recording is not lost
+		if (rec.liveFile) {
+			try {
+				writeFileSync(rec.liveFile, JSON.stringify({ conversations: [...this.recording.values()] }));
+			} catch {
+				// best effort
+			}
+		}
 	}
 
 	private renderTurn(turn: Turn, route: string, turnIndex: number, req: CapturedRequest): any[] {
