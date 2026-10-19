@@ -109,6 +109,13 @@ export interface ClaudeCodeToolsOptions {
 	modelRuntime?: ModelRuntime;
 	/** Bash defaults. */
 	bash?: { defaultTimeoutMs?: number; maxTimeoutMs?: number };
+	/**
+	 * Claude Code bug compatibility. "claude-code" (default) reproduces behaviors where Claude Code is
+	 * arguably wrong, for exact parity; "fixed" corrects all of them. See `QUIRKS` in shared/quirks.ts.
+	 */
+	compat?: import("./quirks.js").QuirkMode;
+	/** Per-quirk override of `compat`, e.g. `{ bashErrexit: "fixed" }`. */
+	quirks?: Partial<Record<import("./quirks.js").Quirk, import("./quirks.js").QuirkMode>>;
 	/** Internal: the parent's task list, shared with foreground subagents (as in Claude Code). */
 	sharedTaskStore?: import("../tools/task-tools.js").TaskStore;
 	/** Internal: set for subagent sessions (disables Task, AskUserQuestion, nested spill dir). */
