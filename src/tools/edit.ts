@@ -5,8 +5,9 @@ import { withFileMutationQueue } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 import type { CCContext } from "../shared/context.js";
 import { FILE_CONTENT_CHANGED, FILE_MODIFIED_SINCE_READ, FileStateTracker } from "../shared/file-state.js";
-import { resolvePath } from "../shared/paths.js";
-import { FILE_STATE_CURRENT_NOTE, readExistingText, writeText, notTextMessage } from "./write.js";
+import { resolveToolPath } from "../shared/paths.js";
+import { isFixed } from "../shared/quirks.js";
+import { FILE_STATE_CURRENT_NOTE, NOT_A_REGULAR_FILE, NotRegularFileError, readExistingText, writeText, notTextMessage } from "./write.js";
 
 // Mirrors Claude Code 2.1.302's Edit tool (description, schema, validation order and messages).
 
@@ -221,18 +222,44 @@ export function editOutcome(file: string, oldString: string, replaceAll: boolean
 
 class EditApplyError extends Error {}
 
+/** Delete every occurrence of `oldString` in one left-to-right pass, each with the newline right after it (if any). */
+function deleteAllWithNewlines(content: string, oldString: string): string {
+	let out = "";
+	let pos = 0;
+	for (let i = content.indexOf(oldString); i !== -1; i = content.indexOf(oldString, pos)) {
+		out += content.slice(pos, i);
+		pos = i + oldString.length;
+		if (content[pos] === "\n") pos++;
+	}
+	return out + content.slice(pos);
+}
+
+export interface ApplyEditOptions {
+	/**
+	 * #19 `replaceAllTrailingMatch` fixed: a replace_all deletion removes every occurrence (and the
+	 * newline after each one that has it). Claude Code only removes "old_string\n" once any such
+	 * occurrence exists, so a final match without a trailing newline survives.
+	 */
+	deleteAllMatches?: boolean;
+}
+
 /**
  * Replace `oldString` (already resolved to the file's spelling) with `newString`. Deleting text
  * that ends a line also removes that line's newline.
  */
-export function applyEdit(content: string, oldString: string, newString: string, replaceAll = false): string {
+export function applyEdit(content: string, oldString: string, newString: string, replaceAll = false, opts: ApplyEditOptions = {}): string {
 	if (oldString === "") {
 		if (newString === content) throw new EditApplyError("String not found in file. Failed to apply edit.");
 		return newString;
 	}
 	const rep = (s: string, find: string) => (replaceAll ? s.replaceAll(find, () => newString) : s.replace(find, () => newString));
+	const deletesLines = newString === "" && !oldString.endsWith("\n") && content.includes(oldString + "\n");
 	const updated =
-		newString === "" && !oldString.endsWith("\n") && content.includes(oldString + "\n") ? rep(content, oldString + "\n") : rep(content, oldString);
+		deletesLines && replaceAll && opts.deleteAllMatches
+			? deleteAllWithNewlines(content, oldString)
+			: deletesLines
+				? rep(content, oldString + "\n")
+				: rep(content, oldString);
 	if (updated === content) throw new EditApplyError("String not found in file. Failed to apply edit.");
 	return updated;
 }
@@ -320,7 +347,8 @@ export function registerEdit(pi: ExtensionAPI, cc: CCContext): void {
 				throw new Error("file_path, old_string and new_string are required strings.");
 			}
 			const cwd = ctx?.cwd ?? process.cwd();
-			const absPath = resolvePath(cwd, filePath);
+			const absPath = resolveToolPath(cc, cwd, filePath);
+			const contentCheck = isFixed(cc, "mtimeOnlyChangeDetection");
 
 			return withFileMutationQueue(absPath, async () => {
 				if (signal?.aborted) throw new Error("Operation aborted");
@@ -331,6 +359,9 @@ export function registerEdit(pi: ExtensionAPI, cc: CCContext): void {
 					if (st.size > MAX_EDIT_FILE_BYTES) {
 						throw new Error(`File is too large to edit (${formatSize(st.size)}). Maximum editable file size is ${formatSize(MAX_EDIT_FILE_BYTES)}.`);
 					}
+					// Claude Code fails reading such a path (after blocking on a FIFO until a writer
+					// shows up); refuse it before opening it at all (#7b).
+					if (!st.isFile() && !st.isDirectory()) throw new NotRegularFileError();
 				} catch (err: any) {
 					if (err?.code !== "ENOENT") throw err;
 				}
@@ -339,6 +370,7 @@ export function registerEdit(pi: ExtensionAPI, cc: CCContext): void {
 				try {
 					existing = await readExistingText(absPath);
 				} catch (err: any) {
+					if (err instanceof NotRegularFileError) throw new Error(NOT_A_REGULAR_FILE);
 					throw new Error(`Error calling tool (Edit): ${err?.message ?? String(err)}`);
 				}
 				const rec = cc.fileState.get(absPath);
@@ -350,7 +382,7 @@ export function registerEdit(pi: ExtensionAPI, cc: CCContext): void {
 				} else {
 					if (absPath.endsWith(".ipynb")) throw new Error(NOT_A_NOTEBOOK_TOOL);
 					const text = stripBom(existing.content);
-					if (rec && cc.fileState.isStale(absPath, text) && editOutcome(text, oldString, replaceAll) !== "applies") {
+					if (rec && cc.fileState.isStale(absPath, text, { contentCheck }) && editOutcome(text, oldString, replaceAll) !== "applies") {
 						throw new Error(FILE_MODIFIED_SINCE_READ);
 					}
 					if (existing.notText) throw new Error(notTextMessage(existing.notText));
@@ -371,7 +403,7 @@ export function registerEdit(pi: ExtensionAPI, cc: CCContext): void {
 				const fileExists = existing !== null;
 				const content = existing?.content ?? "";
 				let staleRecovered = false;
-				if (fileExists && rec && cc.fileState.isStale(absPath, content)) {
+				if (fileExists && rec && cc.fileState.isStale(absPath, content, { contentCheck })) {
 					if (editOutcome(content, oldString, replaceAll) !== "applies") throw new Error(FILE_CONTENT_CHANGED);
 					staleRecovered = true;
 				}
@@ -381,7 +413,7 @@ export function registerEdit(pi: ExtensionAPI, cc: CCContext): void {
 				if (oldString === "") newString = addBomLike(content, newString);
 				let updated: string;
 				try {
-					updated = applyEdit(content, actualOld, newString, replaceAll);
+					updated = applyEdit(content, actualOld, newString, replaceAll, { deleteAllMatches: isFixed(cc, "replaceAllTrailingMatch") });
 				} catch (err) {
 					if (err instanceof EditApplyError) throw new Error(err.message);
 					throw err;

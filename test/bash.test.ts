@@ -392,10 +392,14 @@ describe("Bash background + TaskStop", () => {
 		const h = setup();
 		await h.run("Bash", { command: "sleep 10", run_in_background: true });
 		await h.run("Bash", { command: "sleep 10", run_in_background: true });
+		const tasks = h.cc.tasks.list();
+		expect(tasks.map((t) => t.status)).toEqual(["running", "running"]);
 		await h.shutdown();
 		await waitFor(() => h.events.filter((e) => e.type === "background_shell_exited").length === 2);
 		expect(h.messages).toHaveLength(0);
-		expect(h.cc.tasks.list().map((t) => t.status)).toEqual(["killed", "killed"]);
+		expect(tasks.map((t) => t.status)).toEqual(["killed", "killed"]);
+		// finished tasks are evicted from the registry
+		expect(h.cc.tasks.list()).toEqual([]);
 	});
 
 	it("background commands do not change the persistent cwd", async () => {

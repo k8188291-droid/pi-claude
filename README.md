@@ -85,6 +85,27 @@ const { session } = await createAgentSession({ cwd, modelRuntime, resourceLoader
 | `deferredTools` | `[]` | 以 pi 原生 `exposure: "deferred"` 註冊的本套件工具；有任何延遲載入工具（含你自己或 MCP 的）時會自動啟用 `tool_search` |
 | `modelRuntime` | 由 `createClaudeCodeSession` 帶入 | subagent 使用的 ModelRuntime（憑證與模型目錄） |
 | `bash` | `{ defaultTimeoutMs: 120000, maxTimeoutMs: 600000 }` | Bash 前景 timeout（背景工作的時間上限另計：預設 30 分、最多 2 小時） |
+| `compat` | `"claude-code"` | Claude Code 本身有 bug 的行為：`"claude-code"` 照樣重現（逐位元相容），`"fixed"` 全部改用修正後的行為 |
+| `quirks` | — | 逐項覆寫 `compat`，例如 `{ bashErrexit: "fixed" }`；項目見下表 |
+
+### Claude Code 相容選項（`compat` / `quirks`）
+
+下列行為是 Claude Code 本身的問題（見 [review](docs/review-2026-10-18.md) C 類）。預設照樣重現，以維持和 Claude Code 相同；設成 `"fixed"` 改用修正後的行為。
+
+| 項目 | Claude Code 的行為（預設） | `"fixed"` 時 |
+|---|---|---|
+| `bashErrexit` | `set -e` 失效，前一步失敗仍繼續 | `set -e` 正常生效 |
+| `orphanProcesses` | 指令用 `&` 啟動的子程序在 shell 結束後仍存活 | shell 結束時一併終止整個 process group |
+| `agentDisallowAll` | agent 的 `disallowedTools: "*"` 被忽略 | 移除全部工具 |
+| `remoteIsolationFallback` | `isolation: "remote"` 靜默改成本機執行 | 明確回報不支援 |
+| `mtimeOnlyChangeDetection` | 只看 mtime 判斷檔案是否被改過 | 比對內容雜湊 |
+| `notebookStaleBeforeSize` | NotebookEdit 先讀完整檔案才檢查大小 | 先檢查大小 |
+| `specialFileReads` | FIFO 等特殊檔案會讓 Read 卡住，也無法取消 | 先拒絕特殊檔案，讀取可取消 |
+| `pathTrim` | 路徑被 `trim()`，`"name "` 會寫到 `"name"` | 路徑照原樣使用，空路徑回錯誤 |
+| `searchPermissionErrors` | Grep／Glob 讀不到的檔案被當成「沒有符合」 | 回報讀不到的路徑 |
+| `readTokenCountLineNumbers` | Read 的 token 上限沒計入行號 | 計入行號 |
+| `replaceAllTrailingMatch` | `replace_all` 刪除時漏掉不帶換行的最後一個符合 | 全部刪除 |
+| `notebookCellTypeConversion` | 轉換 cell 型別後的欄位比照 Claude Code | 比照 nbformat 4 |
 
 ## Hooks
 
@@ -101,6 +122,7 @@ const { session } = await createAgentSession({ cwd, modelRuntime, resourceLoader
 - Read 的 token 數用估算（字元數 ÷ 4），Claude Code 會向 API 精算。
 - pi 送出工具 schema 時會拿掉 `additionalProperties: false`。
 - Bash 不載入使用者 shell profile（alias / function 不可用）。
+- 背景輸出、大輸出寫檔都放在私有目錄 `<tmpdir>/pi-cc-<uid>/`（目錄 0700、檔案 0600）。
 - Subagent 使用記憶體內預設設定與 `getAgentDir()`；憑證與模型目錄共用父 session 的 ModelRuntime。不支援接續已完成的 agent（Claude Code 改用 SendMessage）。
 - 工作清單的提醒是暫時注入（只出現在該次 LLM 呼叫），不寫入 session。
 

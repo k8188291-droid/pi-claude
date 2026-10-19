@@ -137,6 +137,37 @@ describe("AskUserQuestion execution", () => {
 		expect((r2.details as any).annotations).toEqual({ "One?": { notes: "hmm" } });
 	});
 
+	it("answers questions named like Object.prototype keys, \"__proto__\" included (#28)", async () => {
+		const keys = ["__proto__", "constructor", "toString", "hasOwnProperty"];
+		const host = async (qs: AskUserQuestionItem[]) => Object.fromEntries(qs.map((x) => [x.question, x.options[0].label]));
+		const { run } = setup({ onAskUserQuestion: host });
+		const r = await run({ questions: keys.map((k) => q(k)) });
+		expect(resultText(r)).toBe(
+			`Your questions have been answered: ${keys.map((k) => `"${k}"="A"`).join(", ")}. You can now continue with these answers in mind.`,
+		);
+		expect((r.details as any).unanswered).toEqual([]);
+		expect(Object.hasOwn((r.details as any).answers, "__proto__")).toBe(true);
+
+		// the structured form, from JSON (an own "__proto__" key)
+		const { run: run2 } = setup({ onAskUserQuestion: async () => JSON.parse('{"answers":{"__proto__":"B"}}') });
+		expect(resultText(await run2({ questions: [q("__proto__")] }))).toBe(
+			'Your questions have been answered: "__proto__"="B". You can now continue with these answers in mind.',
+		);
+
+		// unanswered prototype-named questions stay unanswered
+		const { run: run3 } = setup({ onAskUserQuestion: async () => ({}) });
+		const r3 = await run3({ questions: [q("constructor"), q("__proto__")] });
+		expect(resultText(r3)).toBe("The user did not answer the questions.");
+		expect((r3.details as any).unanswered).toEqual(["constructor", "__proto__"]);
+	});
+
+	it("UI fallback answers a \"__proto__\" question (#28)", async () => {
+		const ctx = fakeCtx("/tmp", { hasUI: true, ui: { select: async () => "A", input: async () => undefined } as any });
+		const { run } = setup();
+		const r = await run({ questions: [q("__proto__")] }, { ctx });
+		expect(resultText(r)).toBe('Your questions have been answered: "__proto__"="A". You can now continue with these answers in mind.');
+	});
+
 	it("turns host errors into tool errors", async () => {
 		const { run } = setup({
 			onAskUserQuestion: async () => {

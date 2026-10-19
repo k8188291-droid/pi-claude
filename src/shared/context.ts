@@ -28,7 +28,12 @@ export function createCCContext(options: ClaudeCodeToolsOptions, pi?: ExtensionA
 		notifications: pi ? new NotificationQueue(pi) : { enqueue() {}, discard() {} },
 		emit(event) {
 			try {
-				options.onEvent?.(event);
+				// `onEvent` is typed `=> void`, but an async callback still type-checks: swallow its
+				// rejection too, or a failing host handler becomes an unhandled rejection (#21).
+				const result: unknown = options.onEvent?.(event);
+				if (result !== null && typeof result === "object" && typeof (result as PromiseLike<unknown>).then === "function") {
+					Promise.resolve(result as PromiseLike<unknown>).then(undefined, () => {});
+				}
 			} catch {
 				// host errors must never break the agent loop
 			}

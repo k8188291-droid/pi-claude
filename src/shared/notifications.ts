@@ -43,6 +43,8 @@ export function formatTaskNotification(n: TaskNotification): string {
 export class NotificationQueue {
 	private pending: string[] = [];
 	private running = false;
+	/** Set on session_shutdown: nothing is delivered (and no turn is started) afterwards. */
+	private closed = false;
 
 	constructor(private pi: ExtensionAPI) {
 		pi.on("agent_start", async () => {
@@ -53,12 +55,25 @@ export class NotificationQueue {
 			// let the loop settle before starting a new turn
 			setTimeout(() => this.flushIdle(), 0);
 		});
+		pi.on("session_shutdown", async () => {
+			this.close();
+		});
+	}
+
+	/** Stop delivering: drop queued notifications and ignore later ones. */
+	close(): void {
+		this.closed = true;
+		this.pending = [];
+	}
+
+	get isClosed(): boolean {
+		return this.closed;
 	}
 
 	/** Register the tool_result hook that attaches pending notifications. Call after other tool_result hooks. */
 	attachToToolResults(): void {
 		this.pi.on("tool_result", async (event) => {
-			if (this.pending.length === 0) return undefined;
+			if (this.closed || this.pending.length === 0) return undefined;
 			const text = this.pending.splice(0).join("\n\n");
 			// Claude Code appends the reminder to the result text after a blank line
 			const content = [...(event.content ?? [])];
@@ -72,6 +87,7 @@ export class NotificationQueue {
 	}
 
 	enqueue(text: string): void {
+		if (this.closed) return;
 		this.pending.push(text);
 		if (!this.running) this.flushIdle();
 	}
@@ -82,7 +98,7 @@ export class NotificationQueue {
 	}
 
 	private flushIdle(): void {
-		if (this.running || this.pending.length === 0) return;
+		if (this.closed || this.running || this.pending.length === 0) return;
 		const text = this.pending.splice(0).join("\n\n");
 		try {
 			this.pi.sendMessage({ customType: NOTIFICATION_CUSTOM_TYPE, content: text, display: false }, { deliverAs: "followUp", triggerTurn: true });

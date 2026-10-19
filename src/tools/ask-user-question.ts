@@ -331,7 +331,8 @@ const DONE_LABEL = "Done";
  * that question unanswered.
  */
 async function askViaUI(questions: AskUserQuestionItem[], ctx: ExtensionContext, signal: AbortSignal | undefined): Promise<Record<string, string | string[]>> {
-	const answers: Record<string, string | string[]> = {};
+	// null prototype: a question may be any string, "__proto__" included (#28)
+	const answers: Record<string, string | string[]> = Object.create(null);
 	const dialogOpts = signal ? { signal } : undefined;
 	for (const q of questions) {
 		if (signal?.aborted) throw abortError();
@@ -377,7 +378,8 @@ function normalizeHostResult(
 			if (typeof raw.response === "string") response = raw.response;
 		} else answersIn = raw;
 	}
-	const answers: Record<string, string> = {};
+	// null prototype: a question may be any string, "__proto__" included (#28)
+	const answers: Record<string, string> = Object.create(null);
 	for (const q of questions) {
 		const v = own(answersIn, q.question);
 		if (Array.isArray(v)) {
@@ -422,7 +424,7 @@ export function registerAskUserQuestion(pi: ExtensionAPI, cc: CCContext): void {
 			if (signal?.aborted) throw abortError();
 
 			const { answers, annotations, response } = normalizeHostResult(questions, raw);
-			const unanswered = questions.filter((q) => !(q.question in answers)).map((q) => q.question);
+			const unanswered = questions.filter((q) => !Object.hasOwn(answers, q.question)).map((q) => q.question);
 			const details: AskUserQuestionDetails = { questions, answers, unanswered };
 			if (annotations) details.annotations = annotations;
 			if (response?.trim()) details.response = response;

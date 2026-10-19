@@ -10,6 +10,7 @@
  */
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
 import type { AddressInfo } from "node:net";
+import { createHash } from "node:crypto";
 import { writeFileSync } from "node:fs";
 import { gunzipSync } from "node:zlib";
 
@@ -53,13 +54,55 @@ export interface MockScript {
 
 const SUB_MARKER = /\[\[sub:([\w-]+)\]\]/;
 
-function textOf(content: unknown): string {
+const sha256 = (data: string | Buffer) => createHash("sha256").update(data).digest("hex");
+
+/** Placeholder text for a base64/url/file `source` (images, documents), so content differences are compared. */
+function sourceText(type: string, source: any): string {
+	if (source?.type === "base64" && typeof source.data === "string") {
+		const bytes = Buffer.from(source.data, "base64");
+		return `<${type} ${source.media_type ?? "?"} ${bytes.length} bytes sha256:${sha256(bytes)}>`;
+	}
+	if (source?.type === "text" && typeof source.data === "string") return `<${type} ${source.media_type ?? "text/plain"} text>\n${source.data}`;
+	if (source?.type === "url") return `<${type} url:${source.url}>`;
+	if (source?.type === "file") return `<${type} file:${source.file_id}>`;
+	if (source?.type === "content") return `<${type} content>\n${textOf(source.content)}`;
+	return `<${type} ${stableJson(source)}>`;
+}
+
+/** JSON with sorted keys, long strings replaced by their hash, `cache_control` dropped. */
+function stableJson(v: unknown): string {
+	const walk = (x: any): any => {
+		if (typeof x === "string") return x.length > 200 ? `<${x.length} chars sha256:${sha256(x)}>` : x;
+		if (Array.isArray(x)) return x.map(walk);
+		if (x && typeof x === "object")
+			return Object.fromEntries(
+				Object.keys(x)
+					.filter((k) => k !== "cache_control")
+					.sort()
+					.map((k) => [k, walk(x[k])]),
+			);
+		return x;
+	};
+	return JSON.stringify(walk(v)) ?? "";
+}
+
+/**
+ * Text of a message/tool_result content. Non-text blocks are rendered as placeholders (images and
+ * documents by media type + sha256 of their bytes) so they take part in the comparison.
+ */
+export function textOf(content: unknown): string {
 	if (typeof content === "string") return content;
 	if (!Array.isArray(content)) return "";
 	return content
 		.map((b: any) => {
 			if (b?.type === "text") return b.text;
 			if (b?.type === "tool_result") return textOf(b.content);
+			if (b?.type === "image" || b?.type === "document") return sourceText(b.type, b.source);
+			if (b?.type === "tool_reference") return `<tool_reference ${b.tool_name}>`;
+			if (typeof b?.type === "string") {
+				const { type, ...rest } = b;
+				return `<${type} ${stableJson(rest)}>`;
+			}
 			return "";
 		})
 		.join("\n");
@@ -87,6 +130,8 @@ export class MockAnthropicServer {
 	readonly requests: CapturedRequest[] = [];
 	private idPrefix = "run";
 	private recorder?: { upstream: string; apiKey?: string; model?: string; liveFile?: string };
+	/** Handler failures since the last load() (answered with 4xx/5xx instead of crashing the process). */
+	readonly errors: string[] = [];
 	readonly recording = new Map<string, RecordedConversation>();
 
 	/**
@@ -100,7 +145,9 @@ export class MockAnthropicServer {
 	}
 
 	async start(): Promise<string> {
-		this.server = createServer((req, res) => void this.handle(req, res));
+		this.server = createServer((req, res) => {
+			this.handle(req, res).catch((e) => this.fail(req, res, e));
+		});
 		await new Promise<void>((r) => this.server!.listen(0, "127.0.0.1", r));
 		const { port } = this.server.address() as AddressInfo;
 		return `http://127.0.0.1:${port}`;
@@ -114,7 +161,22 @@ export class MockAnthropicServer {
 	load(script: MockScript, idPrefix: string): void {
 		this.script = script;
 		this.requests.length = 0;
+		this.errors.length = 0;
 		this.idPrefix = idPrefix;
+	}
+
+	/** Answer a failed request (400 for client/script errors, 500 otherwise) and keep serving. */
+	private fail(req: IncomingMessage, res: ServerResponse, e: unknown): void {
+		const status = e instanceof MockRequestError ? 400 : 500;
+		const message = `mock: ${e instanceof Error ? e.message : String(e)}`;
+		this.errors.push(`${req.method} ${req.url} → ${status}: ${message}`);
+		process.stderr.write(`[mock] ${req.method} ${req.url} → ${status}: ${message}\n`);
+		try {
+			if (!res.headersSent) json(res, status, { type: "error", error: { type: status === 400 ? "invalid_request_error" : "api_error", message } });
+			else res.destroy();
+		} catch {
+			// socket already gone
+		}
 	}
 
 	private async handle(req: IncomingMessage, res: ServerResponse): Promise<void> {
@@ -122,7 +184,13 @@ export class MockAnthropicServer {
 		const chunks: Buffer[] = [];
 		for await (const chunk of req) chunks.push(chunk as Buffer);
 		let buf = Buffer.concat(chunks);
-		if (req.headers["content-encoding"] === "gzip") buf = gunzipSync(buf);
+		if (req.headers["content-encoding"] === "gzip") {
+			try {
+				buf = gunzipSync(buf);
+			} catch (e) {
+				throw new MockRequestError(`bad gzip body (${(e as Error).message})`);
+			}
+		}
 		const raw = buf.toString("utf8");
 		if (req.method === "POST" && /\/v1\/messages\/count_tokens/.test(url)) {
 			return json(res, 200, { input_tokens: 100 });
@@ -178,7 +246,13 @@ export class MockAnthropicServer {
 			const turns = route === "main" ? this.script?.main : this.script?.subagents?.[route];
 			turn = turns?.[turnIndex] ?? { text: `[mock] script exhausted (${route} turn ${turnIndex})` };
 		}
-		const content = this.renderTurn(turn, route, turnIndex, this.requests.at(-1)!);
+		let content: any[];
+		try {
+			content = this.renderTurn(turn, route, turnIndex, this.requests.at(-1)!);
+		} catch (e) {
+			// deterministic script bug: a 400 stops the client instead of retrying
+			throw new MockRequestError(`script error (${route} turn ${turnIndex}): ${(e as Error).message}`);
+		}
 		const stopReason = content.some((b) => b.type === "tool_use") ? "tool_use" : "end_turn";
 		const message = {
 			id: `msg_${this.idPrefix}_${route}_${turnIndex}_${this.requests.length}`,
@@ -263,6 +337,9 @@ export class MockAnthropicServer {
 		return out;
 	}
 }
+
+/** A request the mock cannot answer for reasons that won't change on retry (answered with 400). */
+class MockRequestError extends Error {}
 
 /** Deterministic tool_use id, identical for both harnesses. */
 export function toolUseId(route: string, turnIndex: number, i: number): string {

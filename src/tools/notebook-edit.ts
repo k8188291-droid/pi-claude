@@ -1,10 +1,12 @@
 import { randomUUID } from "node:crypto";
-import { readFile, stat, writeFile } from "node:fs/promises";
+import { stat } from "node:fs/promises";
 import { extname } from "node:path";
 import { withFileMutationQueue, type ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import type { CCContext } from "../shared/context.js";
-import { resolvePath } from "../shared/paths.js";
+import { resolveToolPath } from "../shared/paths.js";
+import { isFixed } from "../shared/quirks.js";
 import { textResult } from "../shared/text.js";
+import { NotRegularFileError, readRegularFile, writeRegularFile } from "./write.js";
 import { claudeInputValidator, type Spec } from "./input-validation.js";
 
 export const NOTEBOOK_EDIT_TOOL_NAME = "NotebookEdit";
@@ -80,6 +82,7 @@ export const NOTEBOOK_MESSAGES = {
 	invalidNotebook: 'Notebook file is not a valid Jupyter notebook (top-level "cells" must be an array of cell objects, each with a string or string-array "source").',
 	cellIdRequired: "Cell ID must be specified when not inserting a new cell.",
 	tooLarge: "Notebook file exceeds the maximum size this tool can read (100MB).",
+	notRegular: "Notebook path is not a regular file (device, FIFO, or socket).",
 } as const;
 
 class NotebookEditError extends Error {}
@@ -136,7 +139,10 @@ export function registerNotebookEdit(pi: ExtensionAPI, cc: CCContext): void {
 			const { notebook_path, new_source, cell_id, edit_mode } = params as NotebookEditInput;
 			let cellType = (params as NotebookEditInput).cell_type;
 			const cwd = ctx?.cwd ?? process.cwd();
-			const absPath = resolvePath(cwd, notebook_path);
+			const absPath = resolveToolPath(cc, cwd, notebook_path, "notebook_path");
+			const contentCheck = isFixed(cc, "mtimeOnlyChangeDetection");
+			const sizeFirst = isFixed(cc, "notebookStaleBeforeSize");
+			const fixCellFields = isFixed(cc, "notebookCellTypeConversion");
 
 			return withFileMutationQueue(absPath, async () => {
 				// ---- validation (Claude Code's validateInput order) ----
@@ -144,14 +150,27 @@ export function registerNotebookEdit(pi: ExtensionAPI, cc: CCContext): void {
 				if (extname(absPath) !== ".ipynb") throw new NotebookEditError(NOTEBOOK_MESSAGES.notNotebook);
 				if (mode === "insert" && !cellType) throw new NotebookEditError(NOTEBOOK_MESSAGES.cellTypeRequired);
 				if (!cc.fileState.has(absPath)) throw new NotebookEditError(NOTEBOOK_MESSAGES.notRead);
-				if (cc.fileState.isStale(absPath)) throw new NotebookEditError(NOTEBOOK_MESSAGES.modified);
+				// Size (a stat) before staleness (which may read the whole file): #6b fixed.
+				// Claude Code checks staleness first.
+				const checkSize = async () => {
+					try {
+						const st = await stat(absPath);
+						if (st.size > MAX_NOTEBOOK_BYTES) throw new NotebookEditError(NOTEBOOK_MESSAGES.tooLarge);
+					} catch (err: any) {
+						if (err?.code === "ENOENT") throw new NotebookEditError(NOTEBOOK_MESSAGES.missing);
+						throw err;
+					}
+				};
+				if (sizeFirst) await checkSize();
+				if (cc.fileState.isStale(absPath, undefined, { contentCheck })) throw new NotebookEditError(NOTEBOOK_MESSAGES.modified);
+				if (!sizeFirst) await checkSize();
 				let raw: string;
 				try {
-					const st = await stat(absPath);
-					if (st.size > MAX_NOTEBOOK_BYTES) throw new NotebookEditError(NOTEBOOK_MESSAGES.tooLarge);
-					raw = await readFile(absPath, "utf8");
+					// Opened non-blocking and fstat-checked: a FIFO or device is refused, never read or written.
+					raw = (await readRegularFile(absPath)).toString("utf8");
 				} catch (err: any) {
 					if (err?.code === "ENOENT") throw new NotebookEditError(NOTEBOOK_MESSAGES.missing);
+					if (err instanceof NotRegularFileError) throw new NotebookEditError(NOTEBOOK_MESSAGES.notRegular);
 					throw err;
 				}
 				let nb: any;
@@ -201,11 +220,24 @@ export function registerNotebookEdit(pi: ExtensionAPI, cc: CCContext): void {
 					const cell = nb.cells[index];
 					oldSource = sourceText(cell.source);
 					cell.source = new_source;
-					if (cell.cell_type === "code") {
-						cell.execution_count = null;
-						cell.outputs = [];
+					if (fixCellFields) {
+						// #27 fixed: give the cell the fields its (new) type has in nbformat 4: code cells
+						// get cleared outputs and execution_count, markdown/raw cells have neither.
+						if (cellType && cellType !== cell.cell_type) cell.cell_type = cellType;
+						if (cell.cell_type === "code") {
+							cell.execution_count = null;
+							cell.outputs = [];
+						} else {
+							delete cell.execution_count;
+							delete cell.outputs;
+						}
+					} else {
+						if (cell.cell_type === "code") {
+							cell.execution_count = null;
+							cell.outputs = [];
+						}
+						if (cellType && cellType !== cell.cell_type) cell.cell_type = cellType;
 					}
-					if (cellType && cellType !== cell.cell_type) cell.cell_type = cellType;
 				}
 				let out = JSON.stringify(nb, null, 1);
 				if (lineEndings(raw) === "CRLF") out = out.replace(/\n/g, "\r\n");
@@ -213,7 +245,12 @@ export function registerNotebookEdit(pi: ExtensionAPI, cc: CCContext): void {
 					throw new NotebookEditError("Edit rejected: the updated notebook would exceed the maximum size this tool can read (100MB). The file was left unchanged.");
 				}
 				if (signal?.aborted) throw new Error("Operation aborted");
-				await writeFile(absPath, out, "utf8");
+				try {
+					await writeRegularFile(absPath, out);
+				} catch (err) {
+					if (err instanceof NotRegularFileError) throw new NotebookEditError(NOTEBOOK_MESSAGES.notRegular);
+					throw err;
+				}
 				cc.fileState.recordWrite(absPath, out);
 				const resultMode = effectiveMode ?? "replace";
 				const resultCellId = newCellId || undefined;

@@ -5,7 +5,8 @@ import { Type, type Static } from "typebox";
 import type { CCContext } from "../shared/context.js";
 import { resolvePath } from "../shared/paths.js";
 import { textResult } from "../shared/text.js";
-import { displayPath, missingPathMessage, runRipgrep, splitNullOutput } from "./grep.js";
+import { isFixed } from "../shared/quirks.js";
+import { displayPath, missingPathMessage, runRipgrep, splitNullOutput, surfacePathErrors, type SearchOptions } from "./grep.js";
 
 export const GLOB_TOOL_NAME = "Glob";
 export const GLOB_MAX_RESULTS = 100;
@@ -105,16 +106,17 @@ export async function executeGlob(
 	params: GlobParams,
 	cwd: string,
 	signal?: AbortSignal,
+	options: SearchOptions = {},
 ): Promise<{ text: string; details: GlobDetails }> {
 	const start = Date.now();
 	if (typeof params.pattern !== "string") throw new Error("pattern must be a string");
 	if (signal?.aborted) throw new Error("Operation aborted");
 
 	const abs = splitAbsolutePattern(params.pattern);
-	const searchDir = abs ? resolve(abs.baseDir) : params.path ? resolvePath(cwd, params.path) : resolve(cwd);
+	const searchDir = abs ? resolve(abs.baseDir) : params.path ? resolvePath(cwd, params.path, { trim: !options.exactPaths }) : resolve(cwd);
 
 	// The path parameter is validated only when it is the directory searched.
-	if (params.path && searchDir === resolvePath(cwd, params.path)) {
+	if (params.path && searchDir === resolvePath(cwd, params.path, { trim: !options.exactPaths })) {
 		let st;
 		try {
 			st = await stat(searchDir);
@@ -150,21 +152,23 @@ export async function executeGlob(
 	const run = await runRipgrep(args, isDir ? searchDir : dirname(searchDir), signal);
 	if (signal?.aborted) throw new Error("Operation aborted");
 
-	const files = splitNullOutput(run.lines, "files_with_matches").map((p) =>
-		isDir ? join(searchDir, p.startsWith("./") ? p.slice(2) : p) : p,
-	);
+	const toAbs = (p: string) => (isDir ? join(searchDir, p.startsWith("./") ? p.slice(2) : p) : p);
+	const files = splitNullOutput(run.lines, "files_with_matches").map(toAbs);
 	const shown = files.slice(0, GLOB_MAX_RESULTS).map((f) => displayPath(cwd, f));
 	details.filenames = shown;
 	details.numFiles = shown.length;
 	details.truncated = files.length > GLOB_MAX_RESULTS;
 	details.totalMatches = files.length;
 	details.durationMs = Date.now() - start;
-	if (shown.length === 0) return { text: "No files found", details };
-	const text = [...shown, ...(details.truncated ? [globTruncationNote(shown.length, files.length)] : [])].join("\n");
+	let text =
+		shown.length === 0
+			? "No files found"
+			: [...shown, ...(details.truncated ? [globTruncationNote(shown.length, files.length)] : [])].join("\n");
+	if (options.surfacePathErrors) text = surfacePathErrors(text, shown.length === 0, run.stderr, (p) => displayPath(cwd, toAbs(p)));
 	return { text, details };
 }
 
-export function registerGlob(pi: ExtensionAPI, _cc: CCContext): void {
+export function registerGlob(pi: ExtensionAPI, cc: CCContext): void {
 	pi.registerTool({
 		name: GLOB_TOOL_NAME,
 		label: "Glob",
@@ -172,7 +176,10 @@ export function registerGlob(pi: ExtensionAPI, _cc: CCContext): void {
 		promptSnippet: 'Find files by glob pattern (e.g. "**/*.ts"), oldest first',
 		parameters: globSchema,
 		async execute(_toolCallId, params, signal, _onUpdate, ctx) {
-			const { text, details } = await executeGlob(params, ctx.cwd, signal);
+			const { text, details } = await executeGlob(params, ctx.cwd, signal, {
+				surfacePathErrors: isFixed(cc, "searchPermissionErrors"),
+				exactPaths: isFixed(cc, "pathTrim"),
+			});
 			return textResult<GlobDetails>(text, details);
 		},
 	});

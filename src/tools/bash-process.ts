@@ -105,10 +105,18 @@ export function shellQuote(s: string): string {
  * - the user command runs through `eval` so syntax errors are reported as a normal non-zero exit,
  * - optional: on success, the final `pwd -P` is written to a side-channel file (Claude Code only
  *   updates the working directory when the command succeeds).
+ *
+ * Claude Code runs `eval '<cmd>' && pwd -P ...`: the eval is the left side of an `&&` list, where
+ * bash ignores `set -e`, so a command using `set -e` keeps going after a failure (quirk
+ * `bashErrexit`). With `errexit: true` the eval is a plain statement instead (errexit applies and
+ * stops the shell with the failing status); the cwd is still only captured when it succeeded.
  */
-export function buildScript(command: string, cwdFile?: string): string {
+export function buildScript(command: string, cwdFile?: string, opts: { errexit?: boolean } = {}): string {
 	let script = `exec 2>&1; eval ${shellQuote(command)}`;
-	if (cwdFile) script += ` && pwd -P >| ${shellQuote(cwdFile)}`;
+	if (!cwdFile) return script;
+	if (opts.errexit) {
+		script += `; __pi_cc_status=$?; if [ "$__pi_cc_status" -eq 0 ]; then pwd -P >| ${shellQuote(cwdFile)}; fi; exit "$__pi_cc_status"`;
+	} else script += ` && pwd -P >| ${shellQuote(cwdFile)}`;
 	return script;
 }
 
@@ -123,8 +131,16 @@ export interface SpawnedShell {
 /** Grace period after the shell exits for descendants still holding the output pipes. */
 const EXIT_STDIO_GRACE_MS = 100;
 
+export interface SpawnShellOptions {
+	/**
+	 * Kill the shell's whole process group as soon as the shell exits, so processes it started with
+	 * `&` do not outlive it (quirk `orphanProcesses` fixed). Claude Code leaves them running.
+	 */
+	killGroupOnExit?: boolean;
+}
+
 /** Spawn `script` in the user's shell as a detached process group, streaming decoded output to `onData`. */
-export function spawnShell(script: string, cwd: string, onData: (text: string) => void): SpawnedShell {
+export function spawnShell(script: string, cwd: string, onData: (text: string) => void, opts: SpawnShellOptions = {}): SpawnedShell {
 	const { shell, args } = getShellConfig();
 	const child = spawn(shell, [...args, script], {
 		cwd,
@@ -174,6 +190,7 @@ export function spawnShell(script: string, cwd: string, onData: (text: string) =
 		});
 		child.once("exit", (code, signal) => {
 			exited = true;
+			if (opts.killGroupOnExit && pid && process.platform !== "win32") killProcessTree(pid);
 			result = { exitCode: code, signal };
 			maybeFinalize();
 			if (!settled) graceTimer = setTimeout(finalize, EXIT_STDIO_GRACE_MS);

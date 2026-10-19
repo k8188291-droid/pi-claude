@@ -33,8 +33,13 @@ export interface TodoItem {
 export interface AgentDefinition {
 	description: string;
 	prompt: string;
-	/** Tool names the subagent may use. Omit to inherit all parent tools (except Task). */
+	/**
+	 * Tool names the subagent may use. Omit (or include "*") for all tools; `[]` means no tools.
+	 * `mcp__server` / `mcp__server__*` match every tool of that MCP server.
+	 */
 	tools?: string[];
+	/** Tool names removed from the subagent's tools (same rule syntax as `tools`; "*" is a quirk, see `agentDisallowAll`). */
+	disallowedTools?: string[];
 	/**
 	 * Model override: a pi Model, a model id ("provider/id" or bare id), an alias
 	 * ("sonnet" | "opus" | "haiku"), or "inherit" (default).
@@ -71,7 +76,7 @@ export interface OutputSpillOptions {
 	maxChars?: number;
 	/** Characters of preview kept inline when spilling. Default 2000. */
 	previewChars?: number;
-	/** Directory where spilled outputs are written. Default: <os.tmpdir()>/pi-cc-tool-results/<sessionId>. */
+	/** Directory where spilled outputs are written. Default: <os.tmpdir()>/pi-cc-<uid>/<sessionId>/tool-results (private: 0700 dirs, 0600 files). */
 	dir?: string;
 	/** Tool names excluded from spilling (Read is always excluded to avoid loops). */
 	exclude?: string[];

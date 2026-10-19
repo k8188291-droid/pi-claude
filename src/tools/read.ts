@@ -4,12 +4,15 @@ import { mkdtemp, open, readdir, readFile, realpath, rm, stat } from "node:fs/pr
 import { tmpdir } from "node:os";
 import { basename, dirname, extname, join, relative, sep } from "node:path";
 import { isUtf8 } from "node:buffer";
+import type { StringDecoder } from "node:string_decoder";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import type { ImageContent, TextContent } from "@earendil-works/pi-ai";
 import type { AgentToolResult, ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 import type { CCContext } from "../shared/context.js";
-import { resolvePath } from "../shared/paths.js";
+import { decoderFor, hashFileTextAsync, TextHasher } from "../shared/file-state.js";
+import { resolveToolPath } from "../shared/paths.js";
+import { isFixed } from "../shared/quirks.js";
 
 // ---------------------------------------------------------------------------------------------
 // Limits (Claude Code 2.1.x defaults)
@@ -216,6 +219,29 @@ function throwIfAborted(signal: AbortSignal | undefined): void {
 	if (signal?.aborted) throw new Error("Operation aborted");
 }
 
+/**
+ * #7c (`specialFileReads` fixed): settle as soon as `signal` aborts, even while the read itself
+ * cannot be cancelled (an `open()` stuck in the threadpool on a FIFO without a writer).
+ */
+export function abortable<T>(p: Promise<T>, signal: AbortSignal | undefined): Promise<T> {
+	if (!signal) return p;
+	return new Promise<T>((resolve, reject) => {
+		const onAbort = () => reject(new Error("Operation aborted"));
+		if (signal.aborted) onAbort();
+		else signal.addEventListener("abort", onAbort, { once: true });
+		p.then(
+			(v) => {
+				signal.removeEventListener("abort", onAbort);
+				resolve(v);
+			},
+			(e) => {
+				signal.removeEventListener("abort", onAbort);
+				reject(e);
+			},
+		);
+	});
+}
+
 // ---------------------------------------------------------------------------------------------
 // Size / token limit errors
 // ---------------------------------------------------------------------------------------------
@@ -317,6 +343,8 @@ interface TextRange {
 	notText?: NotText;
 	/** The raw file (not set for streamed files). */
 	raw?: Buffer;
+	/** Streamed files: the whole file's text hash, computed while streaming (#6a). */
+	hash?: string;
 }
 
 function decodeText(buf: Buffer): { text: string; notText?: NotText } {
@@ -362,7 +390,11 @@ export function selectLines(text: string, offset: number, limit: number | undefi
 	return { content: selected.join("\n"), lineCount: selected.length, totalLines: index };
 }
 
-/** Streaming variant for large files (UTF-8 only, like Claude Code). */
+/**
+ * Streaming variant for large files. Like Claude Code, it decodes UTF-8, or UTF-16LE when the file
+ * starts with its byte-order mark (#26), and keeps only the selected lines in memory; the whole
+ * file's text hash for the file-state record is computed on the way (#6a).
+ */
 async function streamLines(
 	absPath: string,
 	offset: number,
@@ -378,7 +410,8 @@ async function streamLines(
 	let total = 0;
 	let partial = "";
 	let first = true;
-	const decoder = new TextDecoder("utf-8");
+	let decoder: StringDecoder | undefined;
+	const hasher = new TextHasher();
 	const take = (line: string) => {
 		if (line.endsWith("\r")) line = line.slice(0, -1);
 		if (maxSelectedBytes !== undefined) {
@@ -391,8 +424,10 @@ async function streamLines(
 	const stream = createReadStream(absPath, { highWaterMark: STREAM_CHUNK_BYTES, signal });
 	try {
 		for await (const chunk of stream as AsyncIterable<Buffer>) {
-			let s = decoder.decode(chunk, { stream: true });
-			if (first) {
+			decoder ??= decoderFor(chunk);
+			let s = decoder.write(chunk);
+			hasher.update(s);
+			if (first && s !== "") {
 				first = false;
 				if (s.charCodeAt(0) === 0xfeff) s = s.slice(1);
 			}
@@ -410,10 +445,12 @@ async function streamLines(
 	} finally {
 		stream.destroy();
 	}
-	partial += decoder.decode();
+	const rest = decoder?.end() ?? "";
+	hasher.update(rest);
+	partial += first && rest.charCodeAt(0) === 0xfeff ? rest.slice(1) : rest;
 	if (index >= offset && index < end) take(partial);
 	index++;
-	return { content: selected.join("\n"), lineCount: selected.length, totalLines: index };
+	return { content: selected.join("\n"), lineCount: selected.length, totalLines: index, hash: hasher.digest() };
 }
 
 async function readTextRange(
@@ -424,11 +461,13 @@ async function readTextRange(
 	maxBytes: number | undefined,
 	maxSelectedBytes: number | undefined,
 	signal?: AbortSignal,
+	raceAbort = false,
 ): Promise<TextRange> {
 	if (maxSelectedBytes !== undefined && size <= maxSelectedBytes) maxSelectedBytes = undefined;
 	if (size >= STREAM_THRESHOLD_BYTES) return streamLines(absPath, offset, limit, maxBytes, maxSelectedBytes, signal);
 	if (maxBytes !== undefined && size > maxBytes) throw new FileTooLargeError(size, maxBytes);
-	const buf = await readFile(absPath, { signal });
+	const read = readFile(absPath, { signal });
+	const buf = raceAbort ? await abortable(read, signal) : await read;
 	if (maxBytes !== undefined && buf.length > maxBytes) throw new FileTooLargeError(buf.length, maxBytes);
 	const { text, notText } = decodeText(buf);
 	return { ...selectLines(text, offset, limit, maxSelectedBytes), notText, raw: buf };
@@ -481,6 +520,7 @@ async function readTextFile(
 	const { offset, limit } = params;
 	const startIndex = offset === 0 ? 0 : offset - 1;
 	const wholeFile = offset <= 1 && limit === undefined;
+	const countLineNumbers = isFixed(cc, "readTokenCountLineNumbers");
 
 	let range: TextRange;
 	try {
@@ -492,6 +532,7 @@ async function readTextFile(
 			limit === undefined ? maxBytes : undefined,
 			limit === undefined ? undefined : Math.max(baseMaxTokens * SELECTED_BYTES_PER_TOKEN, optIn?.raised?.maxSizeBytes ?? 0),
 			signal,
+			isFixed(cc, "specialFileReads"),
 		);
 	} catch (err) {
 		throw withAllowLargeSuffix(err, room, params.allowLarge);
@@ -503,7 +544,8 @@ async function readTextFile(
 	let recordedLimit = limit;
 	let banner: string | undefined;
 	try {
-		const checked = optIn?.raised ? addLineNumbers(content, Math.max(1, offset)) : content;
+		// Claude Code counts the line-number prefixes only for allow_large reads (#18); fixed: always.
+		const checked = optIn?.raised || countLineNumbers ? addLineNumbers(content, Math.max(1, offset)) : content;
 		const tokens = checkTokens(checked, ext, maxTokens, optIn?.raised !== undefined);
 		if (optIn?.raised && tokens !== undefined) {
 			const cap = room().raised?.maxTokens ?? baseMaxTokens;
@@ -527,7 +569,8 @@ async function readTextFile(
 	const startLine = banner !== undefined ? Math.max(1, offset) : offset;
 	const partial = banner !== undefined || startIndex > 0 || numLines < range.totalLines;
 	try {
-		cc.fileState.recordRead(absPath, range.raw ?? (await readFile(absPath)), { partial, truncated: banner !== undefined, offset, limit: recordedLimit });
+		// A streamed file was hashed while streaming: never load it whole just to record it (#6a).
+		cc.fileState.recordRead(absPath, range.raw ?? { hash: range.hash! }, { partial, truncated: banner !== undefined, offset, limit: recordedLimit });
 	} catch {
 		// the file vanished between reading and recording: nothing to track
 	}
@@ -658,13 +701,13 @@ export async function prepareImage(buffer: Buffer, mimeType: string): Promise<{ 
 	return { note: "[Image omitted: could not be resized below the inline image size limit.]" };
 }
 
-async function readImage(absPath: string, size: number): Promise<AgentToolResult<ReadToolDetails>> {
+async function readImage(absPath: string, size: number, signal?: AbortSignal): Promise<AgentToolResult<ReadToolDetails>> {
 	if (size > MAX_IMAGE_FILE_BYTES) {
 		throw new Error(
 			`File is too large to read as an image (the limit is ${formatBytes(MAX_IMAGE_FILE_BYTES)}): ${absPath}. If it is an image, resize it or export a smaller copy, then read that.`,
 		);
 	}
-	const buffer = await readFile(absPath);
+	const buffer = signal ? await abortable(readFile(absPath, { signal }), signal) : await readFile(absPath);
 	if (buffer.length === 0) throw new Error(`Image file is empty: ${absPath}`);
 	const mime = sniffImageMimeType(buffer);
 	if (!mime) {
@@ -921,11 +964,11 @@ function jscJsonError(err: unknown): string {
 	return msg;
 }
 
-async function readNotebook(absPath: string, size: number): Promise<{ result: AgentToolResult<ReadToolDetails>; raw: Buffer }> {
+async function readNotebook(absPath: string, size: number, signal?: AbortSignal): Promise<{ result: AgentToolResult<ReadToolDetails>; raw: Buffer }> {
 	if (size > NOTEBOOK_MAX_FILE_BYTES) {
 		throw new Error(`Notebook file exceeds the maximum size this tool can read (${formatBytes(NOTEBOOK_MAX_FILE_BYTES)}). ${NOTEBOOK_JQ_HINT}`);
 	}
-	const raw = await readFile(absPath);
+	const raw = signal ? await abortable(readFile(absPath, { signal }), signal) : await readFile(absPath);
 	let nb: any;
 	try {
 		nb = JSON.parse(raw.toString("utf8"));
@@ -1075,7 +1118,11 @@ export function registerRead(pi: ExtensionAPI, cc: CCContext): void {
 				const error = validatePages(params.pages);
 				if (error) throw new Error(error);
 			}
-			let absPath = resolvePath(cwd, params.file_path);
+			let absPath = resolveToolPath(cc, cwd, params.file_path);
+			const contentCheck = isFixed(cc, "mtimeOnlyChangeDetection");
+			const fixSpecialFiles = isFixed(cc, "specialFileReads");
+			/** Only passed to the image/notebook readers when #7c is fixed (Claude Code's are not abortable). */
+			const readSignal = fixSpecialFiles ? signal : undefined;
 			if (hasBinaryExtension(absPath)) {
 				throw new Error(
 					`This tool cannot read binary files. The file appears to be a binary ${extname(absPath).toLowerCase()} file. Use a skill for this file type if one is available, or a shell command or script that can read the format.`,
@@ -1097,7 +1144,8 @@ export function registerRead(pi: ExtensionAPI, cc: CCContext): void {
 			if (rec && rec.source === "read" && !rec.truncated && !rec.contentNotInModelContext && rec.offset !== undefined && rec.offset === offset && rec.limit === limit) {
 				try {
 					const st = await stat(absPath);
-					if (Math.floor(st.mtimeMs) === rec.timestamp) {
+					// #5 fixed: an unchanged mtime is not enough, the content must match too.
+					if (Math.floor(st.mtimeMs) === rec.timestamp && (!contentCheck || (st.isFile() && (await hashFileTextAsync(absPath)) === rec.hash))) {
 						return { content: [{ type: "text", text: WASTED_CALL_MESSAGE }], details: { filePath: absPath, kind: "file_unchanged" } };
 					}
 				} catch {
@@ -1120,10 +1168,15 @@ export function registerRead(pi: ExtensionAPI, cc: CCContext): void {
 			}
 			if (st.isDirectory()) throw new Error(`EISDIR: illegal operation on a directory, read '${absPath}'`);
 			throwIfAborted(signal);
+			// #7a fixed: refuse FIFOs, sockets and devices before dispatching on the extension (Claude
+			// Code reads a FIFO named like an image or PDF, blocking until a writer shows up).
+			if (fixSpecialFiles && !st.isFile()) {
+				throw new Error(isNotebook ? "Notebook path is not a regular file (device, FIFO, or socket)." : `${absPath} is not a regular file.`);
+			}
 
 			if (isNotebook) {
 				if (!st.isFile()) throw new Error("Notebook path is not a regular file (device, FIFO, or socket).");
-				const { result, raw } = await readNotebook(absPath, st.size);
+				const { result, raw } = await readNotebook(absPath, st.size, readSignal);
 				try {
 					cc.fileState.recordRead(absPath, raw, { offset, limit });
 				} catch {
@@ -1143,7 +1196,7 @@ export function registerRead(pi: ExtensionAPI, cc: CCContext): void {
 					await fh.close();
 				}
 			}
-			if (looksLikeImage) return readImage(absPath, st.size);
+			if (looksLikeImage) return readImage(absPath, st.size, readSignal);
 			if (ext === "pdf") return readPdf(absPath, st.size, params.pages, signal);
 			if (!st.isFile()) throw new Error(`${absPath} is not a regular file.`);
 			return readTextFile(cc, ctx, absPath, st.size, { offset, limit, allowLarge: params.allow_large === true }, signal);

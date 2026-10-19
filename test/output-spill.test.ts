@@ -1,9 +1,16 @@
-import { existsSync, readFileSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, readFileSync, statSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { describe, expect, it } from "vitest";
 import type { ExtensionAPI, ExtensionFactory } from "@earendil-works/pi-coding-agent";
-import { formatPersistedOutput, formatSize, makePreview, registerOutputSpill, spillThreshold } from "../src/output-spill.js";
+import {
+	defaultSpillDir,
+	formatPersistedOutput,
+	formatSize,
+	makePreview,
+	registerOutputSpill,
+	spillThreshold,
+} from "../src/output-spill.js";
 import { createCCContext } from "../src/shared/context.js";
 import type { ClaudeCodeHostEvent } from "../src/shared/types.js";
 import { createTestSession, fakeCtx, fauxAssistantMessage, fauxToolCall, tempDir } from "./helpers.js";
@@ -49,8 +56,8 @@ function handlerHarness(options: Parameters<typeof createCCContext>[0]) {
 	const fakePi = new Proxy({}, { get: (_t, p) => (p === "on" ? (ev: string, h: Function) => ev === "tool_result" && handlers.push(h) : () => undefined) });
 	registerOutputSpill(fakePi as any, createCCContext(options));
 	const ctx = fakeCtx(tempDir());
-	return async (toolName: string, content: any[], isError = false) => {
-		let ev: any = { type: "tool_result", toolName, toolCallId: "x", input: {}, content, isError };
+	return async (toolName: string, content: any[], isError = false, details?: unknown) => {
+		let ev: any = { type: "tool_result", toolName, toolCallId: "x", input: {}, content, isError, details };
 		for (const h of handlers) {
 			const r = await h(ev, ctx);
 			if (r) ev = { ...ev, ...r };
@@ -128,16 +135,69 @@ describe("output spill", () => {
 		t2.dispose();
 	});
 
-	it("defaults the directory to <tmpdir>/pi-cc-tool-results/<sessionId>", async () => {
+	it("defaults to a private per-user directory <tmpdir>/pi-cc-<uid>/<sessionId>/tool-results (0700 dirs, 0600 file) (#10)", async () => {
 		const t = await createTestSession({
 			extraExtensions: [tools],
 			responses: [fauxAssistantMessage(fauxToolCall("Big", {}, { id: "abc" }), { stopReason: "toolUse" }), fauxAssistantMessage("done")],
 		});
 		await t.session.prompt("go");
-		const expected = join(tmpdir(), "pi-cc-tool-results", t.session.sessionManager.getSessionId(), "abc.txt");
+		const root = join(tmpdir(), `pi-cc-${process.getuid!()}`);
+		const sessionDir = join(root, t.session.sessionManager.getSessionId());
+		const expected = join(sessionDir, "tool-results", "abc.txt");
 		expect(t.toolResults()[0]!.text).toContain(expected);
-		expect(existsSync(expected)).toBe(true);
+		expect(readFileSync(expected, "utf8")).toBe(BIG);
+		for (const d of [root, sessionDir, dirname(expected)]) expect(statSync(d).mode & 0o777).toBe(0o700);
+		expect(statSync(expected).mode & 0o777).toBe(0o600);
 		t.dispose();
+	});
+
+	it("narrows an existing per-user root to 0700 and refuses a root it does not own or a symlink (#10)", async () => {
+		const base = tempDir();
+		const root = join(base, `pi-cc-${process.getuid!()}`);
+		mkdirSync(root, { mode: 0o755 });
+		chmodSync(root, 0o755);
+		const dir = await defaultSpillDir("sess", base);
+		expect(dir).toBe(join(root, "sess", "tool-results"));
+		expect(statSync(root).mode & 0o777).toBe(0o700);
+
+		const base2 = tempDir();
+		symlinkSync(tempDir(), join(base2, `pi-cc-${process.getuid!()}`));
+		await expect(defaultSpillDir("sess", base2)).rejects.toThrow();
+	});
+
+	it("writes spill files 0600 in a configured directory too (#10)", async () => {
+		const dir = join(tempDir(), "new");
+		const run = handlerHarness({ outputSpill: { dir } });
+		const out = await run("Other", [{ type: "text", text: BIG }]);
+		const file = out[0].text.match(/saved to: (.*)\n/)[1];
+		expect(statSync(file).mode & 0o777).toBe(0o600);
+		expect(statSync(dir).mode & 0o777).toBe(0o700);
+	});
+
+	it("copies details.fullOutputPath as the spill file when the text is cut (#9 interface)", async () => {
+		const dir = tempDir();
+		const src = join(tempDir(), "full.output");
+		const full = "BEGIN\n" + "y".repeat(100_000) + "\nEND\n";
+		writeFileSync(src, full, { mode: 0o644 });
+		const run = handlerHarness({ outputSpill: { dir } });
+		const cut = "y".repeat(40_000); // the tool's shortened inline text
+		const out = await run("Bash", [{ type: "text", text: cut }], false, { fullOutputPath: src });
+		const file = out[0].text.match(/saved to: (.*)\n/)[1];
+		expect(readFileSync(file, "utf8")).toBe(full);
+		expect(statSync(file).mode & 0o777).toBe(0o600);
+		expect(out[0].text).toContain(`Output too large (${formatSize(full.length)})`);
+		expect(out[0].text).toContain("Preview (first 2KB):\nBEGIN\n");
+		expect(readFileSync(src, "utf8")).toBe(full); // the source is only read
+	});
+
+	it("falls back to the inline text when details.fullOutputPath is missing or not a file", async () => {
+		const dir = tempDir();
+		const run = handlerHarness({ outputSpill: { dir } });
+		for (const fullOutputPath of [join(dir, "nope"), dir, 42]) {
+			const out = await run("Bash", [{ type: "text", text: BIG }], false, { fullOutputPath });
+			const file = out[0].text.match(/saved to: (.*)\n/)[1];
+			expect(readFileSync(file, "utf8")).toBe(BIG);
+		}
 	});
 
 	it("replaces an empty result with '(<Tool> completed with no output)'", async () => {

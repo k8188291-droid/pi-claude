@@ -1,12 +1,15 @@
-import { createHash } from "node:crypto";
-import { readFileSync, statSync } from "node:fs";
+import { createHash, type Hash } from "node:crypto";
+import { closeSync, constants as fsConstants, fstatSync, openSync, readSync, statSync } from "node:fs";
+import { open } from "node:fs/promises";
+import { StringDecoder } from "node:string_decoder";
 
 /**
  * What the model has seen of a file, mirroring Claude Code's `readFileState` entries.
  *
  * - `timestamp` is `Math.floor(mtimeMs)` when the file was read or written by a tool.
  * - `hash` is the hash of the whole file's text as Claude Code compares it (UTF-8 BOM stripped,
- *   CRLF folded to LF), so a rewrite that leaves the text unchanged is not "a change".
+ *   CRLF folded to LF), so a rewrite that leaves the text unchanged is not "a change". It always
+ *   covers the whole file, also for partial reads (streamed reads hash incrementally, #6a).
  * - `partial` means the read did not cover the whole file (offset/limit); content comparisons and
  *   the "file state is current" note then do not apply. It does not block writes.
  * - `truncated` is Claude Code's `isPartialView`: the Read result was a cut-down excerpt. Write
@@ -31,6 +34,21 @@ export interface RecordReadOptions {
 	truncated?: boolean;
 	offset?: number;
 	limit?: number;
+}
+
+/** A precomputed whole-file text hash (see `TextHasher`), in place of the file's content. */
+export interface PrecomputedHash {
+	hash: string;
+}
+
+export interface ChangeCheckOptions {
+	/**
+	 * Decide by content, not by mtime (quirk #5 `mtimeOnlyChangeDetection` fixed): the file is
+	 * changed exactly when its text hash differs from the record's, so an external rewrite that
+	 * restored the mtime is caught, and an mtime bump that left the text alone is not a change even
+	 * for partial views. Claude Code (the default) only compares content once the mtime moved.
+	 */
+	contentCheck?: boolean;
 }
 
 export interface RecordWriteOptions {
@@ -66,6 +84,73 @@ export function textHash(content: string | Buffer): string {
 	return hashContent(normalizeText(content));
 }
 
+/**
+ * Incremental `textHash`: feed the decoded text in pieces (a leading BOM is dropped and CRLF is
+ * folded across piece boundaries), so a large file can be hashed without holding it in memory.
+ */
+export class TextHasher {
+	private readonly hash: Hash = createHash("sha256");
+	private first = true;
+	private pendingCR = false;
+
+	update(piece: string): void {
+		if (piece === "") return;
+		if (this.first) {
+			this.first = false;
+			if (piece.charCodeAt(0) === 0xfeff) piece = piece.slice(1);
+		}
+		if (this.pendingCR) {
+			piece = `\r${piece}`;
+			this.pendingCR = false;
+		}
+		if (piece.endsWith("\r")) {
+			this.pendingCR = true;
+			piece = piece.slice(0, -1);
+		}
+		this.hash.update(piece.replaceAll("\r\n", "\n"));
+	}
+
+	digest(): string {
+		if (this.pendingCR) this.hash.update("\r");
+		this.pendingCR = false;
+		return this.hash.digest("hex");
+	}
+}
+
+/** Decoder for a file's bytes as `normalizeText` decodes them, chosen from its first bytes. */
+export function decoderFor(head: Buffer): StringDecoder {
+	return new StringDecoder(head.length >= 2 && head[0] === 0xff && head[1] === 0xfe ? "utf16le" : "utf8");
+}
+
+/** Never equal to a real hash: what a path that is not a regular file hashes to. */
+const NOT_A_REGULAR_FILE = "not-a-regular-file";
+const HASH_CHUNK_BYTES = 524288;
+
+/**
+ * `textHash` of a file's current content, read in chunks (bounded memory). The file is opened
+ * non-blocking and must be a regular file: a FIFO or device never blocks this and never matches.
+ */
+export function hashFileText(absPath: string): string {
+	const fd = openSync(absPath, fsConstants.O_RDONLY | (fsConstants.O_NONBLOCK ?? 0));
+	try {
+		if (!fstatSync(fd).isFile()) return NOT_A_REGULAR_FILE;
+		const buf = Buffer.allocUnsafe(HASH_CHUNK_BYTES);
+		const hasher = new TextHasher();
+		let decoder: StringDecoder | undefined;
+		for (;;) {
+			const n = readSync(fd, buf, 0, HASH_CHUNK_BYTES, null);
+			if (n === 0) break;
+			const chunk = buf.subarray(0, n);
+			decoder ??= decoderFor(chunk);
+			hasher.update(decoder.write(chunk));
+		}
+		if (decoder) hasher.update(decoder.end());
+		return hasher.digest();
+	} finally {
+		closeSync(fd);
+	}
+}
+
 function mtimeOf(absPath: string): number {
 	return Math.floor(statSync(absPath).mtimeMs);
 }
@@ -77,11 +162,14 @@ function mtimeOf(absPath: string): number {
 export class FileStateTracker {
 	private records = new Map<string, FileRecord>();
 
-	/** Record a read. Pass the whole file content (Buffer or text) so it can be hashed. */
-	recordRead(absPath: string, content: string | Buffer, opts: RecordReadOptions = {}): void {
+	/**
+	 * Record a read. Pass the whole file content (Buffer or text) so it can be hashed, or its
+	 * precomputed `textHash` when the file was streamed.
+	 */
+	recordRead(absPath: string, content: string | Buffer | PrecomputedHash, opts: RecordReadOptions = {}): void {
 		this.records.set(absPath, {
 			timestamp: mtimeOf(absPath),
-			hash: textHash(content),
+			hash: typeof content === "string" || Buffer.isBuffer(content) ? textHash(content) : content.hash,
 			partial: !!opts.partial,
 			truncated: !!opts.truncated,
 			offset: opts.offset,
@@ -132,9 +220,10 @@ export class FileStateTracker {
 
 	/**
 	 * Whether the file changed on disk since it was recorded: its mtime moved past the record and,
-	 * for full views, its text differs. `currentText` avoids re-reading the file.
+	 * for full views, its text differs. `currentText` avoids re-reading the file. With
+	 * `contentCheck` (#5 fixed) only the text decides.
 	 */
-	isStale(absPath: string, currentText?: string | Buffer): boolean {
+	isStale(absPath: string, currentText?: string | Buffer, opts: ChangeCheckOptions = {}): boolean {
 		const rec = this.records.get(absPath);
 		if (!rec) return false;
 		let mtime: number;
@@ -143,9 +232,10 @@ export class FileStateTracker {
 		} catch {
 			return false;
 		}
+		if (opts.contentCheck) return rec.hash !== (currentText !== undefined ? textHash(currentText) : hashFileText(absPath));
 		if (mtime <= rec.timestamp) return false;
 		if (!FileStateTracker.isFullView(rec)) return true;
-		return !FileStateTracker.sameContent(rec, currentText ?? readFileSync(absPath));
+		return currentText !== undefined ? !FileStateTracker.sameContent(rec, currentText) : rec.hash !== hashFileText(absPath);
 	}
 
 	/**
@@ -153,7 +243,7 @@ export class FileStateTracker {
 	 * fine, truncated views and files changed since they were read are not.
 	 * Returns undefined when OK, or an error message for the model.
 	 */
-	checkCanModify(absPath: string): string | undefined {
+	checkCanModify(absPath: string, opts: ChangeCheckOptions = {}): string | undefined {
 		try {
 			statSync(absPath);
 		} catch {
@@ -161,20 +251,42 @@ export class FileStateTracker {
 		}
 		const rec = this.records.get(absPath);
 		if (rec?.truncated) return FILE_NOT_READ;
-		if (rec && this.isStale(absPath)) return FILE_MODIFIED_SINCE_READ;
+		if (rec && this.isStale(absPath, undefined, opts)) return FILE_MODIFIED_SINCE_READ;
 		return undefined;
 	}
 
 	/** Paths recorded so far whose on-disk content changed since (for change reminders). */
-	changedSinceRead(): string[] {
+	changedSinceRead(opts: ChangeCheckOptions = {}): string[] {
 		const out: string[] = [];
 		for (const p of this.records.keys()) {
 			try {
-				if (this.isStale(p)) out.push(p);
+				if (this.isStale(p, undefined, opts)) out.push(p);
 			} catch {
 				out.push(p);
 			}
 		}
 		return out;
+	}
+}
+
+/** Async `hashFileText` (bounded memory, does not block the event loop on a large file). */
+export async function hashFileTextAsync(absPath: string): Promise<string> {
+	const fh = await open(absPath, fsConstants.O_RDONLY | (fsConstants.O_NONBLOCK ?? 0));
+	try {
+		if (!(await fh.stat()).isFile()) return NOT_A_REGULAR_FILE;
+		const buf = Buffer.allocUnsafe(HASH_CHUNK_BYTES);
+		const hasher = new TextHasher();
+		let decoder: StringDecoder | undefined;
+		for (;;) {
+			const { bytesRead } = await fh.read(buf, 0, HASH_CHUNK_BYTES, null);
+			if (bytesRead === 0) break;
+			const chunk = buf.subarray(0, bytesRead);
+			decoder ??= decoderFor(chunk);
+			hasher.update(decoder.write(chunk));
+		}
+		if (decoder) hasher.update(decoder.end());
+		return hasher.digest();
+	} finally {
+		await fh.close();
 	}
 }

@@ -439,16 +439,26 @@ function cloneTask(t: TaskItem): TaskItem {
 	return copy;
 }
 
+/** Who changed a TaskStore: the session that owns it, or a (subagent) session sharing it. */
+export type TaskChangeSource = "owner" | "shared";
+
+/**
+ * Custom session entry (`pi.appendEntry`) holding the task list after a foreground subagent sharing
+ * the parent's list changed it. The subagent's own TaskCreate/TaskUpdate results live in its
+ * in-memory session, so the parent records the state in its own branch for resume/fork/tree.
+ */
+export const TASK_STATE_ENTRY_TYPE = "pi-claude-task-list";
+
 /** In-memory task list with Claude Code's semantics (ids, dependencies, deletion). */
 export class TaskStore {
-	private listeners = new Set<() => void>();
-	/** Called after a session that shares this store (a subagent) changed it. */
-	subscribe(fn: () => void): () => void {
+	private listeners = new Set<(source: TaskChangeSource) => void>();
+	/** Called after the store changed; `source` is "shared" when a session sharing it (a subagent) changed it. */
+	subscribe(fn: (source: TaskChangeSource) => void): () => void {
 		this.listeners.add(fn);
 		return () => this.listeners.delete(fn);
 	}
-	notify(): void {
-		for (const fn of this.listeners) fn();
+	notify(source: TaskChangeSource = "owner"): void {
+		for (const fn of this.listeners) fn(source);
 	}
 
 	private tasks = new Map<string, TaskItem>();
@@ -621,10 +631,18 @@ export function buildTaskReminderText(tasks: TaskItem[]): string {
 	return text;
 }
 
-/** Latest task list found in successful TaskCreate/TaskUpdate results of a session branch. */
+/**
+ * Latest task list found in successful TaskCreate/TaskUpdate results of a session branch (or in
+ * the state entries recorded when a subagent changed the shared list).
+ */
 export function taskListFromBranch(entries: readonly any[]): TaskListState | undefined {
 	let state: TaskListState | undefined;
 	for (const entry of entries) {
+		if (entry?.type === "custom" && entry.customType === TASK_STATE_ENTRY_TYPE) {
+			const data = entry.data as Partial<TaskListState> | undefined;
+			if (data && Array.isArray(data.tasks)) state = data as TaskListState;
+			continue;
+		}
 		if (entry?.type !== "message") continue;
 		const msg = entry.message;
 		if (msg?.role !== "toolResult" || !MUTATING_TOOLS.has(msg.toolName) || msg.isError) continue;
@@ -660,7 +678,19 @@ export function registerTaskTools(pi: ExtensionAPI, cc: CCContext): void {
 		cc.emit({ type: "tasks_updated", tasks });
 	};
 
-	if (!shared) store.subscribe(() => publish());
+	if (!shared) {
+		store.subscribe((source) => {
+			publish();
+			// a subagent changed the list: record it in this session's branch, which reconstruct() reads
+			if (source === "shared") {
+				try {
+					pi.appendEntry(TASK_STATE_ENTRY_TYPE, store.snapshot());
+				} catch {
+					// no session to record into (e.g. a host without session storage)
+				}
+			}
+		});
+	}
 
 	const reconstruct = (ctx: ExtensionContext) => {
 		if (shared) return; // the parent's branch is the source of truth
@@ -680,7 +710,7 @@ export function registerTaskTools(pi: ExtensionAPI, cc: CCContext): void {
 	pi.on("session_tree", async (_event, ctx) => reconstruct(ctx));
 
 	const mutated = (text: string) => {
-		store.notify(); // owner publishes (also when a subagent sharing the store mutated it)
+		store.notify(shared ? "shared" : "owner"); // owner publishes (and persists a subagent's change)
 		return textResult<TaskToolDetails>(text, { taskList: store.snapshot() });
 	};
 

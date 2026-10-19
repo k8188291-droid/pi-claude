@@ -9,6 +9,7 @@ import { getAgentDir, type ExtensionAPI } from "@earendil-works/pi-coding-agent"
 import { Type, type Static } from "typebox";
 import type { CCContext } from "../shared/context.js";
 import { resolvePath } from "../shared/paths.js";
+import { isFixed } from "../shared/quirks.js";
 import { textResult } from "../shared/text.js";
 
 export const GREP_TOOL_NAME = "Grep";
@@ -17,6 +18,11 @@ export const GREP_TOOL_NAME = "Grep";
 export const GREP_DEFAULT_HEAD_LIMIT = 250;
 /** Claude Code caps buffered rg stdout at 20 MB; complete lines before the cap are kept. */
 const MAX_RG_OUTPUT_BYTES = 20_000_000;
+let rgOutputCapBytes = MAX_RG_OUTPUT_BYTES;
+/** Tests only: lower the rg stdout cap (no argument restores the 20 MB default). */
+export function setRgOutputCapForTests(bytes?: number): void {
+	rgOutputCapBytes = bytes ?? MAX_RG_OUTPUT_BYTES;
+}
 /** Lines longer than this are replaced by an "[Omitted long ... line]" marker (minified files etc.). */
 const MAX_LINE_CHARS = 500;
 /** Version-control directories never searched (--hidden would otherwise include them). */
@@ -264,9 +270,9 @@ export async function runRipgrep(args: string[], cwd: string, signal: AbortSigna
 			signal?.addEventListener("abort", onAbort, { once: true });
 			child.stdout.on("data", (d: Buffer) => {
 				if (capped) return;
-				if (bytes + d.length > MAX_RG_OUTPUT_BYTES) {
-					chunks.push(d.subarray(0, MAX_RG_OUTPUT_BYTES - bytes));
-					bytes = MAX_RG_OUTPUT_BYTES;
+				if (bytes + d.length > rgOutputCapBytes) {
+					chunks.push(d.subarray(0, rgOutputCapBytes - bytes));
+					bytes = rgOutputCapBytes;
 					capped = true;
 					child.kill("SIGKILL");
 					return;
@@ -297,12 +303,7 @@ export async function runRipgrep(args: string[], cwd: string, signal: AbortSigna
 
 	const abnormal = run.code !== 0 && run.code !== 1 && run.code !== 2;
 	const cut = run.capped || run.timedOut || abnormal;
-	let stdout = run.stdout;
-	if (cut && !stdout.endsWith("\n")) {
-		// drop the partial last line
-		const nl = stdout.lastIndexOf("\n");
-		stdout = nl >= 0 ? stdout.slice(0, nl + 1) : "";
-	}
+	const stdout = cut ? dropPartialTail(run.stdout) : run.stdout;
 	const lines = stdout === "" ? [] : stdout.replace(/\n$/, "").split("\n");
 	if (run.code === 1 && !cut) return { lines: [], stderr: run.stderr, code: 1 };
 	if (lines.length === 0) {
@@ -326,6 +327,64 @@ export async function runRipgrep(args: string[], cwd: string, signal: AbortSigna
 		}
 	}
 	return { lines, stderr: run.stderr, code: run.code };
+}
+
+/**
+ * Drop the incomplete tail of output that was cut short (cap, timeout, kill), like Claude Code:
+ * output ending in a newline is kept whole; otherwise the partial last line is dropped, except
+ * that a `--null` line keeps every entry up to its last NUL. Without that, a long NUL-separated
+ * file list (one "line" of tens of MB) would lose every result (#17b).
+ */
+export function dropPartialTail(stdout: string): string {
+	if (stdout === "" || stdout.endsWith("\n")) return stdout;
+	const lineStart = stdout.lastIndexOf("\n") + 1;
+	const nul = stdout.indexOf("\0", lineStart) === -1 ? -1 : stdout.lastIndexOf("\0");
+	return nul === -1 ? stdout.slice(0, lineStart) : stdout.slice(0, nul + 1);
+}
+
+/** One per-path I/O error ripgrep printed to stderr, e.g. "rg: ./x: Permission denied (os error 13)". */
+export interface RgPathError {
+	path: string;
+	message: string;
+}
+
+/** Per-path I/O errors (permission denied, I/O error, ...) from rg's stderr. */
+export function rgPathErrors(stderr: string): RgPathError[] {
+	const out: RgPathError[] = [];
+	for (const line of stderr.split("\n")) {
+		// "rg: ./d: IO error for operation on ./d: Permission denied (os error 13)" (directories) or
+		// "rg: ./f: Permission denied (os error 13)" (files)
+		const m =
+			/^rg: (.+): IO error for operation on \1: (.*\(os error \d+\))\s*$/.exec(line) ??
+			/^rg: (.+): ([^:]*\(os error \d+\))\s*$/.exec(line);
+		if (m) out.push({ path: m[1], message: m[2] });
+	}
+	return out;
+}
+
+/**
+ * searchPermissionErrors quirk, fixed mode (#16): Claude Code reports a search whose files or
+ * directories could not be read as "No matches found"/"No files found". The fixed mode throws when
+ * nothing was found and some paths were unreadable, and appends a warning to partial results.
+ * `toDisplay` turns an rg path into the path shown to the model.
+ */
+export function surfacePathErrors(
+	text: string,
+	empty: boolean,
+	stderr: string,
+	toDisplay: (rgPath: string) => string,
+): string {
+	const errors = rgPathErrors(stderr);
+	if (errors.length === 0) return text;
+	const shown = errors.slice(0, 20).map((e) => `- ${toDisplay(e.path)}: ${e.message}`);
+	if (errors.length > shown.length) shown.push(`- ... and ${errors.length - shown.length} more`);
+	const list = shown.join("\n");
+	if (empty) {
+		throw new Error(
+			`Search incomplete: ripgrep could not read ${errors.length === 1 ? "1 path" : `${errors.length} paths`}, so this is not a "no matches" result:\n${list}`,
+		);
+	}
+	return `${text}\n\nWarning: ripgrep could not read ${errors.length === 1 ? "1 path" : `${errors.length} paths`}; results may be incomplete:\n${list}`;
 }
 
 /**
@@ -436,12 +495,15 @@ function newlinesBefore(buf: Buffer, end: number): number {
 /**
  * Parse rg --json output into "path\0N:line" / "path\0N-line" entries plus "--" context breaks.
  * Claude Code keeps rg's (multi-threaded, unstable) file order; files are sorted by path here so
- * output and paging are deterministic.
+ * output and paging are deterministic. A file whose events were cut short (no "end" event: the
+ * output hit the cap or timed out) can only be the last one rg printed; it stays last, so its
+ * lines are kept after the complete files, as in Claude Code (#17a).
  */
 export function parseRgJson(lines: string[], opts: { contextBreaks: boolean; onlyMatching: boolean }): string[] {
 	// group events per file (begin .. end)
-	const groups: Array<{ path: string; events: RgJsonEvent[] }> = [];
-	let current: { path: string; events: RgJsonEvent[] } | undefined;
+	type Group = { path: string; events: RgJsonEvent[]; ended: boolean };
+	const groups: Group[] = [];
+	let current: Group | undefined;
 	for (const line of lines) {
 		if (!line.startsWith("{")) continue;
 		let ev: RgJsonEvent;
@@ -452,19 +514,23 @@ export function parseRgJson(lines: string[], opts: { contextBreaks: boolean; onl
 		}
 		if (ev === null || typeof ev !== "object") continue;
 		if (ev.type === "begin") {
-			current = { path: jsonText(ev.data?.path), events: [ev] };
+			current = { path: jsonText(ev.data?.path), events: [ev], ended: false };
 			groups.push(current);
 			continue;
 		}
 		if (ev.type === "summary") continue;
 		if (!current) {
-			current = { path: jsonText(ev.data?.path), events: [] };
+			current = { path: jsonText(ev.data?.path), events: [], ended: false };
 			groups.push(current);
 		}
 		current.events.push(ev);
-		if (ev.type === "end") current = undefined;
+		if (ev.type === "end") {
+			current.ended = true;
+			current = undefined;
+		}
 	}
-	groups.sort((a, b) => (a.path < b.path ? -1 : a.path > b.path ? 1 : 0));
+	const complete = groups.filter((g) => g.ended).sort((a, b) => (a.path < b.path ? -1 : a.path > b.path ? 1 : 0));
+	const ordered = [...complete, ...groups.filter((g) => !g.ended)];
 
 	const omit = (s: string, kind: "match" | "context") =>
 		s.length > MAX_LINE_CHARS ? (kind === "match" ? "[Omitted long matching line]" : "[Omitted long context line]") : s;
@@ -472,7 +538,7 @@ export function parseRgJson(lines: string[], opts: { contextBreaks: boolean; onl
 	let pending: string[] = [];
 	let lastPath: string | null = null;
 	let lastLine = -1;
-	for (const g of groups) {
+	for (const g of ordered) {
 		for (const ev of g.events) {
 			const d = ev.data ?? {};
 			if (ev.type === "begin") {
@@ -515,8 +581,10 @@ export function parseRgJson(lines: string[], opts: { contextBreaks: boolean; onl
 			lastPath = path;
 			lastLine = lineNo + parts.length - 1;
 		}
+		// a group cut short has no "end": keep what it printed instead of dropping it at the next "begin"
+		for (const l of pending) out.push(l);
+		pending = [];
 	}
-	for (const l of pending) out.push(l);
 	return out;
 }
 
@@ -533,10 +601,18 @@ function validateWholeNumber(name: "head_limit" | "offset", v: unknown): void {
 
 const byString = (a: string, b: string) => (a < b ? -1 : a > b ? 1 : 0);
 
+export interface SearchOptions {
+	/** searchPermissionErrors quirk fixed: report unreadable paths instead of "no matches" (#16). */
+	surfacePathErrors?: boolean;
+	/** Use `path` exactly as given (quirk `pathTrim` fixed); default trims it like Claude Code. */
+	exactPaths?: boolean;
+}
+
 export async function executeGrep(
 	params: GrepParams,
 	cwd: string,
 	signal?: AbortSignal,
+	options: SearchOptions = {},
 ): Promise<{ text: string; details: GrepDetails }> {
 	const mode: GrepOutputMode = params.output_mode ?? "files_with_matches";
 	if (typeof params.pattern !== "string") throw new Error("pattern must be a string");
@@ -545,7 +621,7 @@ export async function executeGrep(
 	const limit = params.head_limit ?? undefined;
 	const offset = params.offset ?? 0;
 
-	const searchAbs = params.path ? resolvePath(cwd, params.path) : cwd;
+	const searchAbs = params.path ? resolvePath(cwd, params.path, { trim: !options.exactPaths }) : cwd;
 	let isDirectory: boolean;
 	try {
 		isDirectory = statSync(searchAbs).isDirectory();
@@ -562,9 +638,11 @@ export async function executeGrep(
 	const run = await runRipgrep(buildRgArgs(params, target), spawnCwd, signal);
 
 	let details: GrepDetails;
+	let found: number;
 	if (mode === "content") {
 		const contextBreaks = [params.context, params["-C"], params["-B"], params["-A"]].some((v) => typeof v === "number" && v > 0);
 		const entries = parseRgJson(run.lines, { contextBreaks, onlyMatching: params["-o"] === true });
+		found = entries.length;
 		const showNumbers = params["-n"] !== false;
 		const paged = applyPaging(entries, limit, offset);
 		const out = paged.items.map((e) => {
@@ -594,6 +672,7 @@ export async function executeGrep(
 		// rg prints files in thread-completion order; sort so output and paging are deterministic
 		const key = (e: string) => e.slice(0, Math.max(0, e.lastIndexOf(":")));
 		entries.sort((a, b) => byString(key(a), key(b)));
+		found = entries.length;
 		const paged = applyPaging(entries, limit, offset);
 		const out = paged.items.map((e) => {
 			const i = e.lastIndexOf(":");
@@ -620,6 +699,7 @@ export async function executeGrep(
 		};
 	} else {
 		const files = splitNullOutput(run.lines, "files_with_matches").map(toAbs);
+		found = files.length;
 		const stats = await Promise.allSettled(files.map((f) => stat(f)));
 		const sorted = files
 			.map((f, i) => {
@@ -639,7 +719,9 @@ export async function executeGrep(
 			...(offset > 0 && { appliedOffset: offset }),
 		};
 	}
-	return { text: formatGrep(details), details };
+	let text = formatGrep(details);
+	if (options.surfacePathErrors) text = surfacePathErrors(text, found === 0, run.stderr, (p) => displayPath(cwd, toAbs(p)));
+	return { text, details };
 }
 
 function emptyDetails(mode: GrepOutputMode): GrepDetails {
@@ -667,7 +749,7 @@ export function formatGrep(d: GrepDetails): string {
 	return `Found ${d.numFiles} ${d.numFiles === 1 ? "file" : "files"}${paging ? ` ${paging}` : ""}\n${d.filenames.join("\n")}`;
 }
 
-export function registerGrep(pi: ExtensionAPI, _cc: CCContext): void {
+export function registerGrep(pi: ExtensionAPI, cc: CCContext): void {
 	pi.registerTool({
 		name: GREP_TOOL_NAME,
 		label: "Grep",
@@ -675,7 +757,10 @@ export function registerGrep(pi: ExtensionAPI, _cc: CCContext): void {
 		promptSnippet: "Search file contents with ripgrep (regex; glob/type filters; content, files_with_matches, count modes)",
 		parameters: grepSchema,
 		async execute(_toolCallId, params, signal, _onUpdate, ctx) {
-			const { text, details } = await executeGrep(params, ctx.cwd, signal);
+			const { text, details } = await executeGrep(params, ctx.cwd, signal, {
+				surfacePathErrors: isFixed(cc, "searchPermissionErrors"),
+				exactPaths: isFixed(cc, "pathTrim"),
+			});
 			return textResult<GrepDetails>(text, details);
 		},
 	});

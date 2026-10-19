@@ -1,8 +1,11 @@
 import { randomBytes } from "node:crypto";
-import { mkdir, writeFile } from "node:fs/promises";
+import { createReadStream, createWriteStream } from "node:fs";
+import { chmod, mkdir, open, stat, writeFile } from "node:fs/promises";
+import { pipeline } from "node:stream/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
+import { ensurePrivateDir, privateTempRoot } from "./shared/background.js";
 import type { CCContext } from "./shared/context.js";
 
 /**
@@ -15,6 +18,12 @@ import type { CCContext } from "./shared/context.js";
  * - Results containing images are never persisted.
  * - The inline replacement is `<persisted-output>` + size + path + a 2KB preview cut at a line break.
  * - A successful result with no text at all becomes "(<Tool> completed with no output)".
+ * - Spill files are private: the default directory is <os.tmpdir()>/pi-cc-<uid>/<session>/tool-results
+ *   (every level created 0700, the per-user root must be a real directory owned by the user, like
+ *   Claude Code's `$TMPDIR/claude-<uid>`), and files are written 0600.
+ * - A tool whose text is only part of its output can name a file holding the complete output in
+ *   `details.fullOutputPath` (see FullOutputDetails); that file is copied as the spill file, so the
+ *   spill file is complete even when the inline text was cut.
  *
  * Implemented as a `tool_result` handler. pi chains `tool_result` handlers in extension load order
  * (and registration order within an extension); each handler sees the previous handler's patch.
@@ -41,6 +50,12 @@ export function formatSize(bytes: number): string {
 	const mb = kb / 1024;
 	if (mb < 1024) return `${mb.toFixed(1).replace(/\.0$/, "")}MB`;
 	return `${(mb / 1024).toFixed(1).replace(/\.0$/, "")}GB`;
+}
+
+/** `details.fullOutputPath` when it is a non-empty string (see FullOutputDetails). */
+function fullOutputPathOf(details: unknown): string | undefined {
+	const p = (details as FullOutputDetails | undefined)?.fullOutputPath;
+	return typeof details === "object" && details !== null && typeof p === "string" && p !== "" ? p : undefined;
 }
 
 function sanitize(s: string, max = 100): string {
@@ -73,6 +88,40 @@ export function spillThreshold(toolName: string, maxChars?: number): number {
 	return Math.min(TOOL_SPILL_THRESHOLDS[toolName] ?? SPILL_THRESHOLD_CEILING, SPILL_THRESHOLD_CEILING);
 }
 
+/**
+ * Result details a tool may set when its text is not its complete output: `fullOutputPath` is a
+ * regular file holding the complete text output. When the result is spilled, that file (not the
+ * shortened text) is copied to the spill file and its size is reported. The file is only read.
+ */
+export interface FullOutputDetails {
+	fullOutputPath?: string;
+}
+
+/**
+ * Default spill directory: <base>/pi-cc-<uid>/<session>/tool-results. The per-user root comes from
+ * `privateTempRoot()` (shared with background task output: 0700, refuses symlinked or foreign-owned
+ * roots); the session and tool-results levels are private (0700) too.
+ */
+export async function defaultSpillDir(sessionId: string, base: string = tmpdir()): Promise<string> {
+	const sessionDir = join(privateTempRoot(base), sanitize(sessionId));
+	ensurePrivateDir(sessionDir);
+	const dir = join(sessionDir, "tool-results");
+	ensurePrivateDir(dir);
+	return dir;
+}
+
+/** First `maxChars` characters of a file (UTF-8). */
+async function readHead(path: string, maxChars: number): Promise<string> {
+	const fh = await open(path, "r");
+	try {
+		const buf = Buffer.alloc(Math.max(4, maxChars * 4));
+		const { bytesRead } = await fh.read(buf, 0, buf.length, 0);
+		return buf.subarray(0, bytesRead).toString("utf8").slice(0, maxChars);
+	} finally {
+		await fh.close();
+	}
+}
+
 export function registerOutputSpill(pi: ExtensionAPI, cc: CCContext): void {
 	if (cc.options.outputSpill === false) return;
 	const opts = cc.options.outputSpill;
@@ -80,15 +129,19 @@ export function registerOutputSpill(pi: ExtensionAPI, cc: CCContext): void {
 	const excluded = new Set([...ALWAYS_EXCLUDED, ...(opts?.exclude ?? [])]);
 	const fallbackId = randomBytes(8).toString("hex");
 
-	const spillDir = (ctx: ExtensionContext): string => {
-		if (opts?.dir) return opts.dir;
+	/** Create (if needed) and return the spill directory. */
+	const spillDir = async (ctx: ExtensionContext): Promise<string> => {
+		if (opts?.dir) {
+			await mkdir(opts.dir, { recursive: true, mode: 0o700 });
+			return opts.dir;
+		}
 		let sessionId: string | undefined;
 		try {
 			sessionId = ctx.sessionManager?.getSessionId?.();
 		} catch {
 			sessionId = undefined;
 		}
-		return join(tmpdir(), "pi-cc-tool-results", sanitize(sessionId || fallbackId));
+		return defaultSpillDir(sessionId || fallbackId);
 	};
 
 	pi.on("tool_result", async (event, ctx) => {
@@ -109,17 +162,40 @@ export function registerOutputSpill(pi: ExtensionAPI, cc: CCContext): void {
 		// Claude Code persists a single text result as text, a multi-block result as JSON.
 		const isJson = texts.length > 1;
 		const fullText = isJson ? JSON.stringify(texts, null, 2) : texts[0].text;
-		const dir = spillDir(ctx);
-		const path = join(dir, `${sanitize(event.toolCallId)}.${isJson ? "json" : "txt"}`);
+		const fullOutputPath = isJson ? undefined : fullOutputPathOf(event.details);
+		let path: string;
+		let size = fullText.length;
+		let head = fullText;
 		try {
-			await mkdir(dir, { recursive: true });
-			await writeFile(path, fullText, "utf8");
+			const dir = await spillDir(ctx);
+			path = join(dir, `${sanitize(event.toolCallId)}.${isJson ? "json" : "txt"}`);
+			let copied = false;
+			if (fullOutputPath) {
+				// the tool's complete output (its text may be cut); fall back to the text on any failure
+				try {
+					const st = await stat(fullOutputPath);
+					if (st.isFile()) {
+						await pipeline(createReadStream(fullOutputPath), createWriteStream(path, { mode: 0o600 }));
+						size = (await stat(path)).size;
+						head = await readHead(path, previewChars + 1);
+						copied = true;
+					}
+				} catch {
+					copied = false;
+				}
+			}
+			if (!copied) {
+				size = fullText.length;
+				head = fullText;
+				await writeFile(path, fullText, { encoding: "utf8", mode: 0o600 });
+			}
+			await chmod(path, 0o600);
 		} catch {
 			// Claude Code keeps the original result when it cannot be persisted.
 			return undefined;
 		}
-		const { preview, truncated } = makePreview(fullText, previewChars);
-		const text = formatPersistedOutput({ size: fullText.length, path, preview, truncated, previewChars });
+		const { preview, truncated } = makePreview(head, previewChars);
+		const text = formatPersistedOutput({ size, path, preview, truncated, previewChars });
 		cc.emit({ type: "output_spilled", toolName: event.toolName, toolCallId: event.toolCallId, path, totalChars: total });
 		return { content: [{ type: "text", text }] };
 	});

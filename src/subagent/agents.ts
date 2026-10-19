@@ -17,10 +17,21 @@ export interface SubagentDefinition {
 	description: string;
 	/** System prompt for the child session (Claude Code's subagent notes are appended to it). */
 	prompt: string;
-	/** Tool allowlist; undefined or containing "*" = every tool available to a subagent session. */
+	/**
+	 * Tool allowlist; undefined or containing "*" = every tool available to a subagent session,
+	 * [] = no tools at all (as in Claude Code). `mcp__server` / `mcp__server__*` allow a whole MCP server.
+	 */
 	tools?: string[];
-	/** Tools removed from the child's tool set (applied after `tools`). */
+	/**
+	 * Tools removed from the child's tool set (applied before `tools`). `mcp__server` /
+	 * `mcp__server__*` remove a whole MCP server, `mcp__*` every MCP tool.
+	 */
 	disallowedTools?: string[];
+	/**
+	 * The definition's disallowedTools contained "*". Claude Code ignores it (#2c); with the
+	 * `agentDisallowAll` quirk fixed it removes every tool.
+	 */
+	disallowAll?: boolean;
 	/** undefined = inherit parent model; string = alias ("sonnet"/"opus"/"haiku"/"fable") or model id. */
 	model?: Model<any> | string;
 	/** Reasoning effort for the child (pi thinking level). undefined = inherit the parent's. */
@@ -181,15 +192,30 @@ export const BUILT_IN_AGENTS: Record<string, SubagentDefinition> = {
 	},
 };
 
-/** Parse a `tools` frontmatter value: "A, B", ["A","B"], "*" (all). */
-export function parseToolList(value: unknown): string[] | undefined {
+/** The entries of a `tools`/`disallowedTools` value, as Claude Code reads them (undefined when absent). */
+function toolListItems(value: unknown): string[] | undefined {
+	if (value === undefined) return undefined;
 	let items: string[];
 	if (Array.isArray(value)) items = value.map((v) => String(v));
 	else if (typeof value === "string") items = value.split(",");
-	else return undefined;
-	items = items.map((s) => s.trim()).filter(Boolean);
-	if (items.length === 0 || items.includes("*")) return undefined;
+	// an empty `tools:` key (null) or any other value: an empty list, like Claude Code
+	else return [];
+	return items.map((s) => s.trim()).filter(Boolean);
+}
+
+/**
+ * Parse a `tools` frontmatter value: "A, B", ["A","B"], "*" (all → undefined). An empty value
+ * (`tools: []`, `tools: ""`, `tools:`) is an empty list: no tools, as in Claude Code.
+ */
+export function parseToolList(value: unknown): string[] | undefined {
+	const items = toolListItems(value);
+	if (!items || items.includes("*")) return undefined;
 	return items;
+}
+
+/** Whether a tool list contains the "*" wildcard. */
+function hasWildcard(value: unknown): boolean {
+	return toolListItems(value)?.includes("*") === true;
 }
 
 function parseEffort(value: unknown): AgentEffort | undefined {
@@ -218,6 +244,7 @@ export function parseAgentMarkdown(content: string, filePath: string, source: Ag
 		prompt: body.trim(),
 		tools: parseToolList(frontmatter.tools),
 		disallowedTools: parseToolList(frontmatter.disallowedTools),
+		...(hasWildcard(frontmatter.disallowedTools) ? { disallowAll: true } : {}),
 		model: modelRaw && modelRaw !== "inherit" ? modelRaw : undefined,
 		effort: parseEffort(frontmatter.effort),
 		...(background ? { background } : {}),
@@ -249,11 +276,17 @@ export function loadAgentsFromDir(dir: string, source: AgentSource): SubagentDef
 }
 
 function fromOptions(name: string, def: AgentDefinition): SubagentDefinition {
+	// Claude Agent SDK definitions may also carry disallowedTools
+	const disallowed: unknown = def.disallowedTools;
+	const disallowedTools = Array.isArray(disallowed) ? parseToolList(disallowed) : undefined;
 	return {
 		name,
 		description: def.description,
 		prompt: def.prompt,
-		tools: def.tools && def.tools.length > 0 && !def.tools.includes("*") ? [...def.tools] : undefined,
+		// `tools: []` means no tools (Claude Code); only an absent list or "*" means all tools
+		tools: Array.isArray(def.tools) && !def.tools.includes("*") ? [...def.tools] : undefined,
+		...(disallowedTools && disallowedTools.length > 0 ? { disallowedTools } : {}),
+		...(Array.isArray(disallowed) && hasWildcard(disallowed) ? { disallowAll: true } : {}),
 		model: def.model === "inherit" ? undefined : def.model,
 		source: "options",
 	};
@@ -285,14 +318,45 @@ export function loadAgentDefinitions(opts: LoadAgentsOptions): Map<string, Subag
 	return map;
 }
 
+/** `mcp__<server>__<tool>` → { server, tool } (tool undefined for `mcp__<server>`), as Claude Code splits it. */
+function parseMcpName(name: string): { server: string; tool?: string } | undefined {
+	const [prefix, server, ...rest] = name.split("__");
+	if (prefix !== "mcp" || !server) return undefined;
+	return { server, tool: rest.length > 0 ? rest.join("__") : undefined };
+}
+
+/**
+ * Whether a `tools` ("allow") or `disallowedTools` ("deny") entry names `tool`. Like Claude Code,
+ * `mcp__server` and `mcp__server__*` name every tool of that MCP server; `mcp__*` names every MCP
+ * tool in a deny list only. `ToolSearch` (Claude Code's name) also names pi's `tool_search`.
+ */
+export function toolRuleMatches(rule: string, tool: string, kind: "allow" | "deny"): boolean {
+	if (rule === tool) return true;
+	if (rule === "ToolSearch" && tool === "tool_search") return true;
+	const r = parseMcpName(rule);
+	if (!r || (r.tool !== undefined && r.tool !== "*")) return false;
+	const t = parseMcpName(tool);
+	if (!t) return false;
+	if (r.server === "*") return kind === "deny";
+	return r.server === t.server;
+}
+
+export interface AgentToolOptions {
+	/** Apply `disallowedTools: "*"` (the `agentDisallowAll` quirk fixed): the agent gets no tools. */
+	disallowAll?: boolean;
+}
+
 /** True when the definition lets the child use `name` (before subagent-wide exclusions). */
-export function agentAllowsTool(def: SubagentDefinition, name: string): boolean {
-	if (def.disallowedTools?.includes(name)) return false;
-	return !def.tools || def.tools.includes("*") || def.tools.includes(name);
+export function agentAllowsTool(def: SubagentDefinition, name: string, opts: AgentToolOptions = {}): boolean {
+	if (opts.disallowAll && def.disallowAll) return false;
+	if (def.disallowedTools?.some((rule) => toolRuleMatches(rule, name, "deny"))) return false;
+	if (!def.tools || def.tools.includes("*")) return true;
+	return def.tools.some((rule) => toolRuleMatches(rule, name, "allow"));
 }
 
 /** Claude Code's "(Tools: ...)" label. */
-export function toolsLabel(def: SubagentDefinition): string {
+export function toolsLabel(def: SubagentDefinition, opts: AgentToolOptions = {}): string {
+	if (opts.disallowAll && def.disallowAll) return "None";
 	const tools = def.tools ?? [];
 	const disallowed = def.disallowedTools ?? [];
 	if (tools.length > 0 && disallowed.length > 0) {
@@ -310,14 +374,14 @@ export function sortedAgentNames(defs: Map<string, SubagentDefinition>): string[
 }
 
 /** "- name: description (Tools: ...)" lines, as in Claude Code's agent listing. */
-export function formatAgentList(defs: Map<string, SubagentDefinition>): string {
+export function formatAgentList(defs: Map<string, SubagentDefinition>, opts: AgentToolOptions = {}): string {
 	return sortedAgentNames(defs)
 		.map((n) => defs.get(n)!)
-		.map((d) => `- ${d.name}: ${d.description} (Tools: ${toolsLabel(d)})`)
+		.map((d) => `- ${d.name}: ${d.description} (Tools: ${toolsLabel(d, opts)})`)
 		.join("\n");
 }
 
 /** The "Available agent types" system reminder Claude Code injects into the conversation. */
-export function formatAgentListingReminder(defs: Map<string, SubagentDefinition>): string {
-	return `Available agent types for the Agent tool:\n${formatAgentList(defs)}\n\nWhen you launch multiple agents for independent work, send them in a single message with multiple tool uses so they run concurrently.`;
+export function formatAgentListingReminder(defs: Map<string, SubagentDefinition>, opts: AgentToolOptions = {}): string {
+	return `Available agent types for the Agent tool:\n${formatAgentList(defs, opts)}\n\nWhen you launch multiple agents for independent work, send them in a single message with multiple tool uses so they run concurrently.`;
 }

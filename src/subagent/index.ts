@@ -16,6 +16,7 @@ import { createClaudeCodeSession } from "../sdk.js";
 import { type BackgroundTask, newTaskId } from "../shared/background.js";
 import { type CCContext, createCCContext } from "../shared/context.js";
 import { formatTaskNotification } from "../shared/notifications.js";
+import { isFixed } from "../shared/quirks.js";
 import { REMINDER_CUSTOM_TYPE, wrapReminder } from "../shared/reminders.js";
 import type { ClaudeCodeHostEvent, ClaudeCodeToolsOptions, SubagentUsage } from "../shared/types.js";
 import { type AgentEffort, agentAllowsTool, formatAgentListingReminder, loadAgentDefinitions, SUBAGENT_PROMPT_NOTES, type SubagentDefinition, sortedAgentNames } from "./agents.js";
@@ -234,6 +235,26 @@ interface RegisterAgentInternalOptions {
 	inFork?: boolean;
 }
 
+/**
+ * Wraps an extension factory so the tools it registers that `allowed` rejects are registered with
+ * pi's `hidden` exposure: they are neither declared to the child, nor loadable by tool_search, nor
+ * callable (a restricted agent must not reach them, as in Claude Code).
+ */
+function restrictToolRegistration(factory: ExtensionFactory, allowed: (name: string) => boolean): ExtensionFactory {
+	return (childPi) => {
+		const view = new Proxy(childPi, {
+			get(target, prop, receiver) {
+				if (prop === "registerTool") {
+					return (def: Parameters<ExtensionAPI["registerTool"]>[0]) => target.registerTool(allowed(def.name) ? def : { ...def, exposure: "hidden" });
+				}
+				const value = Reflect.get(target, prop, receiver);
+				return typeof value === "function" ? value.bind(target) : value;
+			},
+		});
+		return factory(view);
+	};
+}
+
 /** Register Claude Code's Agent tool (subagents). */
 export function registerAgent(pi: ExtensionAPI, cc: CCContext, internal: RegisterAgentInternalOptions = {}): void {
 	const runs = new Map<string, AgentRun>();
@@ -326,11 +347,12 @@ export function registerAgent(pi: ExtensionAPI, cc: CCContext, internal: Registe
 				parentActive = undefined;
 			}
 		}
+		const disallowAll = isFixed(cc, "agentDisallowAll");
 		const allowed = (name: string): boolean => {
 			if (parentActive) return parentActive.has(name);
 			if (SUBAGENT_EXCLUDED_TOOLS.includes(name)) return false;
 			if (opts.background && BACKGROUND_EXCLUDED_TOOLS.includes(name)) return false;
-			return agentAllowsTool(def, name);
+			return agentAllowsTool(def, name, { disallowAll });
 		};
 		const deferredTools = opts.fork ? cc.options.deferredTools : (cc.options.deferredTools ?? []).filter(allowed);
 
@@ -353,7 +375,19 @@ export function registerAgent(pi: ExtensionAPI, cc: CCContext, internal: Registe
 			// so they never clobber the parent's state in the host UI
 			onEvent: (event) => emit({ type: "subagent_event", agentId: opts.agentId, parentToolCallId: opts.toolCallId, event }),
 		};
-		const factories: ExtensionFactory[] = [...(cc.options.subagentExtensions ?? []), ...subagentInternals.childExtensionFactories, (childPi) => registerUnknownToolErrors(childPi)];
+		const hostFactories = [...(cc.options.subagentExtensions ?? []), ...subagentInternals.childExtensionFactories];
+		const factories: ExtensionFactory[] = [
+			// a fork inherits the parent's tools (and may load its deferred tools); other agents only get
+			// what their definition allows, also for deferred and host/MCP tools
+			...(opts.fork ? hostFactories : hostFactories.map((f) => restrictToolRegistration(f, allowed))),
+			(childPi) => registerUnknownToolErrors(childPi),
+		];
+		if (!opts.fork) {
+			// last line of defense: whatever got registered or activated, a disallowed tool never runs
+			factories.push((childPi) => {
+				childPi.on("tool_call", (event) => (event.toolName === "tool_search" || allowed(event.toolName) ? undefined : { block: true, reason: noSuchToolText(event.toolName) }));
+			});
+		}
 		if (allowed(AGENT_TOOL_NAME)) {
 			// subagents can launch their own agents (foreground by default)
 			factories.push((childPi) => {
@@ -374,6 +408,7 @@ export function registerAgent(pi: ExtensionAPI, cc: CCContext, internal: Registe
 		const systemPrompt = opts.fork ? parentPrompt : def.prompt ? `${def.prompt}\n\n${SUBAGENT_PROMPT_NOTES}` : SUBAGENT_PROMPT_NOTES;
 
 		const registry = ctx.modelRegistry;
+		if (shuttingDown) throw new SubagentAbortedError();
 		const { session } = await createClaudeCodeSession({
 			cwd: opts.cwd,
 			sessionManager: opts.fork ? forkSessionManager(ctx, opts.cwd) : SessionManager.inMemory(opts.cwd),
@@ -395,11 +430,20 @@ export function registerAgent(pi: ExtensionAPI, cc: CCContext, internal: Registe
 				extensionFactories: factories,
 			},
 		});
+		// the parent may have shut down while the child was being created: never start its extensions
+		if (shuttingDown) {
+			session.dispose();
+			throw new SubagentAbortedError();
+		}
 		try {
 			await session.bindExtensions({});
 		} catch (err) {
 			session.dispose();
 			throw err;
+		}
+		if (shuttingDown) {
+			await disposeSession(session);
+			throw new SubagentAbortedError();
 		}
 		// Deferred tools stay registered-but-inactive until tool_search loads them, as in the parent.
 		session.setActiveToolsByName(session.getActiveToolNames().filter((n) => n === "tool_search" || allowed(n)));
@@ -410,7 +454,7 @@ export function registerAgent(pi: ExtensionAPI, cc: CCContext, internal: Registe
 		const file = run.outputFile;
 		if (!file) return () => {};
 		try {
-			writeFileSync(file, "");
+			writeFileSync(file, "", { mode: 0o600 });
 		} catch {
 			return () => {};
 		}
@@ -532,7 +576,7 @@ export function registerAgent(pi: ExtensionAPI, cc: CCContext, internal: Registe
 		onUpdate: AgentToolUpdateCallback<AgentDetails> | undefined,
 		ctx: ExtensionContext,
 	): Promise<{ content: Array<{ type: "text"; text: string }>; details: AgentDetails }> {
-		if (signal?.aborted) throw new SubagentAbortedError();
+		if (signal?.aborted || shuttingDown) throw new SubagentAbortedError();
 		const invalid = validateAgentInput(params);
 		if (invalid) throw new Error(invalid);
 
@@ -557,7 +601,11 @@ export function registerAgent(pi: ExtensionAPI, cc: CCContext, internal: Registe
 		// by a subagent run in the foreground unless run_in_background is true.
 		const background = params.run_in_background === true || def.background === true || (!isSubagent && params.run_in_background !== false);
 
-		// "remote" is not available here: fall back to a worktree in a git checkout, else run locally
+		// "remote" is not available here. Claude Code silently falls back to a worktree in a git checkout,
+		// else runs locally (#3); with the remoteIsolationFallback quirk fixed it is an error instead.
+		if (params.isolation === "remote" && isFixed(cc, "remoteIsolationFallback")) {
+			throw new Error('isolation: "remote" is not available: remote agent sessions are not supported here, and the agent would silently run on this machine instead. Omit isolation to run it in the current directory, or use isolation: "worktree" for an isolated git worktree.');
+		}
 		const isolation = params.isolation === "remote" ? (gitRootOf(ctx.cwd) ? "worktree" : undefined) : params.isolation;
 		const agentId = newTaskId("local_agent");
 		const worktree = isolation === "worktree" ? createAgentWorktree(ctx.cwd, agentId) : undefined;
@@ -590,7 +638,7 @@ export function registerAgent(pi: ExtensionAPI, cc: CCContext, internal: Registe
 			startIndex: session.messages.length,
 			worktree,
 		};
-		if (signal?.aborted) {
+		if (signal?.aborted || shuttingDown) {
 			if (worktree) finishAgentWorktree(worktree);
 			await disposeSession(session);
 			throw new SubagentAbortedError();
@@ -681,7 +729,7 @@ export function registerAgent(pi: ExtensionAPI, cc: CCContext, internal: Registe
 	pi.on("before_agent_start", (_event, ctx) => {
 		let listing: string;
 		try {
-			listing = formatAgentListingReminder(loadDefs(ctx.cwd));
+			listing = formatAgentListingReminder(loadDefs(ctx.cwd), { disallowAll: isFixed(cc, "agentDisallowAll") });
 		} catch {
 			return undefined;
 		}

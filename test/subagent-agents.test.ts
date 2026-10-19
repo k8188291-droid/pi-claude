@@ -4,7 +4,7 @@ import { getModel } from "@earendil-works/pi-ai/compat";
 import { ModelRegistry } from "@earendil-works/pi-coding-agent";
 import { createTestModelRuntime } from "./helpers.js";
 import { beforeAll, describe, expect, it } from "vitest";
-import { BUILT_IN_AGENTS, loadAgentDefinitions, parseAgentMarkdown } from "../src/subagent/agents.js";
+import { agentAllowsTool, BUILT_IN_AGENTS, loadAgentDefinitions, parseAgentMarkdown, parseToolList, toolRuleMatches, toolsLabel } from "../src/subagent/agents.js";
 import { formatAgentListingReminder } from "../src/subagent/agents.js";
 import { foregroundResultText, frameHandback, validateAgentInput } from "../src/subagent/prompt.js";
 import { resolveSubagentModel } from "../src/subagent/models.js";
@@ -164,5 +164,68 @@ describe("subagent model resolution", () => {
 		expect(c.ok).toBe(false);
 		const d = resolveSubagentModel("no-such-model", registry, parent, { strict: false });
 		expect(d).toMatchObject({ ok: true, model: parent });
+	});
+});
+
+describe("agent tool restrictions (review 2026-10-18 #2b/#2c/#2d)", () => {
+	const md = (fm: string) => parseAgentMarkdown(`---\nname: x\ndescription: d\n${fm}\n---\nBody`, "/x/x.md", "project")!;
+
+	it("#2b: an empty tools value means no tools; absent or '*' means all (like Claude Code)", () => {
+		expect(parseToolList(undefined)).toBeUndefined();
+		expect(parseToolList([])).toEqual([]);
+		expect(parseToolList("")).toEqual([]);
+		expect(parseToolList(null)).toEqual([]);
+		expect(parseToolList(["Read", "*"])).toBeUndefined();
+		expect(md("tools: []").tools).toEqual([]);
+		expect(md("tools:").tools).toEqual([]);
+		expect(md("model: haiku").tools).toBeUndefined();
+		expect(agentAllowsTool(md("tools: []"), "Read")).toBe(false);
+		expect(agentAllowsTool(md("model: haiku"), "Read")).toBe(true);
+
+		const defs = loadAgentDefinitions({ cwd: tempDir(), homeDir: tempDir(), agents: { empty: { description: "d", prompt: "p", tools: [] }, all: { description: "d", prompt: "p" } } });
+		expect(defs.get("empty")!.tools).toEqual([]);
+		expect(defs.get("all")!.tools).toBeUndefined();
+		expect(agentAllowsTool(defs.get("empty")!, "Read")).toBe(false);
+		expect(toolsLabel(defs.get("empty")!)).toBe("All tools"); // Claude Code's label for an empty list
+	});
+
+	it("#2d: mcp__server / mcp__server__* / mcp__* rules match MCP tools like Claude Code", () => {
+		expect(toolRuleMatches("mcp__prod", "mcp__prod__danger", "deny")).toBe(true);
+		expect(toolRuleMatches("mcp__prod__*", "mcp__prod__danger", "deny")).toBe(true);
+		expect(toolRuleMatches("mcp__*", "mcp__prod__danger", "deny")).toBe(true);
+		expect(toolRuleMatches("mcp__prod", "mcp__production__x", "deny")).toBe(false);
+		expect(toolRuleMatches("mcp__prod__other", "mcp__prod__danger", "deny")).toBe(false);
+		expect(toolRuleMatches("mcp__*", "Read", "deny")).toBe(false);
+		expect(toolRuleMatches("mcp__prod", "mcp__prod__danger", "allow")).toBe(true);
+		expect(toolRuleMatches("mcp__prod__*", "mcp__prod__danger", "allow")).toBe(true);
+		expect(toolRuleMatches("ToolSearch", "tool_search", "allow")).toBe(true);
+
+		const deny = md("disallowedTools: mcp__prod");
+		expect(agentAllowsTool(deny, "mcp__prod__danger")).toBe(false);
+		expect(agentAllowsTool(deny, "mcp__other__x")).toBe(true);
+		expect(agentAllowsTool(deny, "Read")).toBe(true);
+		const allow = md("tools: Read, mcp__prod__*");
+		expect(agentAllowsTool(allow, "mcp__prod__danger")).toBe(true);
+		expect(agentAllowsTool(allow, "mcp__other__x")).toBe(false);
+		expect(agentAllowsTool(allow, "Bash")).toBe(false);
+	});
+
+	it('#2c: disallowedTools "*" is ignored by default and removes every tool with the quirk fixed', () => {
+		const a = md('disallowedTools: "*"');
+		expect(a.disallowedTools).toBeUndefined();
+		expect(a.disallowAll).toBe(true);
+		expect(agentAllowsTool(a, "Read")).toBe(true);
+		expect(toolsLabel(a)).toBe("All tools");
+		expect(agentAllowsTool(a, "Read", { disallowAll: true })).toBe(false);
+		expect(toolsLabel(a, { disallowAll: true })).toBe("None");
+		// definitions without the wildcard are unaffected by the quirk
+		const b = md("disallowedTools: Write");
+		expect(b.disallowAll).toBeUndefined();
+		expect(agentAllowsTool(b, "Read", { disallowAll: true })).toBe(true);
+		// Agent SDK-style options definitions may carry disallowedTools too
+		const defs = loadAgentDefinitions({ cwd: tempDir(), homeDir: tempDir(), agents: { o: { description: "d", prompt: "p", disallowedTools: ["*"] } as any, w: { description: "d", prompt: "p", disallowedTools: ["Write"] } as any } });
+		expect(defs.get("o")!.disallowAll).toBe(true);
+		expect(agentAllowsTool(defs.get("w")!, "Write")).toBe(false);
+		expect(toolsLabel(defs.get("w")!)).toBe("All tools except Write");
 	});
 });

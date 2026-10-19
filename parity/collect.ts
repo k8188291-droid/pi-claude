@@ -54,6 +54,8 @@ export function collectOutcome(
 	const extraTurns = mock.requests
 		.filter((r) => r.route === "main" && r.turnIndex >= s.turns.length)
 		.map((r) => `turn ${r.turnIndex}: ${r.lastUserText.replace(/\s+/g, " ").slice(0, 200)}`);
+	// requests the mock failed (bad body, script errors) would otherwise only show up as missing steps
+	const mockErrors = mock.errors.length ? `mock server errors:\n${mock.errors.join("\n")}` : undefined;
 	return {
 		harness,
 		steps,
@@ -61,5 +63,6 @@ export function collectOutcome(
 		subagentTools,
 		extraTurns,
 		...extra,
+		error: [extra.error, mockErrors].filter(Boolean).join("\n") || undefined,
 	};
 }
