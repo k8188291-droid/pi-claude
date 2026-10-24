@@ -1,0 +1,16 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "pi-claude-web",
+  "main": "worker/index.ts",
+  "compatibility_date": "2026-10-01",
+  "assets": {
+    "directory": "./dist",
+    "binding": "ASSETS",
+    "not_found_handling": "single-page-application",
+    // 只有 API 轉送需要跑 Worker，其他路徑直接由靜態檔提供。
+    "run_worker_first": ["/anthropic/*"]
+  },
+  "vars": {
+    "UPSTREAM_URL": "https://api.anthropic.com"
+  }
+}
