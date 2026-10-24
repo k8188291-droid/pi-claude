@@ -55,6 +55,7 @@ npm run deploy         # 打包並部署，完成後會印出 https://pi-claude-
 - 想換名稱或綁自己的網域：改 `wrangler.jsonc` 的 `name`，或在 Cloudflare 後台的 Worker → Settings → Domains & Routes 加上自訂網域。
 - 在 CI 部署：設定 `CLOUDFLARE_API_TOKEN`（權限選「Edit Cloudflare Workers」範本）與 `CLOUDFLARE_ACCOUNT_ID` 後執行 `npm run deploy`。
 - 本機用 Workers 執行環境測試：`npm run worker:dev`（http://localhost:8787）；接假 API 時加 `-- --var UPSTREAM_URL:http://localhost:4010`。
+- `wrangler.jsonc` 用 `placement.region` 把轉送的 Worker 固定在美東執行。Worker 預設在離使用者最近的機房執行，如果那裡是 Anthropic 不支援的地區，API 會回 `403 Request not allowed`。
 - Worker 不需要任何 secret；API key 仍由每個使用者在自己的瀏覽器輸入。
 - 部署後網址是公開的，任何人都能打開頁面，但必須輸入自己的 key 才能使用。若只想自己用，可在 Cloudflare 後台替這個 Worker 開啟 Access（Zero Trust）登入保護。
 

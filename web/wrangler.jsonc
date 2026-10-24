@@ -10,6 +10,11 @@
     // 只有 API 轉送需要跑 Worker，其他路徑直接由靜態檔提供。
     "run_worker_first": ["/anthropic/*"]
   },
+  // Anthropic API 會拒絕來自不支援地區的請求（403 Request not allowed）。Worker 預設在離使用者
+  // 最近的機房執行，所以把轉送的 Worker 固定放在美東；靜態檔仍由離使用者最近的機房提供。
+  "placement": {
+    "region": "aws:us-east-1"
+  },
   "vars": {
     "UPSTREAM_URL": "https://api.anthropic.com"
   }

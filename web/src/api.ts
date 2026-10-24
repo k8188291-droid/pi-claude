@@ -52,7 +52,11 @@ export function getClient(s: Settings): Anthropic {
 
 export function errorMessage(err: unknown): string {
   if (err instanceof Anthropic.AuthenticationError) return "API key 無效（401）";
-  if (err instanceof Anthropic.PermissionDeniedError) return `權限不足（403）：${err.message}`;
+  if (err instanceof Anthropic.PermissionDeniedError) {
+    if (/request not allowed/i.test(err.message))
+      return "Anthropic 拒絕了這個請求（403 Request not allowed）：通常是請求從 Anthropic 不支援的地區送出。";
+    return `權限不足（403）：${err.message}`;
+  }
   if (err instanceof Anthropic.NotFoundError) return `找不到資源（404）：${err.message}`;
   if (err instanceof Anthropic.RateLimitError) return "請求太頻繁（429），稍後再試";
   if (err instanceof Anthropic.APIError) return `API 錯誤 ${err.status ?? ""}：${err.message}`;

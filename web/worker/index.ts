@@ -38,6 +38,9 @@ export default {
       // 直接回傳上游的 body stream，SSE 會逐塊送出。
       const out = new Headers(upstream.headers);
       out.delete("set-cookie");
+      // 方便除錯：Worker 實際在哪個機房執行（placement 生效時是 remote-XXX）。
+      const placement = request.headers.get("cf-placement");
+      if (placement) out.set("x-worker-placement", placement);
       return new Response(upstream.body, { status: upstream.status, statusText: upstream.statusText, headers: out });
     } catch (err) {
       return Response.json(
