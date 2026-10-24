@@ -168,3 +168,8 @@ npm test          # vitest，使用 pi 的 faux provider 跑完整 agent 流程
 npm run typecheck
 npm run build
 ```
+
+## 網頁介面（`web/`）
+
+`web/` 是另一個獨立的小專案：類似 Claude Code on the web 的網頁介面，使用者填入自己的 API key，
+透過 Claude Managed Agents 在雲端容器裡跑 agent。說明見 [`web/README.md`](web/README.md)。
