@@ -152,10 +152,7 @@ describe("createMemoryClaudeCodeSession", () => {
 		expect(outsidePackages(touched, adc)).toEqual([]);
 	});
 
-	// Depends on the tool rewiring (every tool reaching fs/shell/search through
-	// ClaudeCodeToolsOptions.host). Before it, Write/Read/Bash/Grep/Glob still use the real disk,
-	// so this would write to the host's /workspace: keep it skipped until that change is merged.
-	it.skip("[needs host rewiring] Write, Read, Edit, Bash, Grep and Glob all run on the in-memory filesystem", async () => {
+	it("Write, Read, Edit, Bash, Grep and Glob all run on the in-memory filesystem", async () => {
 		const s = await start([
 			fauxAssistantMessage(fauxToolCall("Write", { file_path: "/workspace/src/a.ts", content: "export const foo = 1;\n" }), { stopReason: "toolUse" }),
 			fauxAssistantMessage(fauxToolCall("Read", { file_path: "/workspace/src/a.ts" }), { stopReason: "toolUse" }),

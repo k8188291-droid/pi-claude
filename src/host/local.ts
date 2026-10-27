@@ -90,7 +90,7 @@ function toHostStat(s: Stats): HostStat {
 }
 
 function abortError(): Error {
-	return new Error("Operation aborted");
+	return Object.assign(new Error("Operation aborted"), { name: "AbortError" });
 }
 
 /** O_NONBLOCK: opening a FIFO must neither wait for its other end nor hand it data. */

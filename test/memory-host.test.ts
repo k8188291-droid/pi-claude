@@ -17,6 +17,24 @@ describeHostContract("memory host", async () => {
 });
 
 describe("memory host specifics", () => {
+	it("ripgrep --files --sort=modified lists oldest first, as Glob relies on", async () => {
+		const host = await createMemoryHost();
+		const dir = "/workspace/sorted";
+		await host.fs.mkdir(dir, { recursive: true });
+		for (const [name, t] of [["b.ts", 3000], ["a.ts", 1000], ["c.ts", 2000]] as const) {
+			await host.fs.writeFile(`${dir}/${name}`, name);
+			await host.vfs.utimes(`${dir}/${name}`, new Date(t), new Date(t));
+		}
+		const args = ["--files", "--null", "--glob", "*.ts", "--sort=modified", "--no-ignore", "--hidden", "."];
+		const r = await host.search.ripgrep(args, { cwd: dir });
+		expect(r.exitCode).toBe(0);
+		expect(r.stdout.split("\0").filter(Boolean).map((p) => p.replace(/^\.\//, ""))).toEqual(["a.ts", "c.ts", "b.ts"]);
+		const reversed = await host.search.ripgrep(args.map((a) => (a === "--sort=modified" ? "--sortr=modified" : a)), { cwd: dir });
+		expect(reversed.stdout.split("\0").filter(Boolean).map((p) => p.replace(/^\.\//, ""))).toEqual(["b.ts", "c.ts", "a.ts"]);
+		const unsupported = await host.search.ripgrep(args.map((a) => (a === "--sort=modified" ? "--sort=accessed" : a)), { cwd: dir });
+		expect(unsupported.exitCode).toBe(2);
+	});
+
 	it("defaults: cwd, tmp and home directories, environment, no worktrees", async () => {
 		const host = await createMemoryHost();
 		expect(host.cwd).toBe("/workspace");

@@ -65,6 +65,7 @@ const VALUE_FLAGS = new Set([
 	"--regexp",
 	"--replace",
 	"--sort",
+	"--sortr",
 	"--threads",
 	"--type",
 	"--type-add",
@@ -80,6 +81,10 @@ interface ParsedArgs {
 	before: number;
 	after: number;
 	types: string[];
+	/** `--sort`/`--sortr` (just-bash has neither): applied to the output afterwards. */
+	sort?: { by: string; reverse: boolean };
+	/** Output entries are NUL-terminated (`--null` / `-0`). */
+	nullSeparated: boolean;
 }
 
 const longName: Record<string, string> = { "--after-context": "-A", "--before-context": "-B", "--context": "-C", "--glob": "-g", "--type": "-t", "--max-columns": "-M" };
@@ -103,7 +108,7 @@ export function adaptGlob(glob: string): string[] {
 }
 
 export function parseRgArgs(input: string[]): ParsedArgs {
-	const p: ParsedArgs = { args: ["--case-sensitive"], json: false, multiline: false, onlyMatching: false, before: 0, after: 0, types: [] };
+	const p: ParsedArgs = { args: ["--case-sensitive"], json: false, multiline: false, onlyMatching: false, before: 0, after: 0, types: [], nullSeparated: false };
 	let ctxA: number | undefined;
 	let ctxB: number | undefined;
 	let ctxC: number | undefined;
@@ -112,6 +117,10 @@ export function parseRgArgs(input: string[]): ParsedArgs {
 		switch (f) {
 			case "-M":
 				return; // --max-columns: unsupported, see above
+			case "--sort":
+			case "--sortr":
+				p.sort = { by: value, reverse: f === "--sortr" };
+				return;
 			case "-g":
 				for (const g of adaptGlob(value)) p.args.push("--glob", g);
 				return;
@@ -146,6 +155,7 @@ export function parseRgArgs(input: string[]): ParsedArgs {
 			continue;
 		}
 		if (a === "--max-columns-preview") continue;
+		if (a === "--null" || a === "-0") p.nullSeparated = true;
 		if (a === "--json") p.json = true;
 		else if (a === "-U" || a === "--multiline" || a === "--multiline-dotall") p.multiline = true;
 		else if (a === "-o" || a === "--only-matching") p.onlyMatching = true;
@@ -315,6 +325,31 @@ export function normalizeRgError(stderr: string): string | undefined {
 	return undefined;
 }
 
+/**
+ * ripgrep's `--sort` for list-shaped output (`--files`, `-l`): `path`, or `modified` (oldest first,
+ * ties by path); `none` keeps just-bash's order. Returns undefined for a key the memory host cannot
+ * reproduce (`accessed`, `created`).
+ */
+async function sortEntries(stdout: string, parsed: ParsedArgs, vfs: InMemoryFs, cwd: string): Promise<string | undefined> {
+	const { by, reverse } = parsed.sort!;
+	if (by === "none") return stdout;
+	if (by !== "path" && by !== "modified") return undefined;
+	const sep = parsed.nullSeparated ? "\0" : "\n";
+	const entries = stdout.split(sep).filter((e) => e !== "");
+	const keyed = await Promise.all(entries.map(async (entry) => {
+		if (by === "path") return { entry, key: 0 };
+		try {
+			const st = await vfs.stat(posix.resolve(cwd, entry));
+			return { entry, key: st.mtime.getTime() };
+		} catch {
+			return { entry, key: 0 };
+		}
+	}));
+	keyed.sort((a, b) => a.key - b.key || (a.entry < b.entry ? -1 : a.entry > b.entry ? 1 : 0));
+	if (reverse) keyed.reverse();
+	return keyed.map((k) => k.entry + sep).join("");
+}
+
 export class MemoryRipgrep {
 	private typeNames?: Promise<Set<string>>;
 
@@ -354,6 +389,11 @@ export class MemoryRipgrep {
 		const error = normalizeRgError(r.stderr);
 		if (error !== undefined) return { stdout: r.stdout, stderr: error, exitCode: 2 };
 		let stdout = r.stdout;
+		if (parsed.sort !== undefined && r.exitCode === 0) {
+			const sorted = await sortEntries(stdout, parsed, this.vfs, cwd);
+			if (sorted === undefined) return { stdout: "", stderr: `rg: error parsing flag --sort: not supported by the memory host's ripgrep (just-bash): ${parsed.sort.by}\n`, exitCode: 2 };
+			stdout = sorted;
+		}
 		if (parsed.json && r.exitCode === 0) {
 			const events = parseEvents(stdout);
 			if (parsed.multiline) {
