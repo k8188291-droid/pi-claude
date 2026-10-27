@@ -71,6 +71,41 @@ await loader.reload();
 const { session } = await createAgentSession({ cwd, modelRuntime, resourceLoader: loader, noTools: "builtin" });
 ```
 
+## 記憶體 host（`pi-claude-code-tools/memory`）
+
+讓工具完全不碰宿主的檔案與程序（例如在 Lambda 裡）：檔案放在 just-bash 的 `InMemoryFs`，Bash 由 just-bash 直譯器執行（不啟動子程序），Grep 用 just-bash 內建的 `rg`，Glob 直接比對記憶體內的路徑。需要安裝選用的 peer dependency `just-bash`（≥ 3.4.2）與 `minimatch`；根目錄的 `pi-claude-code-tools` 不會載入它們。
+
+```ts
+import { createMemoryClaudeCodeSession } from "pi-claude-code-tools/memory";
+
+const { session, host, snapshot } = await createMemoryClaudeCodeSession({
+  model, modelRuntime,                       // 由呼叫端提供（Bedrock、OpenAI 相容 endpoint 等皆可）
+  snapshot: saved,                           // 選用：還原檔案、cwd 與完整 session tree
+  hostOptions: {
+    executionLimitProfile: "hardened",
+    fetch: myVirtualApiFetch,                // 選用：讓 curl 呼叫 host 提供的虛擬 HTTP API
+  },
+});
+await session.prompt("...");
+const text = new TextDecoder().decode(await host.fs.readFile("/workspace/out.md"));
+store(JSON.stringify(await snapshot()));     // 讀寫 snapshot 物件由呼叫端負責
+```
+
+- **環境：** cwd 預設 `/workspace`、`/tmp`、`/home/agent`；network、Python、JavaScript 預設關閉；`supportsWorktrees: false`。也可以只用 `createMemoryHost()`，再把它當 `claudeCode.host` 傳給 `createClaudeCodeExtension`。
+- **資源：** `MemoryResourceLoader` 只讀 VFS：AGENTS.md／CLAUDE.md（`/agent`，再從 `/` 到 cwd 每一層）、skills（`/agent/skills`、`<cwd>/.pi/skills`、`<cwd>/.agents/skills`）、prompt templates（`/agent/prompts`、`<cwd>/.pi/prompts`）。Extension 只有程式內傳入的 factory，永遠不從檔案載入；settings 與 session 都在記憶體中。
+- **Snapshot：** 和 memory-pi-agent 相同的 version 1 格式（檔案含 base64 與 mode、目錄、symlink、cwd、session tree），另外保存 mtime。`/bin`、`/usr`、`/proc`、`/dev` 每次重建，不存。OAuth 等憑證不放進 snapshot（舊格式的 `oauth` 欄位會被忽略）。
+- **ModelRuntime：** 沒給時用 `createMemoryModelRuntime()`（記憶體憑證、只有內建模型目錄、不連網）。
+
+已知限制：
+
+- Bash 的 stdout／stderr 在指令結束時一次送出（just-bash 沒有串流 API）。`kill()`／timeout 在直譯器下一次 await 時生效；完全不 await 的迴圈（`while :; do :; done`）要靠 `executionLimits` 結束。
+- 每次指令都是獨立的 just-bash 狀態（同一個 `Bash` 可同時跑多個指令，`cd`／`export` 互不影響，只共用檔案系統）。
+- Grep：just-bash 的 `rg` 一律跳過 `node_modules`、`.git`、`.svn`、`.hg`、`__pycache__`、`.pytest_cache`、`.mypy_cache`、`venv`、`.venv`、`.next`、`.nuxt`、`.cargo`；`.gitignore` 在非 git repo 也生效；二進位檔直接略過（沒有「binary file matches」）；regex 是 just-bash 轉成 JavaScript 的語法（不支援 `(?i)` 等 inline flag）。其餘差異已在 `src/memory/ripgrep.ts` 補齊（預設大小寫、`--max-columns`、`{a,b}` glob、排除目錄、未知 `--type`、JSON 的 context 與 multiline、錯誤訊息）。
+- 檔案系統沒有權限檢查（mode 只記錄不強制）、沒有 FIFO 等特殊檔案；`readRange` 只回傳範圍內的位元組，但由 just-bash 寫入、以字串保存的檔案，每次讀取會先整份編碼。
+- `createMemoryClaudeCodeSession` 預設關閉 `Agent`（`subagents: false`）：subagent session 目前由 pi 的 `DefaultResourceLoader` 建立，會讀宿主磁碟。
+- pi 1.x 只在有名為 `read` 或 `bash` 的工具時才把 skills 列進 system prompt，Claude Code 工具（`Read`、`Bash`）不符合，所以 skills 會載入但不會出現在 prompt 中（磁碟版 `createClaudeCodeSession` 也一樣）。
+- pi-ai 預設的憑證探測仍會讀 `process.env`，並檢查宿主上 Google ADC 檔案是否存在；pi 1.x 的 `ModelRuntime` 無法替換這個 auth context。
+
 ## 選項（`ClaudeCodeToolsOptions`）
 
 | 選項 | 預設 | 說明 |
