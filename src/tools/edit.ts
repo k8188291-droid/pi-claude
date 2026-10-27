@@ -1,8 +1,8 @@
-import { readdir, readFile, realpath, stat } from "node:fs/promises";
 import { basename, dirname, extname, join, relative, sep } from "node:path";
 import type { AgentToolResult, ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { withFileMutationQueue } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
+import type { HostFileSystem } from "../host/types.js";
 import type { CCContext } from "../shared/context.js";
 import { FILE_CONTENT_CHANGED, FILE_MODIFIED_SINCE_READ, FileStateTracker } from "../shared/file-state.js";
 import { resolveToolPath } from "../shared/paths.js";
@@ -272,9 +272,9 @@ function addBomLike(original: string | null | undefined, next: string): string {
 // "File does not exist" suggestions
 // ---------------------------------------------------------------------------------------------
 
-async function exists(p: string): Promise<boolean> {
+async function exists(fs: HostFileSystem, p: string): Promise<boolean> {
 	try {
-		await stat(p);
+		await fs.stat(p);
 		return true;
 	} catch {
 		return false;
@@ -282,35 +282,35 @@ async function exists(p: string): Promise<boolean> {
 }
 
 /** A path outside cwd (but under its parent) that exists when re-rooted under cwd. */
-async function suggestUnderCwd(absPath: string, cwd: string): Promise<string | undefined> {
+async function suggestUnderCwd(fs: HostFileSystem, absPath: string, cwd: string): Promise<string | undefined> {
 	const parent = dirname(cwd);
 	let p = absPath;
 	try {
-		p = join(await realpath(dirname(absPath)), basename(absPath));
+		p = join(await fs.realpath(dirname(absPath)), basename(absPath));
 	} catch {}
 	const prefix = parent === sep ? sep : parent + sep;
 	if (!p.startsWith(prefix) || p.startsWith(cwd + sep) || p === cwd) return undefined;
 	const candidate = join(cwd, relative(parent, p));
-	return (await exists(candidate)) ? candidate : undefined;
+	return (await exists(fs, candidate)) ? candidate : undefined;
 }
 
 const EXT_RE = /^(\.[\p{L}\p{N}_+~#-]{1,32})?$/u;
 
 /** A sibling with the same name but another extension. */
-async function suggestOtherExtension(absPath: string): Promise<string | undefined> {
+async function suggestOtherExtension(fs: HostFileSystem, absPath: string): Promise<string | undefined> {
 	try {
 		const dir = dirname(absPath);
 		const base = basename(absPath, extname(absPath));
-		const entries = await readdir(dir);
+		const entries = (await fs.readdir(dir)).map((e) => e.name);
 		return entries.find((name) => EXT_RE.test(extname(name).normalize("NFC")) && basename(name, extname(name)) === base && join(dir, name) !== absPath);
 	} catch {
 		return undefined;
 	}
 }
 
-async function fileNotFoundMessage(absPath: string, cwd: string): Promise<string> {
+async function fileNotFoundMessage(fs: HostFileSystem, absPath: string, cwd: string): Promise<string> {
 	let msg = `File does not exist. ${CWD_NOTE} ${cwd}.`;
-	const suggestion = (await suggestUnderCwd(absPath, cwd)) ?? (await suggestOtherExtension(absPath));
+	const suggestion = (await suggestUnderCwd(fs, absPath, cwd)) ?? (await suggestOtherExtension(fs, absPath));
 	if (suggestion) msg += ` Did you mean ${suggestion}?`;
 	return msg;
 }
@@ -349,26 +349,27 @@ export function registerEdit(pi: ExtensionAPI, cc: CCContext): void {
 			const cwd = ctx?.cwd ?? process.cwd();
 			const absPath = resolveToolPath(cc, cwd, filePath);
 			const contentCheck = isFixed(cc, "mtimeOnlyChangeDetection");
+			const fs = cc.host.fs;
 
 			return withFileMutationQueue(absPath, async () => {
 				if (signal?.aborted) throw new Error("Operation aborted");
 				// ---- validation (same order as Claude Code) ----
 				if (oldString === newStringIn) throw new Error("No changes to make: old_string and new_string are exactly the same.");
 				try {
-					const st = await stat(absPath);
+					const st = await fs.stat(absPath);
 					if (st.size > MAX_EDIT_FILE_BYTES) {
 						throw new Error(`File is too large to edit (${formatSize(st.size)}). Maximum editable file size is ${formatSize(MAX_EDIT_FILE_BYTES)}.`);
 					}
 					// Claude Code fails reading such a path (after blocking on a FIFO until a writer
 					// shows up); refuse it before opening it at all (#7b).
-					if (!st.isFile() && !st.isDirectory()) throw new NotRegularFileError();
+					if (!st.isFile && !st.isDirectory) throw new NotRegularFileError();
 				} catch (err: any) {
 					if (err?.code !== "ENOENT") throw err;
 				}
 
 				let existing: Awaited<ReturnType<typeof readExistingText>>;
 				try {
-					existing = await readExistingText(absPath);
+					existing = await readExistingText(fs, absPath);
 				} catch (err: any) {
 					if (err instanceof NotRegularFileError) throw new Error(NOT_A_REGULAR_FILE);
 					throw new Error(`Error calling tool (Edit): ${err?.message ?? String(err)}`);
@@ -376,13 +377,13 @@ export function registerEdit(pi: ExtensionAPI, cc: CCContext): void {
 				const rec = cc.fileState.get(absPath);
 
 				if (existing === null) {
-					if (oldString !== "") throw new Error(await fileNotFoundMessage(absPath, cwd));
+					if (oldString !== "") throw new Error(await fileNotFoundMessage(fs, absPath, cwd));
 				} else if (oldString === "") {
 					if (stripBom(existing.content).trim() !== "") throw new Error("Cannot create new file - file already exists.");
 				} else {
 					if (absPath.endsWith(".ipynb")) throw new Error(NOT_A_NOTEBOOK_TOOL);
 					const text = stripBom(existing.content);
-					if (rec && cc.fileState.isStale(absPath, text, { contentCheck }) && editOutcome(text, oldString, replaceAll) !== "applies") {
+					if (rec && (await cc.fileState.isStale(absPath, text, { contentCheck })) && editOutcome(text, oldString, replaceAll) !== "applies") {
 						throw new Error(FILE_MODIFIED_SINCE_READ);
 					}
 					if (existing.notText) throw new Error(notTextMessage(existing.notText));
@@ -403,7 +404,7 @@ export function registerEdit(pi: ExtensionAPI, cc: CCContext): void {
 				const fileExists = existing !== null;
 				const content = existing?.content ?? "";
 				let staleRecovered = false;
-				if (fileExists && rec && cc.fileState.isStale(absPath, content, { contentCheck })) {
+				if (fileExists && rec && (await cc.fileState.isStale(absPath, content, { contentCheck }))) {
 					if (editOutcome(content, oldString, replaceAll) !== "applies") throw new Error(FILE_CONTENT_CHANGED);
 					staleRecovered = true;
 				}
@@ -422,8 +423,8 @@ export function registerEdit(pi: ExtensionAPI, cc: CCContext): void {
 					fileExists && (!FileStateTracker.inModelContext(rec) || staleRecovered || !FileStateTracker.sameContent(rec!, content));
 
 				if (signal?.aborted) throw new Error("Operation aborted");
-				await writeText(absPath, updated, existing?.encoding ?? "utf8", existing?.lineEndings ?? "LF", !fileExists);
-				cc.fileState.recordWrite(absPath, updated, { contentNotInModelContext, truncated: fileExists && rec?.truncated === true });
+				await writeText(fs, absPath, updated, existing?.encoding ?? "utf8", existing?.lineEndings ?? "LF", !fileExists);
+				await cc.fileState.recordWrite(absPath, updated, { contentNotInModelContext, truncated: fileExists && rec?.truncated === true });
 
 				const suffix = staleRecovered ? STALE_RECOVERED_NOTE : contentNotInModelContext ? "" : FILE_STATE_CURRENT_NOTE;
 				const text = replaceAll

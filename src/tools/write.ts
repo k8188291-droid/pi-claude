@@ -1,9 +1,9 @@
-import { constants as fsConstants } from "node:fs";
-import { mkdir, open, stat } from "node:fs/promises";
 import { basename, dirname } from "node:path";
 import type { AgentToolResult, ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { withFileMutationQueue } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
+import type { HostFileSystem } from "../host/types.js";
+import { asBuffer } from "../shared/background.js";
 import type { CCContext } from "../shared/context.js";
 import { FILE_MODIFIED_SINCE_READ, FILE_NOT_READ } from "../shared/file-state.js";
 import { resolveToolPath } from "../shared/paths.js";
@@ -101,52 +101,36 @@ export class NotRegularFileError extends Error {
 	}
 }
 
-/** O_NONBLOCK: opening a FIFO must neither wait for its other end nor hand it data. */
-const O_NONBLOCK = fsConstants.O_NONBLOCK ?? 0;
-
 /**
- * Read a regular file. It is opened non-blocking and checked with fstat before any byte is read,
- * so a FIFO or device is refused at once instead of blocking (#7b).
+ * Read a regular file. It is checked with stat before any byte is read, so a FIFO or device is
+ * refused at once instead of blocking (#7b).
  */
-export async function readRegularFile(absPath: string): Promise<Buffer> {
-	const fh = await open(absPath, fsConstants.O_RDONLY | O_NONBLOCK);
-	try {
-		const st = await fh.stat();
-		if (st.isDirectory()) throw Object.assign(new Error("EISDIR: illegal operation on a directory, read"), { code: "EISDIR", errno: -21, syscall: "read" });
-		if (!st.isFile()) throw new NotRegularFileError();
-		return await fh.readFile();
-	} finally {
-		await fh.close();
-	}
+export async function readRegularFile(fs: HostFileSystem, absPath: string): Promise<Buffer> {
+	const st = await fs.stat(absPath);
+	if (st.isDirectory) throw Object.assign(new Error("EISDIR: illegal operation on a directory, read"), { code: "EISDIR", errno: -21, syscall: "read" });
+	if (!st.isFile) throw new NotRegularFileError();
+	return asBuffer(await fs.readFile(absPath));
 }
 
 /**
- * Create or overwrite a regular file. Opened non-blocking (a FIFO without a reader fails with
- * ENXIO) and checked with fstat before truncating or writing, so nothing is ever written into a
- * FIFO, device or socket, even if one replaced the file after it was checked (#7b).
+ * Create or overwrite a regular file. The host never writes into a FIFO, device or socket, even if
+ * one replaced the file after it was checked (#7b): it refuses with ENXIO (a FIFO without a
+ * reader) or ERR_NOT_REGULAR_FILE, reported here as a NotRegularFileError.
  */
-export async function writeRegularFile(absPath: string, data: string | Buffer): Promise<void> {
-	let fh;
+export async function writeRegularFile(fs: HostFileSystem, absPath: string, data: string | Buffer): Promise<void> {
 	try {
-		fh = await open(absPath, fsConstants.O_WRONLY | fsConstants.O_CREAT | O_NONBLOCK, 0o666);
+		await fs.writeFile(absPath, data);
 	} catch (err: any) {
-		if (err?.code === "ENXIO") throw new NotRegularFileError();
+		if (err?.code === "ENXIO" || err?.code === "ERR_NOT_REGULAR_FILE") throw new NotRegularFileError();
 		throw err;
-	}
-	try {
-		if (!(await fh.stat()).isFile()) throw new NotRegularFileError();
-		await fh.truncate(0);
-		await fh.writeFile(data);
-	} finally {
-		await fh.close();
 	}
 }
 
 /** Read an existing file as text; null when it does not exist. Other errors (EISDIR, ...) are thrown. */
-export async function readExistingText(absPath: string): Promise<ExistingText | null> {
+export async function readExistingText(fs: HostFileSystem, absPath: string): Promise<ExistingText | null> {
 	let buf: Buffer;
 	try {
-		buf = await readRegularFile(absPath);
+		buf = await readRegularFile(fs, absPath);
 	} catch (err: any) {
 		if (err?.code === "ENOENT") return null;
 		throw err;
@@ -157,10 +141,17 @@ export async function readExistingText(absPath: string): Promise<ExistingText | 
 }
 
 /** Write text in the given encoding, converting LF to CRLF when the file used CRLF. */
-export async function writeText(absPath: string, content: string, encoding: TextEncodingName, lineEndings: "LF" | "CRLF", createParents = true): Promise<void> {
+export async function writeText(
+	fs: HostFileSystem,
+	absPath: string,
+	content: string,
+	encoding: TextEncodingName,
+	lineEndings: "LF" | "CRLF",
+	createParents = true,
+): Promise<void> {
 	const text = lineEndings === "CRLF" ? content.replaceAll("\r\n", "\n").split("\n").join("\r\n") : content;
-	if (createParents) await mkdir(dirname(absPath), { recursive: true });
-	await writeRegularFile(absPath, Buffer.from(text, encoding));
+	if (createParents) await fs.mkdir(dirname(absPath), { recursive: true });
+	await writeRegularFile(fs, absPath, Buffer.from(text, encoding));
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -180,6 +171,7 @@ export function registerWrite(pi: ExtensionAPI, cc: CCContext): void {
 			if (typeof filePath !== "string" || typeof params.content !== "string") throw new Error("file_path and content are required strings.");
 			const absPath = resolveToolPath(cc, ctx?.cwd ?? process.cwd(), filePath);
 			const contentCheck = isFixed(cc, "mtimeOnlyChangeDetection");
+			const fs = cc.host.fs;
 
 			return withFileMutationQueue(absPath, async () => {
 				if (signal?.aborted) throw new Error("Operation aborted");
@@ -189,9 +181,9 @@ export function registerWrite(pi: ExtensionAPI, cc: CCContext): void {
 				}
 				let existedBefore = true;
 				try {
-					const st = await stat(absPath);
-					if (st.isDirectory()) throw new Error(`${filePath} is a directory, not a file. To create a file inside it, include the file name in file_path.`);
-					if (!st.isFile()) throw new Error(`${filePath} exists but is not a regular file (a device, FIFO or socket). Write only creates or overwrites regular files.`);
+					const st = await fs.stat(absPath);
+					if (st.isDirectory) throw new Error(`${filePath} is a directory, not a file. To create a file inside it, include the file name in file_path.`);
+					if (!st.isFile) throw new Error(`${filePath} exists but is not a regular file (a device, FIFO or socket). Write only creates or overwrites regular files.`);
 				} catch (err: any) {
 					if (err?.code !== "ENOENT") throw err;
 					existedBefore = false;
@@ -200,20 +192,20 @@ export function registerWrite(pi: ExtensionAPI, cc: CCContext): void {
 					const rec = cc.fileState.get(absPath);
 					if (!rec || rec.truncated) {
 						if (rec || absPath.toLowerCase().endsWith(".ipynb")) throw new Error(FILE_NOT_READ);
-					} else if (cc.fileState.isStale(absPath, undefined, { contentCheck })) {
+					} else if (await cc.fileState.isStale(absPath, undefined, { contentCheck })) {
 						throw new Error(FILE_MODIFIED_SINCE_READ);
 					}
 				}
 
 				// ---- write ----
-				const existing = await readExistingText(absPath);
+				const existing = await readExistingText(fs, absPath);
 				if (existing?.notText) throw new Error(notTextMessage(existing.notText));
 				const original = existing?.content ?? null;
 				let content = params.content;
 				if (content !== "" && original?.charCodeAt(0) === 0xfeff && content.charCodeAt(0) !== 0xfeff) content = `﻿${content}`;
 				if (signal?.aborted) throw new Error("Operation aborted");
-				await writeText(absPath, content, existing?.encoding ?? "utf8", "LF");
-				cc.fileState.recordWrite(absPath, content);
+				await writeText(fs, absPath, content, existing?.encoding ?? "utf8", "LF");
+				await cc.fileState.recordWrite(absPath, content);
 
 				const text =
 					existing !== null

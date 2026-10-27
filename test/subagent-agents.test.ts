@@ -4,6 +4,7 @@ import { getModel } from "@earendil-works/pi-ai/compat";
 import { ModelRegistry } from "@earendil-works/pi-coding-agent";
 import { createTestModelRuntime } from "./helpers.js";
 import { beforeAll, describe, expect, it } from "vitest";
+import { createLocalHost } from "../src/host/local.js";
 import { agentAllowsTool, BUILT_IN_AGENTS, loadAgentDefinitions, parseAgentMarkdown, parseToolList, toolRuleMatches, toolsLabel } from "../src/subagent/agents.js";
 import { formatAgentListingReminder } from "../src/subagent/agents.js";
 import { foregroundResultText, frameHandback, validateAgentInput } from "../src/subagent/prompt.js";
@@ -14,6 +15,8 @@ function writeAgent(dir: string, file: string, content: string) {
 	mkdirSync(dir, { recursive: true });
 	writeFileSync(join(dir, file), content);
 }
+
+const localFs = createLocalHost().fs;
 
 describe("agent definitions", () => {
 	it("has the built-in agents", () => {
@@ -43,7 +46,7 @@ describe("agent definitions", () => {
 		expect(c.tools).toBeUndefined();
 	});
 
-	it("applies precedence built-in < user < project < options.agents", () => {
+	it("applies precedence built-in < user < project < options.agents", async () => {
 		const home = tempDir("pi-cc-home-");
 		const cwd = tempDir("pi-cc-proj-");
 		writeAgent(join(home, ".claude", "agents"), "a.md", "---\nname: alpha\ndescription: user alpha\n---\nuser alpha prompt");
@@ -53,7 +56,8 @@ describe("agent definitions", () => {
 		writeAgent(join(cwd, ".claude", "agents"), "g.md", "---\nname: gamma\ndescription: project gamma\n---\nproject gamma");
 		writeAgent(join(cwd, ".claude", "agents"), "notes.txt", "ignored");
 
-		const defs = loadAgentDefinitions({
+		const defs = await loadAgentDefinitions({
+			fs: localFs,
 			cwd,
 			homeDir: home,
 			agents: { gamma: { description: "options gamma", prompt: "options gamma prompt", tools: ["Read"] } },
@@ -65,7 +69,7 @@ describe("agent definitions", () => {
 		expect(defs.get("Plan")?.source).toBe("built-in");
 		expect(defs.get("general-purpose")?.source).toBe("built-in");
 
-		const noDisk = loadAgentDefinitions({ cwd, homeDir: home, loadAgentsFromDisk: false });
+		const noDisk = await loadAgentDefinitions({ fs: localFs, cwd, homeDir: home, loadAgentsFromDisk: false });
 		expect([...noDisk.keys()].sort()).toEqual(["Explore", "Plan", "claude", "general-purpose"]);
 	});
 
@@ -74,8 +78,9 @@ describe("agent definitions", () => {
 		expect(a).toMatchObject({ disallowedTools: ["Write", "Edit"], effort: "high", background: true });
 	});
 
-	it("lists agent types like Claude Code's system reminder", () => {
-		const defs = loadAgentDefinitions({
+	it("lists agent types like Claude Code's system reminder", async () => {
+		const defs = await loadAgentDefinitions({
+			fs: localFs,
 			cwd: tempDir(),
 			homeDir: tempDir(),
 			loadAgentsFromDisk: false,
@@ -170,7 +175,7 @@ describe("subagent model resolution", () => {
 describe("agent tool restrictions (review 2026-10-18 #2b/#2c/#2d)", () => {
 	const md = (fm: string) => parseAgentMarkdown(`---\nname: x\ndescription: d\n${fm}\n---\nBody`, "/x/x.md", "project")!;
 
-	it("#2b: an empty tools value means no tools; absent or '*' means all (like Claude Code)", () => {
+	it("#2b: an empty tools value means no tools; absent or '*' means all (like Claude Code)", async () => {
 		expect(parseToolList(undefined)).toBeUndefined();
 		expect(parseToolList([])).toEqual([]);
 		expect(parseToolList("")).toEqual([]);
@@ -182,7 +187,7 @@ describe("agent tool restrictions (review 2026-10-18 #2b/#2c/#2d)", () => {
 		expect(agentAllowsTool(md("tools: []"), "Read")).toBe(false);
 		expect(agentAllowsTool(md("model: haiku"), "Read")).toBe(true);
 
-		const defs = loadAgentDefinitions({ cwd: tempDir(), homeDir: tempDir(), agents: { empty: { description: "d", prompt: "p", tools: [] }, all: { description: "d", prompt: "p" } } });
+		const defs = await loadAgentDefinitions({ fs: localFs, cwd: tempDir(), homeDir: tempDir(), agents: { empty: { description: "d", prompt: "p", tools: [] }, all: { description: "d", prompt: "p" } } });
 		expect(defs.get("empty")!.tools).toEqual([]);
 		expect(defs.get("all")!.tools).toBeUndefined();
 		expect(agentAllowsTool(defs.get("empty")!, "Read")).toBe(false);
@@ -210,7 +215,7 @@ describe("agent tool restrictions (review 2026-10-18 #2b/#2c/#2d)", () => {
 		expect(agentAllowsTool(allow, "Bash")).toBe(false);
 	});
 
-	it('#2c: disallowedTools "*" is ignored by default and removes every tool with the quirk fixed', () => {
+	it('#2c: disallowedTools "*" is ignored by default and removes every tool with the quirk fixed', async () => {
 		const a = md('disallowedTools: "*"');
 		expect(a.disallowedTools).toBeUndefined();
 		expect(a.disallowAll).toBe(true);
@@ -223,7 +228,7 @@ describe("agent tool restrictions (review 2026-10-18 #2b/#2c/#2d)", () => {
 		expect(b.disallowAll).toBeUndefined();
 		expect(agentAllowsTool(b, "Read", { disallowAll: true })).toBe(true);
 		// Agent SDK-style options definitions may carry disallowedTools too
-		const defs = loadAgentDefinitions({ cwd: tempDir(), homeDir: tempDir(), agents: { o: { description: "d", prompt: "p", disallowedTools: ["*"] } as any, w: { description: "d", prompt: "p", disallowedTools: ["Write"] } as any } });
+		const defs = await loadAgentDefinitions({ fs: localFs, cwd: tempDir(), homeDir: tempDir(), agents: { o: { description: "d", prompt: "p", disallowedTools: ["*"] } as any, w: { description: "d", prompt: "p", disallowedTools: ["Write"] } as any } });
 		expect(defs.get("o")!.disallowAll).toBe(true);
 		expect(agentAllowsTool(defs.get("w")!, "Write")).toBe(false);
 		expect(toolsLabel(defs.get("w")!)).toBe("All tools except Write");

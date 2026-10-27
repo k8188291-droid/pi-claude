@@ -4,7 +4,8 @@ import { join } from "node:path";
 import type { ExtensionAPI, ToolDefinition } from "@earendil-works/pi-coding-agent";
 import { beforeEach, describe, expect, it } from "vitest";
 import { createCCContext, type CCContext } from "../src/shared/context.js";
-import { hashFileText, hashFileTextAsync, textHash, TextHasher } from "../src/shared/file-state.js";
+import { createLocalHost } from "../src/host/local.js";
+import { hashFileText, textHash, TextHasher } from "../src/shared/file-state.js";
 import type { Quirk } from "../src/shared/quirks.js";
 import { abortable, registerRead, WASTED_CALL_MESSAGE } from "../src/tools/read.js";
 import { captureTools, fakeCtx, resultText, tempDir } from "./helpers.js";
@@ -87,8 +88,7 @@ describe("streaming text hash", () => {
 			Buffer.alloc(0),
 		]) {
 			const p = file("h.txt", buf);
-			expect(hashFileText(p)).toBe(textHash(buf));
-			expect(await hashFileTextAsync(p)).toBe(textHash(buf));
+			expect(await hashFileText(createLocalHost().fs, p)).toBe(textHash(buf));
 		}
 	});
 });

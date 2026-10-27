@@ -17,6 +17,7 @@ import { registerTask, registerUnknownToolErrors } from "./subagent/index.js";
 
 export * from "./shared/types.js";
 export type * from "./host/types.js";
+export { createLocalHost, type LocalHostOptions } from "./host/local.js";
 export { QUIRKS, type Quirk, type QuirkMode } from "./shared/quirks.js";
 export { createClaudeCodeSession, type CreateClaudeCodeSessionOptions } from "./sdk.js";
 

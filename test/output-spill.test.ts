@@ -11,6 +11,7 @@ import {
 	registerOutputSpill,
 	spillThreshold,
 } from "../src/output-spill.js";
+import { createLocalHost } from "../src/host/local.js";
 import { createCCContext } from "../src/shared/context.js";
 import type { ClaudeCodeHostEvent } from "../src/shared/types.js";
 import { createTestSession, fakeCtx, fauxAssistantMessage, fauxToolCall, tempDir } from "./helpers.js";
@@ -156,13 +157,13 @@ describe("output spill", () => {
 		const root = join(base, `pi-cc-${process.getuid!()}`);
 		mkdirSync(root, { mode: 0o755 });
 		chmodSync(root, 0o755);
-		const dir = await defaultSpillDir("sess", base);
+		const dir = await defaultSpillDir(createLocalHost({ tmpBase: base }), "sess");
 		expect(dir).toBe(join(root, "sess", "tool-results"));
 		expect(statSync(root).mode & 0o777).toBe(0o700);
 
 		const base2 = tempDir();
 		symlinkSync(tempDir(), join(base2, `pi-cc-${process.getuid!()}`));
-		await expect(defaultSpillDir("sess", base2)).rejects.toThrow();
+		await expect(defaultSpillDir(createLocalHost({ tmpBase: base2 }), "sess")).rejects.toThrow();
 	});
 
 	it("writes spill files 0600 in a configured directory too (#10)", async () => {

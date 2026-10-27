@@ -3,6 +3,7 @@ import { closeSync, constants, openSync, readFileSync, readSync, statSync, utime
 import { join } from "node:path";
 import type { ExtensionAPI, ToolDefinition } from "@earendil-works/pi-coding-agent";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { createLocalHost } from "../src/host/local.js";
 import { createCCContext } from "../src/shared/context.js";
 import type { Quirk } from "../src/shared/quirks.js";
 import { registerRead } from "../src/tools/read.js";
@@ -64,22 +65,24 @@ afterEach(() => {
 describe("#7b: no writes into FIFOs", () => {
 	it("writeRegularFile refuses a FIFO, with or without a reader, and writes nothing", async () => {
 		const { path, reader } = fifoWithReader("f.txt");
-		await expect(writeRegularFile(path, "bye")).rejects.toThrow(NOT_A_REGULAR_FILE);
+		const { fs } = createLocalHost();
+		await expect(writeRegularFile(fs, path, "bye")).rejects.toThrow(NOT_A_REGULAR_FILE);
 		expect(pending(reader)).toBe("");
 		closeSync(fds.pop()!);
-		await expect(writeRegularFile(path, "bye")).rejects.toThrow(NOT_A_REGULAR_FILE); // ENXIO: no reader
+		await expect(writeRegularFile(fs, path, "bye")).rejects.toThrow(NOT_A_REGULAR_FILE); // ENXIO: no reader
 	});
 
 	it("readExistingText refuses a FIFO without blocking", async () => {
 		const path = join(dir, "r.txt");
 		execFileSync("mkfifo", [path]);
-		await expect(readExistingText(path)).rejects.toThrow(NOT_A_REGULAR_FILE);
+		await expect(readExistingText(createLocalHost().fs, path)).rejects.toThrow(NOT_A_REGULAR_FILE);
 	});
 
 	it("writeRegularFile creates and truncates regular files", async () => {
 		const p = join(dir, "new.txt");
-		await writeRegularFile(p, "a long first version\n");
-		await writeRegularFile(p, "short\n");
+		const { fs } = createLocalHost();
+		await writeRegularFile(fs, p, "a long first version\n");
+		await writeRegularFile(fs, p, "short\n");
 		expect(readFileSync(p, "utf8")).toBe("short\n");
 	});
 

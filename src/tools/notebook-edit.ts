@@ -1,5 +1,4 @@
 import { randomUUID } from "node:crypto";
-import { stat } from "node:fs/promises";
 import { extname } from "node:path";
 import { withFileMutationQueue, type ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import type { CCContext } from "../shared/context.js";
@@ -143,6 +142,7 @@ export function registerNotebookEdit(pi: ExtensionAPI, cc: CCContext): void {
 			const contentCheck = isFixed(cc, "mtimeOnlyChangeDetection");
 			const sizeFirst = isFixed(cc, "notebookStaleBeforeSize");
 			const fixCellFields = isFixed(cc, "notebookCellTypeConversion");
+			const fs = cc.host.fs;
 
 			return withFileMutationQueue(absPath, async () => {
 				// ---- validation (Claude Code's validateInput order) ----
@@ -154,7 +154,7 @@ export function registerNotebookEdit(pi: ExtensionAPI, cc: CCContext): void {
 				// Claude Code checks staleness first.
 				const checkSize = async () => {
 					try {
-						const st = await stat(absPath);
+						const st = await fs.stat(absPath);
 						if (st.size > MAX_NOTEBOOK_BYTES) throw new NotebookEditError(NOTEBOOK_MESSAGES.tooLarge);
 					} catch (err: any) {
 						if (err?.code === "ENOENT") throw new NotebookEditError(NOTEBOOK_MESSAGES.missing);
@@ -162,12 +162,12 @@ export function registerNotebookEdit(pi: ExtensionAPI, cc: CCContext): void {
 					}
 				};
 				if (sizeFirst) await checkSize();
-				if (cc.fileState.isStale(absPath, undefined, { contentCheck })) throw new NotebookEditError(NOTEBOOK_MESSAGES.modified);
+				if (await cc.fileState.isStale(absPath, undefined, { contentCheck })) throw new NotebookEditError(NOTEBOOK_MESSAGES.modified);
 				if (!sizeFirst) await checkSize();
 				let raw: string;
 				try {
-					// Opened non-blocking and fstat-checked: a FIFO or device is refused, never read or written.
-					raw = (await readRegularFile(absPath)).toString("utf8");
+					// Checked before reading: a FIFO or device is refused, never read or written.
+					raw = (await readRegularFile(fs, absPath)).toString("utf8");
 				} catch (err: any) {
 					if (err?.code === "ENOENT") throw new NotebookEditError(NOTEBOOK_MESSAGES.missing);
 					if (err instanceof NotRegularFileError) throw new NotebookEditError(NOTEBOOK_MESSAGES.notRegular);
@@ -246,12 +246,12 @@ export function registerNotebookEdit(pi: ExtensionAPI, cc: CCContext): void {
 				}
 				if (signal?.aborted) throw new Error("Operation aborted");
 				try {
-					await writeRegularFile(absPath, out);
+					await writeRegularFile(fs, absPath, out);
 				} catch (err) {
 					if (err instanceof NotRegularFileError) throw new NotebookEditError(NOTEBOOK_MESSAGES.notRegular);
 					throw err;
 				}
-				cc.fileState.recordWrite(absPath, out);
+				await cc.fileState.recordWrite(absPath, out);
 				const resultMode = effectiveMode ?? "replace";
 				const resultCellId = newCellId || undefined;
 				return textResult<NotebookEditDetails>(resultText(resultMode, resultCellId, new_source), {

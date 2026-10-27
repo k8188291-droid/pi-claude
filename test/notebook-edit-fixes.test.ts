@@ -19,10 +19,10 @@ function setup(fixed: Quirk[] = []) {
 	const cc = createCCContext({ quirks: Object.fromEntries(fixed.map((q) => [q, "fixed"])) });
 	const { tools } = captureTools((pi) => registerNotebookEdit(pi, cc));
 	const tool = tools.get("NotebookEdit")!;
-	const write = (name: string, content: string, read = true) => {
+	const write = async (name: string, content: string, read = true) => {
 		const p = join(cwd, name);
 		writeFileSync(p, content);
-		if (read) cc.fileState.recordRead(p, readFileSync(p));
+		if (read) await cc.fileState.recordRead(p, readFileSync(p));
 		return p;
 	};
 	const run = async (params: Record<string, unknown>) => {
@@ -42,7 +42,7 @@ function rewriteKeepingMtime(p: string, content: string): void {
 describe("#27 notebookCellTypeConversion", () => {
 	it("default: fields are kept/dropped like Claude Code", async () => {
 		const { write, run, cells } = setup();
-		write("a.ipynb", nb([code("aa", "print(1)"), md("bb", "# H")]));
+		await write("a.ipynb", nb([code("aa", "print(1)"), md("bb", "# H")]));
 		await run({ notebook_path: "a.ipynb", cell_id: "aa", new_source: "## md", cell_type: "markdown" });
 		await run({ notebook_path: "a.ipynb", cell_id: "bb", new_source: "y = 2", cell_type: "code" });
 		expect(cells("a.ipynb")).toEqual([
@@ -53,7 +53,7 @@ describe("#27 notebookCellTypeConversion", () => {
 
 	it("fixed: markdown cells lose outputs/execution_count, code cells get cleared ones (nbformat 4)", async () => {
 		const { write, run, cells } = setup(["notebookCellTypeConversion"]);
-		write("a.ipynb", nb([code("aa", "print(1)"), md("bb", "# H"), code("cc", "z")]));
+		await write("a.ipynb", nb([code("aa", "print(1)"), md("bb", "# H"), code("cc", "z")]));
 		await run({ notebook_path: "a.ipynb", cell_id: "aa", new_source: "## md", cell_type: "markdown" });
 		await run({ notebook_path: "a.ipynb", cell_id: "bb", new_source: "y = 2", cell_type: "code" });
 		await run({ notebook_path: "a.ipynb", cell_id: "cc", new_source: "w" });
@@ -71,7 +71,7 @@ describe("#5 mtimeOnlyChangeDetection (NotebookEdit)", () => {
 
 	it("default: overwrites a notebook rewritten with its mtime restored, like Claude Code", async () => {
 		const { write, run, cells } = setup();
-		const p = write("a.ipynb", before);
+		const p = await write("a.ipynb", before);
 		rewriteKeepingMtime(p, external);
 		await run({ notebook_path: "a.ipynb", cell_id: "aa", new_source: "print(3)" });
 		expect(cells("a.ipynb")[0].source).toBe("print(3)");
@@ -79,7 +79,7 @@ describe("#5 mtimeOnlyChangeDetection (NotebookEdit)", () => {
 
 	it("fixed: the content change is detected", async () => {
 		const { write, run, cells } = setup(["mtimeOnlyChangeDetection"]);
-		const p = write("a.ipynb", before);
+		const p = await write("a.ipynb", before);
 		rewriteKeepingMtime(p, external);
 		await expect(run({ notebook_path: "a.ipynb", cell_id: "aa", new_source: "print(3)" })).rejects.toThrow(NOTEBOOK_MESSAGES.modified);
 		expect(cells("a.ipynb")[0].source).toBe("print(2)");
@@ -92,7 +92,7 @@ describe("#6b notebookStaleBeforeSize", () => {
 
 	it("default: the staleness check (reading the whole file) comes first, like Claude Code", async () => {
 		const { write, run } = setup();
-		const p = write("big.ipynb", nb([code("aa", "small")]));
+		const p = await write("big.ipynb", nb([code("aa", "small")]));
 		writeFileSync(p, huge());
 		utimesSync(p, new Date(), new Date(Date.now() + 5000));
 		await expect(run({ notebook_path: "big.ipynb", cell_id: "aa", new_source: "y" })).rejects.toThrow(NOTEBOOK_MESSAGES.modified);
@@ -100,7 +100,7 @@ describe("#6b notebookStaleBeforeSize", () => {
 
 	it("fixed: the size check (a stat) comes first", async () => {
 		const { write, run } = setup(["notebookStaleBeforeSize"]);
-		const p = write("big.ipynb", nb([code("aa", "small")]));
+		const p = await write("big.ipynb", nb([code("aa", "small")]));
 		writeFileSync(p, huge());
 		utimesSync(p, new Date(), new Date(Date.now() + 5000));
 		await expect(run({ notebook_path: "big.ipynb", cell_id: "aa", new_source: "y" })).rejects.toThrow(NOTEBOOK_MESSAGES.tooLarge);
@@ -112,7 +112,7 @@ describe("FIFOs", () => {
 		const { cwd, cc, run } = setup();
 		const p = join(cwd, "f.ipynb");
 		execFileSync("mkfifo", [p]);
-		cc.fileState.recordRead(p, "");
+		await cc.fileState.recordRead(p, "");
 		await expect(run({ notebook_path: "f.ipynb", cell_id: "aa", new_source: "y" })).rejects.toThrow(NOTEBOOK_MESSAGES.notRegular);
 	});
 });
@@ -120,14 +120,14 @@ describe("FIFOs", () => {
 describe("#8 pathTrim (NotebookEdit)", () => {
 	it("default: 'a.ipynb ' edits 'a.ipynb'", async () => {
 		const { write, run, cells } = setup();
-		write("a.ipynb", nb([code("aa", "1")]));
+		await write("a.ipynb", nb([code("aa", "1")]));
 		await run({ notebook_path: "a.ipynb ", cell_id: "aa", new_source: "2" });
 		expect(cells("a.ipynb")[0].source).toBe("2");
 	});
 
 	it("fixed: the path is used verbatim; an empty path is rejected", async () => {
 		const { cwd, write, run, cells } = setup(["pathTrim"]);
-		write("a.ipynb", nb([code("aa", "1")]));
+		await write("a.ipynb", nb([code("aa", "1")]));
 		await expect(run({ notebook_path: "a.ipynb ", cell_id: "aa", new_source: "2" })).rejects.toThrow(NOTEBOOK_MESSAGES.notNotebook);
 		expect(cells("a.ipynb")[0].source).toBe("1");
 		const { tools } = captureTools((pi) => registerNotebookEdit(pi, createCCContext({ quirks: { pathTrim: "fixed" } })));

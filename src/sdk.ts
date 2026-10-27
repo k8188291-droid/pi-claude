@@ -8,9 +8,9 @@ import {
 	ModelRuntime,
 } from "@earendil-works/pi-coding-agent";
 import { createClaudeCodeExtension } from "./index.js";
-import type { ClaudeCodeToolsOptions } from "./shared/types.js";
+import type { ClaudeCodeToolsOptions, ResourceLoaderOptions, SubagentResourceLoaderFactory } from "./shared/types.js";
 
-type LoaderOptions = ConstructorParameters<typeof DefaultResourceLoader>[0];
+type LoaderOptions = ResourceLoaderOptions;
 
 export interface CreateClaudeCodeSessionOptions extends Omit<CreateAgentSessionOptions, "resourceLoader" | "noTools"> {
 	/** Options for the Claude Code tools. */
@@ -19,6 +19,11 @@ export interface CreateClaudeCodeSessionOptions extends Omit<CreateAgentSessionO
 	toolSearch?: boolean;
 	/** Extra DefaultResourceLoader options (extensionFactories are appended after ours). */
 	loader?: Partial<Omit<LoaderOptions, "cwd" | "agentDir">>;
+	/**
+	 * Builds the resource loader from the options above instead of `new DefaultResourceLoader(...)`
+	 * (subagent sessions pass `claudeCode.subagentResourceLoader` here). Default: DefaultResourceLoader.
+	 */
+	resourceLoaderFactory?: SubagentResourceLoaderFactory;
 }
 
 /**
@@ -26,12 +31,12 @@ export interface CreateClaudeCodeSessionOptions extends Omit<CreateAgentSessionO
  * extension installed, and pi's tool_search extension for deferred tools.
  */
 export async function createClaudeCodeSession(opts: CreateClaudeCodeSessionOptions = {}): Promise<CreateAgentSessionResult> {
-	const { claudeCode, toolSearch = true, loader: loaderOpts, ...sessionOpts } = opts;
+	const { claudeCode, toolSearch = true, loader: loaderOpts, resourceLoaderFactory, ...sessionOpts } = opts;
 	const cwd = sessionOpts.cwd ?? process.cwd();
 	const agentDir = sessionOpts.agentDir ?? getAgentDir();
 	// Created here (instead of inside createAgentSession) so subagent sessions can share it.
 	const modelRuntime = sessionOpts.modelRuntime ?? claudeCode?.modelRuntime ?? (await ModelRuntime.create());
-	const loader = new DefaultResourceLoader({
+	const loaderOptions: LoaderOptions = {
 		...loaderOpts,
 		cwd,
 		agentDir,
@@ -41,7 +46,8 @@ export async function createClaudeCodeSession(opts: CreateClaudeCodeSessionOptio
 			...(toolSearch ? [createToolSearchExtension()] : []),
 			...(loaderOpts?.extensionFactories ?? []),
 		],
-	});
+	};
+	const loader = resourceLoaderFactory ? await resourceLoaderFactory(loaderOptions) : new DefaultResourceLoader(loaderOptions);
 	await loader.reload();
 	return createAgentSession({ ...sessionOpts, cwd, agentDir, modelRuntime, resourceLoader: loader, noTools: "builtin" });
 }

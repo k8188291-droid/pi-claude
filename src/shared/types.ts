@@ -1,5 +1,11 @@
 import type { Model } from "@earendil-works/pi-ai";
-import type { ExtensionFactory, ModelRuntime } from "@earendil-works/pi-coding-agent";
+import type { DefaultResourceLoader, ExtensionFactory, ModelRuntime, ResourceLoader } from "@earendil-works/pi-coding-agent";
+
+/** What pi's `DefaultResourceLoader` is constructed with. */
+export type ResourceLoaderOptions = ConstructorParameters<typeof DefaultResourceLoader>[0];
+
+/** Builds a session's resource loader (see `ClaudeCodeToolsOptions.subagentResourceLoader`). */
+export type SubagentResourceLoaderFactory = (options: ResourceLoaderOptions) => ResourceLoader | Promise<ResourceLoader>;
 
 /** One question passed to AskUserQuestion (Claude Code-compatible shape). */
 export interface AskUserQuestionItem {
@@ -76,7 +82,7 @@ export interface OutputSpillOptions {
 	maxChars?: number;
 	/** Characters of preview kept inline when spilling. Default 2000. */
 	previewChars?: number;
-	/** Directory where spilled outputs are written. Default: <os.tmpdir()>/pi-cc-<uid>/<sessionId>/tool-results (private: 0700 dirs, 0600 files). */
+	/** Directory where spilled outputs are written (on the host). Default: <host.tmpDir>/<sessionId>/tool-results, locally <os.tmpdir()>/pi-cc-<uid>/<sessionId>/tool-results (private: 0700 dirs, 0600 files). */
 	dir?: string;
 	/** Tool names excluded from spilling (Read is always excluded to avoid loops). */
 	exclude?: string[];
@@ -103,6 +109,16 @@ export interface ClaudeCodeToolsOptions {
 	 * MCP tools). The Claude Code tools themselves are always installed.
 	 */
 	subagentExtensions?: ExtensionFactory[];
+	/**
+	 * Advanced: builds each subagent session's resource loader in place of pi's
+	 * `DefaultResourceLoader`, which reads settings, `~/.pi/agent` and context files (AGENTS.md /
+	 * CLAUDE.md) from the real disk — supply this when the session runs on a non-local `host`. It
+	 * receives exactly the options `DefaultResourceLoader` would get (cwd, agentDir, the extension
+	 * factories that install the Claude Code tools, the system prompt overrides, noContextFiles, ...)
+	 * and must honour them; `reload()` is called on the returned loader. Nested subagents use it too.
+	 * Default: `new DefaultResourceLoader(options)`.
+	 */
+	subagentResourceLoader?: SubagentResourceLoaderFactory;
 	/** Enable the Task tool. Default true. */
 	subagents?: boolean;
 	/**

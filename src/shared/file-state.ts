@@ -1,7 +1,7 @@
 import { createHash, type Hash } from "node:crypto";
-import { closeSync, constants as fsConstants, fstatSync, openSync, readSync, statSync } from "node:fs";
-import { open } from "node:fs/promises";
 import { StringDecoder } from "node:string_decoder";
+import type { HostFileSystem } from "../host/types.js";
+import { asBuffer } from "./background.js";
 
 /**
  * What the model has seen of a file, mirroring Claude Code's `readFileState` entries.
@@ -127,32 +127,22 @@ const NOT_A_REGULAR_FILE = "not-a-regular-file";
 const HASH_CHUNK_BYTES = 524288;
 
 /**
- * `textHash` of a file's current content, read in chunks (bounded memory). The file is opened
- * non-blocking and must be a regular file: a FIFO or device never blocks this and never matches.
+ * `textHash` of a file's current content, read in chunks (bounded memory). The file must be a
+ * regular file: a FIFO or device is never read (so never blocks this) and never matches.
  */
-export function hashFileText(absPath: string): string {
-	const fd = openSync(absPath, fsConstants.O_RDONLY | (fsConstants.O_NONBLOCK ?? 0));
-	try {
-		if (!fstatSync(fd).isFile()) return NOT_A_REGULAR_FILE;
-		const buf = Buffer.allocUnsafe(HASH_CHUNK_BYTES);
-		const hasher = new TextHasher();
-		let decoder: StringDecoder | undefined;
-		for (;;) {
-			const n = readSync(fd, buf, 0, HASH_CHUNK_BYTES, null);
-			if (n === 0) break;
-			const chunk = buf.subarray(0, n);
-			decoder ??= decoderFor(chunk);
-			hasher.update(decoder.write(chunk));
-		}
-		if (decoder) hasher.update(decoder.end());
-		return hasher.digest();
-	} finally {
-		closeSync(fd);
+export async function hashFileText(fs: HostFileSystem, absPath: string): Promise<string> {
+	if (!(await fs.stat(absPath)).isFile) return NOT_A_REGULAR_FILE;
+	const hasher = new TextHasher();
+	let decoder: StringDecoder | undefined;
+	for (let pos = 0; ; ) {
+		const chunk = asBuffer(await fs.readRange(absPath, pos, HASH_CHUNK_BYTES));
+		if (chunk.length === 0) break;
+		pos += chunk.length;
+		decoder ??= decoderFor(chunk);
+		hasher.update(decoder.write(chunk));
 	}
-}
-
-function mtimeOf(absPath: string): number {
-	return Math.floor(statSync(absPath).mtimeMs);
+	if (decoder) hasher.update(decoder.end());
+	return hasher.digest();
 }
 
 /**
@@ -162,13 +152,19 @@ function mtimeOf(absPath: string): number {
 export class FileStateTracker {
 	private records = new Map<string, FileRecord>();
 
+	constructor(private readonly fs: HostFileSystem) {}
+
+	private async mtimeOf(absPath: string): Promise<number> {
+		return Math.floor((await this.fs.stat(absPath)).mtimeMs);
+	}
+
 	/**
 	 * Record a read. Pass the whole file content (Buffer or text) so it can be hashed, or its
 	 * precomputed `textHash` when the file was streamed.
 	 */
-	recordRead(absPath: string, content: string | Buffer | PrecomputedHash, opts: RecordReadOptions = {}): void {
+	async recordRead(absPath: string, content: string | Buffer | PrecomputedHash, opts: RecordReadOptions = {}): Promise<void> {
 		this.records.set(absPath, {
-			timestamp: mtimeOf(absPath),
+			timestamp: await this.mtimeOf(absPath),
 			hash: typeof content === "string" || Buffer.isBuffer(content) ? textHash(content) : content.hash,
 			partial: !!opts.partial,
 			truncated: !!opts.truncated,
@@ -180,9 +176,9 @@ export class FileStateTracker {
 	}
 
 	/** Record that a tool just wrote `content` to absPath. */
-	recordWrite(absPath: string, content: string | Buffer, opts: RecordWriteOptions = {}): void {
+	async recordWrite(absPath: string, content: string | Buffer, opts: RecordWriteOptions = {}): Promise<void> {
 		this.records.set(absPath, {
-			timestamp: mtimeOf(absPath),
+			timestamp: await this.mtimeOf(absPath),
 			hash: textHash(content),
 			partial: false,
 			truncated: !!opts.truncated,
@@ -223,19 +219,19 @@ export class FileStateTracker {
 	 * for full views, its text differs. `currentText` avoids re-reading the file. With
 	 * `contentCheck` (#5 fixed) only the text decides.
 	 */
-	isStale(absPath: string, currentText?: string | Buffer, opts: ChangeCheckOptions = {}): boolean {
+	async isStale(absPath: string, currentText?: string | Buffer, opts: ChangeCheckOptions = {}): Promise<boolean> {
 		const rec = this.records.get(absPath);
 		if (!rec) return false;
 		let mtime: number;
 		try {
-			mtime = mtimeOf(absPath);
+			mtime = await this.mtimeOf(absPath);
 		} catch {
 			return false;
 		}
-		if (opts.contentCheck) return rec.hash !== (currentText !== undefined ? textHash(currentText) : hashFileText(absPath));
+		if (opts.contentCheck) return rec.hash !== (currentText !== undefined ? textHash(currentText) : await hashFileText(this.fs, absPath));
 		if (mtime <= rec.timestamp) return false;
 		if (!FileStateTracker.isFullView(rec)) return true;
-		return currentText !== undefined ? !FileStateTracker.sameContent(rec, currentText) : rec.hash !== hashFileText(absPath);
+		return currentText !== undefined ? !FileStateTracker.sameContent(rec, currentText) : rec.hash !== (await hashFileText(this.fs, absPath));
 	}
 
 	/**
@@ -243,50 +239,28 @@ export class FileStateTracker {
 	 * fine, truncated views and files changed since they were read are not.
 	 * Returns undefined when OK, or an error message for the model.
 	 */
-	checkCanModify(absPath: string, opts: ChangeCheckOptions = {}): string | undefined {
+	async checkCanModify(absPath: string, opts: ChangeCheckOptions = {}): Promise<string | undefined> {
 		try {
-			statSync(absPath);
+			await this.fs.stat(absPath);
 		} catch {
 			return undefined; // new file
 		}
 		const rec = this.records.get(absPath);
 		if (rec?.truncated) return FILE_NOT_READ;
-		if (rec && this.isStale(absPath, undefined, opts)) return FILE_MODIFIED_SINCE_READ;
+		if (rec && (await this.isStale(absPath, undefined, opts))) return FILE_MODIFIED_SINCE_READ;
 		return undefined;
 	}
 
 	/** Paths recorded so far whose on-disk content changed since (for change reminders). */
-	changedSinceRead(opts: ChangeCheckOptions = {}): string[] {
+	async changedSinceRead(opts: ChangeCheckOptions = {}): Promise<string[]> {
 		const out: string[] = [];
-		for (const p of this.records.keys()) {
+		for (const p of [...this.records.keys()]) {
 			try {
-				if (this.isStale(p, undefined, opts)) out.push(p);
+				if (await this.isStale(p, undefined, opts)) out.push(p);
 			} catch {
 				out.push(p);
 			}
 		}
 		return out;
-	}
-}
-
-/** Async `hashFileText` (bounded memory, does not block the event loop on a large file). */
-export async function hashFileTextAsync(absPath: string): Promise<string> {
-	const fh = await open(absPath, fsConstants.O_RDONLY | (fsConstants.O_NONBLOCK ?? 0));
-	try {
-		if (!(await fh.stat()).isFile()) return NOT_A_REGULAR_FILE;
-		const buf = Buffer.allocUnsafe(HASH_CHUNK_BYTES);
-		const hasher = new TextHasher();
-		let decoder: StringDecoder | undefined;
-		for (;;) {
-			const { bytesRead } = await fh.read(buf, 0, HASH_CHUNK_BYTES, null);
-			if (bytesRead === 0) break;
-			const chunk = buf.subarray(0, bytesRead);
-			decoder ??= decoderFor(chunk);
-			hasher.update(decoder.write(chunk));
-		}
-		if (decoder) hasher.update(decoder.end());
-		return hasher.digest();
-	} finally {
-		await fh.close();
 	}
 }

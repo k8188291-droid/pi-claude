@@ -1,7 +1,7 @@
-import { lstat, stat } from "node:fs/promises";
 import { basename, dirname, isAbsolute, join, resolve, sep } from "node:path";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Type, type Static } from "typebox";
+import type { ClaudeCodeHost, HostFileSystem } from "../host/types.js";
 import type { CCContext } from "../shared/context.js";
 import { resolvePath } from "../shared/paths.js";
 import { textResult } from "../shared/text.js";
@@ -88,13 +88,13 @@ export function stripRepeatedDirPrefix(pattern: string, searchDir: string): stri
 }
 
 /** True when every segment exists under `dir` as a real (non-symlink) directory. */
-async function prefixIsRealDir(dir: string, segs: string[]): Promise<boolean> {
+async function prefixIsRealDir(fs: HostFileSystem, dir: string, segs: string[]): Promise<boolean> {
 	let p = dir;
 	for (const s of segs) {
 		p = join(p, s);
 		try {
-			const st = await lstat(p);
-			if (!st.isDirectory() || st.isSymbolicLink()) return false;
+			const st = await fs.lstat(p);
+			if (!st.isDirectory || st.isSymbolicLink) return false;
 		} catch {
 			return false;
 		}
@@ -103,6 +103,7 @@ async function prefixIsRealDir(dir: string, segs: string[]): Promise<boolean> {
 }
 
 export async function executeGlob(
+	host: ClaudeCodeHost,
 	params: GlobParams,
 	cwd: string,
 	signal?: AbortSignal,
@@ -113,17 +114,18 @@ export async function executeGlob(
 	if (signal?.aborted) throw new Error("Operation aborted");
 
 	const abs = splitAbsolutePattern(params.pattern);
-	const searchDir = abs ? resolve(abs.baseDir) : params.path ? resolvePath(cwd, params.path, { trim: !options.exactPaths }) : resolve(cwd);
+	const pathOpts = { homeDir: host.homeDir, trim: !options.exactPaths };
+	const searchDir = abs ? resolve(abs.baseDir) : params.path ? resolvePath(cwd, params.path, pathOpts) : resolve(cwd);
 
 	// The path parameter is validated only when it is the directory searched.
-	if (params.path && searchDir === resolvePath(cwd, params.path, { trim: !options.exactPaths })) {
+	if (params.path && searchDir === resolvePath(cwd, params.path, pathOpts)) {
 		let st;
 		try {
-			st = await stat(searchDir);
+			st = await host.fs.stat(searchDir);
 		} catch {
-			throw new Error(missingPathMessage("Directory", params.path, searchDir, cwd));
+			throw new Error(await missingPathMessage(host.fs, "Directory", params.path, searchDir, cwd));
 		}
-		if (!st.isDirectory()) throw new Error(`Path is not a directory: ${params.path}`);
+		if (!st.isDirectory) throw new Error(`Path is not a directory: ${params.path}`);
 	}
 
 	let pattern = abs ? abs.relativePattern : params.pattern;
@@ -132,14 +134,14 @@ export async function executeGlob(
 		if (stripped !== pattern) {
 			const restSegs = stripped.replace(/^\//, "").split("/").length;
 			const segs = pattern.split("/");
-			if (!(await prefixIsRealDir(searchDir, segs.slice(0, Math.max(1, segs.length - restSegs))))) pattern = stripped;
+			if (!(await prefixIsRealDir(host.fs, searchDir, segs.slice(0, Math.max(1, segs.length - restSegs))))) pattern = stripped;
 		}
 	}
 
 	const details: GlobDetails = { durationMs: 0, numFiles: 0, filenames: [], truncated: false, totalMatches: 0, countIsComplete: true };
 	let isDir = false;
 	try {
-		isDir = (await stat(searchDir)).isDirectory();
+		isDir = (await host.fs.stat(searchDir)).isDirectory;
 	} catch {
 		details.durationMs = Date.now() - start;
 		return { text: "No files found", details };
@@ -149,7 +151,7 @@ export async function executeGlob(
 	if (envFlag("CLAUDE_CODE_GLOB_NO_IGNORE", true)) args.push("--no-ignore");
 	if (envFlag("CLAUDE_CODE_GLOB_HIDDEN", true)) args.push("--hidden");
 	args.push(isDir ? "." : searchDir);
-	const run = await runRipgrep(args, isDir ? searchDir : dirname(searchDir), signal);
+	const run = await runRipgrep(host, args, isDir ? searchDir : dirname(searchDir), signal);
 	if (signal?.aborted) throw new Error("Operation aborted");
 
 	const toAbs = (p: string) => (isDir ? join(searchDir, p.startsWith("./") ? p.slice(2) : p) : p);
@@ -176,7 +178,7 @@ export function registerGlob(pi: ExtensionAPI, cc: CCContext): void {
 		promptSnippet: 'Find files by glob pattern (e.g. "**/*.ts"), oldest first',
 		parameters: globSchema,
 		async execute(_toolCallId, params, signal, _onUpdate, ctx) {
-			const { text, details } = await executeGlob(params, ctx.cwd, signal, {
+			const { text, details } = await executeGlob(cc.host, params, ctx.cwd, signal, {
 				surfacePathErrors: isFixed(cc, "searchPermissionErrors"),
 				exactPaths: isFixed(cc, "pathTrim"),
 			});

@@ -1,8 +1,8 @@
-import { existsSync, readdirSync, readFileSync, statSync } from "node:fs";
-import { homedir } from "node:os";
 import { basename, join } from "node:path";
 import type { Model } from "@earendil-works/pi-ai";
 import { parseFrontmatter } from "@earendil-works/pi-coding-agent";
+import type { HostFileSystem } from "../host/types.js";
+import { asBuffer } from "../shared/background.js";
 import type { AgentDefinition } from "../shared/types.js";
 
 export type AgentSource = "built-in" | "user" | "project" | "options";
@@ -253,11 +253,13 @@ export function parseAgentMarkdown(content: string, filePath: string, source: Ag
 	};
 }
 
-export function loadAgentsFromDir(dir: string, source: AgentSource): SubagentDefinition[] {
-	if (!existsSync(dir)) return [];
+export async function loadAgentsFromDir(fs: HostFileSystem, dir: string, source: AgentSource): Promise<SubagentDefinition[]> {
 	let entries: string[];
 	try {
-		entries = readdirSync(dir).filter((f) => f.endsWith(".md")).sort();
+		entries = (await fs.readdir(dir))
+			.map((e) => e.name)
+			.filter((f) => f.endsWith(".md"))
+			.sort();
 	} catch {
 		return [];
 	}
@@ -265,8 +267,8 @@ export function loadAgentsFromDir(dir: string, source: AgentSource): SubagentDef
 	for (const file of entries) {
 		const p = join(dir, file);
 		try {
-			if (!statSync(p).isFile()) continue;
-			const def = parseAgentMarkdown(readFileSync(p, "utf8"), p, source);
+			if (!(await fs.stat(p)).isFile) continue;
+			const def = parseAgentMarkdown(asBuffer(await fs.readFile(p)).toString("utf8"), p, source);
 			if (def) out.push(def);
 		} catch {
 			// unreadable file: skip
@@ -293,26 +295,27 @@ function fromOptions(name: string, def: AgentDefinition): SubagentDefinition {
 }
 
 export interface LoadAgentsOptions {
+	/** The host filesystem agent files are read from. */
+	fs: HostFileSystem;
+	/** The host's home directory (`~/.claude/agents`). */
+	homeDir: string;
 	cwd: string;
 	agents?: Record<string, AgentDefinition>;
 	loadAgentsFromDisk?: boolean;
-	/** Override for tests. Default: os.homedir(). */
-	homeDir?: string;
 }
 
 /**
  * Resolve all agent definitions. Precedence (later wins):
  * built-in < ~/.claude/agents < <cwd>/.claude/agents < options.agents.
  */
-export function loadAgentDefinitions(opts: LoadAgentsOptions): Map<string, SubagentDefinition> {
+export async function loadAgentDefinitions(opts: LoadAgentsOptions): Promise<Map<string, SubagentDefinition>> {
 	const map = new Map<string, SubagentDefinition>();
 	for (const def of Object.values(BUILT_IN_AGENTS)) map.set(def.name, def);
 	if (opts.loadAgentsFromDisk !== false) {
-		const home = opts.homeDir ?? homedir();
-		const userDir = join(home, ".claude", "agents");
+		const userDir = join(opts.homeDir, ".claude", "agents");
 		const projectDir = join(opts.cwd, ".claude", "agents");
-		for (const def of loadAgentsFromDir(userDir, "user")) map.set(def.name, def);
-		if (projectDir !== userDir) for (const def of loadAgentsFromDir(projectDir, "project")) map.set(def.name, def);
+		for (const def of await loadAgentsFromDir(opts.fs, userDir, "user")) map.set(def.name, def);
+		if (projectDir !== userDir) for (const def of await loadAgentsFromDir(opts.fs, projectDir, "project")) map.set(def.name, def);
 	}
 	for (const [name, def] of Object.entries(opts.agents ?? {})) map.set(name, fromOptions(name, def));
 	return map;
