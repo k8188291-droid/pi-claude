@@ -83,6 +83,11 @@ export interface OutputSpillOptions {
 }
 
 export interface ClaudeCodeToolsOptions {
+	/**
+	 * Where the tools run: filesystem, shell and search. Default: the local machine. Pass a memory
+	 * host to keep every tool inside an in-memory filesystem. Subagents share the parent's host.
+	 */
+	host?: import("../host/types.js").ClaudeCodeHost;
 	/** Host callback for AskUserQuestion. Without it, the tool returns an error to the model. */
 	onAskUserQuestion?: (questions: AskUserQuestionItem[], ctx: { signal?: AbortSignal; toolCallId: string }) => Promise<AskUserQuestionAnswers | AskUserQuestionReply>;
 	/** Receives host-facing notifications (todos, background shells, subagents, ...). */
