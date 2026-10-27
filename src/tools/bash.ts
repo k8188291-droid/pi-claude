@@ -1,17 +1,16 @@
 import { randomBytes } from "node:crypto";
-import { closeSync, existsSync, openSync, readFileSync, realpathSync, rmSync, statSync, writeSync } from "node:fs";
-import { tmpdir } from "node:os";
 import { dirname, isAbsolute, join, relative } from "node:path";
 import type { AgentToolResult, ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
-import { newTaskId, type BackgroundTask } from "../shared/background.js";
+import type { HostFileSystem, HostProcess, HostProcessExit } from "../host/types.js";
+import { asBuffer, FileAppender, newTaskId, type BackgroundTask } from "../shared/background.js";
 import type { CCContext } from "../shared/context.js";
 import { formatTaskNotification } from "../shared/notifications.js";
 import { isFixed } from "../shared/quirks.js";
 import { formatPersistedOutput, makePreview } from "../output-spill.js";
 import { textResult } from "../shared/text.js";
 import { claudeInputValidator, type Spec } from "./input-validation.js";
-import { OutputBuffer, buildScript, formatClaudeDuration, spawnShell, type SpawnedShell } from "./bash-process.js";
+import { OutputBuffer, buildScript, formatClaudeDuration } from "./bash-process.js";
 
 const DEFAULT_TIMEOUT_MS = 120_000;
 const MAX_TIMEOUT_MS = 600_000;
@@ -300,29 +299,38 @@ function escapeXml(s: string): string {
 }
 
 /** Claude Code's exit code for a process that ended by signal. */
-function exitCodeOf(exit: { exitCode: number | null; signal: NodeJS.Signals | null }): number {
+function exitCodeOf(exit: HostProcessExit): number {
 	if (exit.exitCode !== null) return exit.exitCode;
 	return exit.signal === "SIGTERM" ? 144 : 1;
 }
 
-function isDir(p: string): boolean {
+async function isDir(fs: HostFileSystem, p: string): Promise<boolean> {
 	try {
-		return statSync(p).isDirectory();
+		return (await fs.stat(p)).isDirectory;
 	} catch {
 		return false;
 	}
 }
 
-function isGitRepo(dir: string): boolean {
+async function exists(fs: HostFileSystem, p: string): Promise<boolean> {
+	try {
+		await fs.stat(p);
+		return true;
+	} catch {
+		return false;
+	}
+}
+
+async function isGitRepo(fs: HostFileSystem, dir: string): Promise<boolean> {
 	for (let d = dir; ; d = dirname(d)) {
-		if (existsSync(join(d, ".git"))) return true;
+		if (await exists(fs, join(d, ".git"))) return true;
 		if (dirname(d) === d) return false;
 	}
 }
 
-function realpathOr(p: string): string {
+async function realpathOr(fs: HostFileSystem, p: string): Promise<string> {
 	try {
-		return realpathSync(p);
+		return await fs.realpath(p);
 	} catch {
 		return p;
 	}
@@ -343,50 +351,47 @@ function isWithin(child: string, parent: string): boolean {
 interface ShellRun {
 	/** Task id, allocated up front (the output file is named after it, like Claude Code). */
 	id: string;
-	proc: SpawnedShell;
+	proc: HostProcess;
 	/** Retained tail of the output (foreground only; capped at OUTPUT_HARD_CAP). */
 	output: OutputBuffer;
 	/** First MAX_OUTPUT_CHARS characters of output (what a failed command's result shows). */
 	head: string;
 	/** File with the complete output (undefined if it could not be created for a foreground run). */
 	outputFile?: string;
-	/** Open descriptor of `outputFile` while the command runs. */
-	fd?: number;
+	/** Writes to `outputFile` while the command runs (queued, in order). */
+	file?: FileAppender;
 	/** A write to the output file failed: the file is incomplete. */
 	fileFailed?: boolean;
 	/** Running as a background task: output goes to the file only. */
 	background: boolean;
 	onData?: (text: string) => void;
-	done: Promise<{ exitCode: number | null; signal: NodeJS.Signals | null }>;
+	done: Promise<HostProcessExit>;
 }
 
-/** Close the run's output file descriptor (idempotent, never throws). */
-function closeRunFile(run: ShellRun): void {
-	if (run.fd === undefined) return;
-	const fd = run.fd;
-	run.fd = undefined;
-	try {
-		closeSync(fd);
-	} catch {
-		// ignore
-	}
+/** Stop writing the run's output file once what was written so far is in it (idempotent, never throws). */
+async function closeRunFile(run: ShellRun): Promise<void> {
+	const file = run.file;
+	if (!file) return;
+	await file.close();
+	if (file.failed) run.fileFailed = true;
+	if (run.file === file) run.file = undefined;
 }
 
-/** Append to the run's output file; on a write error the file is marked incomplete and closed. */
+/** Append to the run's output file; after a write error the file is marked incomplete and left alone. */
 function writeRunFile(run: ShellRun, text: string): void {
-	if (run.fd === undefined || !text) return;
-	try {
-		writeSync(run.fd, text);
-	} catch {
+	if (!run.file || !text) return;
+	if (run.file.failed) {
 		run.fileFailed = true;
-		closeRunFile(run);
+		run.file = undefined;
+		return;
 	}
+	run.file.write(text);
 }
 
-function removeFile(path: string | undefined): void {
+async function removeFile(fs: HostFileSystem, path: string | undefined): Promise<void> {
 	if (!path) return;
 	try {
-		rmSync(path, { force: true });
+		await fs.rm(path, { force: true });
 	} catch {
 		// ignore
 	}
@@ -405,19 +410,25 @@ export function registerBash(pi: ExtensionAPI, cc: CCContext): void {
 	const errexit = isFixed(cc, "bashErrexit");
 	const killGroupOnExit = isFixed(cc, "orphanProcesses");
 	const spillOpts = cc.options.outputSpill;
+	const host = cc.host;
+	const fs = host.fs;
 	const previewChars = Math.max(0, (spillOpts === false ? undefined : spillOpts?.previewChars) ?? 2_000);
 
 	/**
 	 * Create the output file, then spawn. A background run needs its file: if it cannot be created
 	 * the error is thrown before anything is started. A foreground run falls back to memory only.
 	 */
-	function startRun(command: string, cwd: string, opts: { background: boolean; cwdFile?: string }): ShellRun {
+	async function startRun(
+		command: string,
+		cwd: string,
+		opts: { background: boolean; cwdFile?: string; cancelled: () => boolean },
+	): Promise<ShellRun> {
 		const id = newTaskId("local_bash");
 		const run = { id, output: new OutputBuffer(), head: "", background: opts.background } as ShellRun;
 		try {
-			const file = cc.tasks.createOutputFile(id);
+			const file = await cc.tasks.createOutputFile(id);
 			run.outputFile = file.path;
-			run.fd = file.fd;
+			run.file = new FileAppender(fs, file.path);
 		} catch (err) {
 			if (opts.background) throw err;
 		}
@@ -430,31 +441,42 @@ export function registerBash(pi: ExtensionAPI, cc: CCContext): void {
 			run.onData?.(text);
 		};
 		try {
-			run.proc = spawnShell(buildScript(command, opts.cwdFile, { errexit }), cwd, onData, { killGroupOnExit });
+			// the call was cancelled while its output file was being created: start nothing
+			if (opts.cancelled()) throw new Error(ABORTED);
+			run.proc = host.shell.spawn(buildScript(command, opts.cwdFile, { errexit }), { cwd, env: host.env, killGroupOnExit });
 		} catch (err) {
-			closeRunFile(run);
-			removeFile(run.outputFile);
+			await closeRunFile(run);
+			await removeFile(fs, run.outputFile);
 			throw err;
 		}
-		run.done = run.proc.done.catch((err: Error) => {
+		run.proc.onStdout(onData);
+		run.proc.onStderr(onData);
+		run.done = run.proc.exited.catch((err: Error) => {
 			onData(`${err.message}\n`);
 			return { exitCode: 127, signal: null };
 		});
 		return run;
 	}
 
-	/** Private side-channel file for the final working directory (falls back to os.tmpdir()). */
-	function cwdFilePath(id: string): string {
+	/**
+	 * Private side-channel file for the final working directory (falls back to the host's temp
+	 * directory; undefined, so the cwd is not tracked, when there is none).
+	 */
+	async function cwdFilePath(id: string): Promise<string | undefined> {
 		try {
-			return join(cc.tasks.outputDir(), `${id}.cwd`);
+			return join(await cc.tasks.outputDir(), `${id}.cwd`);
 		} catch {
-			return join(tmpdir(), `pi-cc-cwd-${process.pid}-${randomBytes(6).toString("hex")}`);
+			try {
+				return join(host.tmpDir, `pi-cc-cwd-${process.pid}-${randomBytes(6).toString("hex")}`);
+			} catch {
+				return undefined;
+			}
 		}
 	}
 
-	function resolveCwd(baseCwd: string): string {
+	async function resolveCwd(baseCwd: string): Promise<string> {
 		announcedCwd ??= baseCwd;
-		if (!shellCwd || !isDir(shellCwd)) shellCwd = baseCwd;
+		if (!shellCwd || !(await isDir(fs, shellCwd))) shellCwd = baseCwd;
 		return shellCwd;
 	}
 
@@ -464,26 +486,28 @@ export function registerBash(pi: ExtensionAPI, cc: CCContext): void {
 	}
 
 	/** "# Environment update" reminder when the shell cwd changed since the model was last told. */
-	function environmentUpdate(): string | undefined {
+	async function environmentUpdate(): Promise<string | undefined> {
 		if (!shellCwd || !announcedCwd || shellCwd === announcedCwd) return undefined;
-		const lines = [` - Primary working directory: ${shellCwd} (was ${announcedCwd})`];
-		const wasGit = isGitRepo(announcedCwd);
-		const isGit = isGitRepo(shellCwd);
+		const now = shellCwd;
+		const lines = [` - Primary working directory: ${now} (was ${announcedCwd})`];
+		const wasGit = await isGitRepo(fs, announcedCwd);
+		const isGit = await isGitRepo(fs, now);
 		if (wasGit !== isGit) lines.push(` - Is a git repository: ${isGit} (was ${wasGit})`);
-		announcedCwd = shellCwd;
+		announcedCwd = now;
 		return `<system-reminder>\n# Environment update\n${lines.join("\n")}\n</system-reminder>`;
 	}
 
 	/** After a formatter/fixer, name previously read files it modified (they must be re-read before editing). */
-	function staleReadHint(command: string, startedAt: number): string | undefined {
+	async function staleReadHint(command: string, startedAt: number): Promise<string | undefined> {
 		if (!FORMATTER_RE.test(command)) return undefined;
-		const changed = cc.fileState.changedSinceRead({ contentCheck: isFixed(cc, "mtimeOnlyChangeDetection") }).filter((p) => {
+		const changed: string[] = [];
+		for (const p of await cc.fileState.changedSinceRead({ contentCheck: isFixed(cc, "mtimeOnlyChangeDetection") })) {
 			try {
-				return statSync(p).mtimeMs > startedAt;
+				if ((await fs.stat(p)).mtimeMs > startedAt) changed.push(p);
 			} catch {
-				return false;
+				// gone: not a file to re-read
 			}
-		});
+		}
 		if (changed.length === 0) return undefined;
 		const base = shellCwd ?? process.cwd();
 		const names = changed.slice(0, 5).map((p) => (isWithin(p, base) ? relative(base, p) || p : p));
@@ -492,13 +516,16 @@ export function registerBash(pi: ExtensionAPI, cc: CCContext): void {
 	}
 
 	/** Turn a running command into a background task (output file, TaskStop, completion notification). */
-	function adoptAsTask(run: ShellRun, opts: { command: string; description?: string; toolCallId: string; limitMs: number; cleanup?: () => void }): BackgroundTask {
+	async function adoptAsTask(
+		run: ShellRun,
+		opts: { command: string; description?: string; toolCallId: string; limitMs: number; cleanup?: () => Promise<void> },
+	): Promise<BackgroundTask> {
 		const id = run.id;
-		if (run.fd === undefined && !run.fileFailed) {
+		if (run.file === undefined && !run.fileFailed) {
 			// the foreground run had no output file: create it now with what was captured so far
-			const file = cc.tasks.createOutputFile(id);
+			const file = await cc.tasks.createOutputFile(id);
 			run.outputFile = file.path;
-			run.fd = file.fd;
+			run.file = new FileAppender(fs, file.path);
 			writeRunFile(run, run.output.toString());
 		}
 		const outputFile = run.outputFile!;
@@ -530,16 +557,16 @@ export function registerBash(pi: ExtensionAPI, cc: CCContext): void {
 		}, opts.limitMs);
 		deadline.unref?.();
 
-		void run.done.then((exit) => {
+		void run.done.then(async (exit) => {
 			clearTimeout(deadline);
 			live.delete(run);
 			const killed = stopped || deadlineHit || shuttingDown;
 			const code = exitCodeOf(exit);
 			try {
-				opts.cleanup?.();
+				await opts.cleanup?.();
 				writeRunFile(run, killed ? "\n[killed]\n" : `\n[exited with code ${code}]\n`);
 			} finally {
-				closeRunFile(run);
+				await closeRunFile(run);
 			}
 			// a terminal status evicts the task from the registry (Claude Code's evictTerminalTask)
 			const status = killed ? "killed" : code === 0 ? "completed" : "failed";
@@ -578,11 +605,11 @@ export function registerBash(pi: ExtensionAPI, cc: CCContext): void {
 		const { command } = params;
 		if (signal?.aborted) throw new Error(ABORTED);
 		const timeoutMs = clampTimeout(params.timeout, defaultTimeout, maxTimeout);
-		const cwd = resolveCwd(baseCwd);
-		const cwdFile = cwdFilePath(newTaskId("local_bash"));
-		const removeCwdFile = () => removeFile(cwdFile);
+		const cwd = await resolveCwd(baseCwd);
+		const cwdFile = await cwdFilePath(newTaskId("local_bash"));
+		const removeCwdFile = () => removeFile(fs, cwdFile);
 		const startedAt = Math.floor(Date.now() / 1000) * 1000;
-		const run = startRun(command, cwd, { background: false, cwdFile });
+		const run = await startRun(command, cwd, { background: false, cwdFile, cancelled: () => signal?.aborted === true });
 		live.add(run);
 
 		let updateTimer: NodeJS.Timeout | undefined;
@@ -612,6 +639,7 @@ export function registerBash(pi: ExtensionAPI, cc: CCContext): void {
 			timer = setTimeout(() => resolve("timeout"), timeoutMs);
 			onAbort = () => resolve("abort");
 			signal?.addEventListener("abort", onAbort, { once: true });
+			if (signal?.aborted) onAbort();
 		});
 		clearTimeout(timer);
 		if (onAbort) signal?.removeEventListener("abort", onAbort);
@@ -623,7 +651,7 @@ export function registerBash(pi: ExtensionAPI, cc: CCContext): void {
 		if (outcome === "timeout" && canAutoBackground(command)) {
 			// Claude Code does not kill a command at its timeout: it keeps running as a background task.
 			try {
-				task = adoptAsTask(run, {
+				task = await adoptAsTask(run, {
 					command,
 					description: params.description,
 					toolCallId,
@@ -646,17 +674,17 @@ export function registerBash(pi: ExtensionAPI, cc: CCContext): void {
 
 		if (outcome !== "exit") run.proc.kill();
 		const exit = await run.done;
-		closeRunFile(run);
+		await closeRunFile(run);
 		let newCwd: string | undefined;
 		try {
-			if (existsSync(cwdFile)) newCwd = readFileSync(cwdFile, "utf8").trim() || undefined;
+			if (cwdFile) newCwd = asBuffer(await fs.readFile(cwdFile)).toString("utf8").trim() || undefined;
 		} catch {
-			// ignore
+			// no cwd recorded (the command failed) or unreadable
 		}
-		removeCwdFile();
+		await removeCwdFile();
 		// The output file is only kept when it is the sole complete copy of the output (see below).
 		const keepFile = outcome === "exit" && run.output.droppedChars > 0 && !run.fileFailed && !isErrorExit(command, exitCodeOf(exit));
-		if (!keepFile) removeFile(run.outputFile);
+		if (!keepFile) await removeFile(fs, run.outputFile);
 
 		if (outcome === "abort") {
 			throw new Error([run.output.toString().trim(), ABORTED].filter(Boolean).join("\n"));
@@ -672,8 +700,8 @@ export function registerBash(pi: ExtensionAPI, cc: CCContext): void {
 		}
 
 		let resetNote: string | undefined;
-		if (newCwd && isDir(newCwd)) {
-			if (isWithin(newCwd, baseCwd) || isWithin(newCwd, realpathOr(baseCwd))) shellCwd = newCwd;
+		if (newCwd && (await isDir(fs, newCwd))) {
+			if (isWithin(newCwd, baseCwd) || isWithin(newCwd, await realpathOr(fs, baseCwd))) shellCwd = newCwd;
 			else {
 				// Claude Code keeps the shell inside the project: leaving it resets to the original directory.
 				shellCwd = baseCwd;
@@ -687,18 +715,23 @@ export function registerBash(pi: ExtensionAPI, cc: CCContext): void {
 			const { preview } = makePreview(run.head, previewChars);
 			body = formatPersistedOutput({ size: run.output.end, path: run.outputFile!, preview, truncated: true, previewChars });
 		} else body = run.output.toString().trim();
-		let text = [body, resetNote, staleReadHint(command, startedAt)].filter(Boolean).join("\n") || NO_OUTPUT;
-		const env = environmentUpdate();
+		let text = [body, resetNote, await staleReadHint(command, startedAt)].filter(Boolean).join("\n") || NO_OUTPUT;
+		const env = await environmentUpdate();
 		if (env) text += `\n\n${env}`;
 		return textResult<BashDetails>(text, { exitCode, signal: exit.signal, cwd: shellCwd });
 	}
 
 	// ---------------------------------------------------------------- background
-	function startBackground(params: { command: string; description?: string; timeout?: number }, toolCallId: string, baseCwd: string): AgentToolResult<BashDetails> {
-		const cwd = resolveCwd(baseCwd);
+	async function startBackground(
+		params: { command: string; description?: string; timeout?: number },
+		toolCallId: string,
+		baseCwd: string,
+		signal: AbortSignal | undefined,
+	): Promise<AgentToolResult<BashDetails>> {
+		const cwd = await resolveCwd(baseCwd);
 		// the output file is created before the command is spawned: no unregistered process on failure
-		const run = startRun(params.command, cwd, { background: true });
-		const task = adoptAsTask(run, {
+		const run = await startRun(params.command, cwd, { background: true, cancelled: () => signal?.aborted === true || shuttingDown });
+		const task = await adoptAsTask(run, {
 			command: params.command,
 			description: params.description,
 			toolCallId,
@@ -740,7 +773,7 @@ export function registerBash(pi: ExtensionAPI, cc: CCContext): void {
 			if (input.run_in_background) {
 				// an already-cancelled call must not start anything (like the foreground path)
 				if (signal?.aborted || shuttingDown) throw new Error(ABORTED);
-				return startBackground(params, toolCallId, ctx.cwd);
+				return startBackground(params, toolCallId, ctx.cwd, signal);
 			}
 			return runForeground(params, toolCallId, ctx.cwd, signal, onUpdate as any);
 		},

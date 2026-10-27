@@ -1,12 +1,8 @@
-import { spawn, spawnSync } from "node:child_process";
-import { existsSync, realpathSync, statSync } from "node:fs";
-import { stat } from "node:fs/promises";
-import { createRequire } from "node:module";
 import { basename, dirname, join, relative, sep } from "node:path";
-import { pathToFileURL } from "node:url";
 import { StringEnum } from "@earendil-works/pi-ai";
-import { getAgentDir, type ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Type, type Static } from "typebox";
+import type { ClaudeCodeHost, HostFileSystem } from "../host/types.js";
 import type { CCContext } from "../shared/context.js";
 import { resolvePath } from "../shared/paths.js";
 import { isFixed } from "../shared/quirks.js";
@@ -133,53 +129,6 @@ export interface GrepDetails {
 }
 
 // ---------------------------------------------------------------------------
-// ripgrep resolution
-// ---------------------------------------------------------------------------
-
-let cachedRgPath: string | undefined;
-
-function commandWorks(cmd: string): boolean {
-	try {
-		const r = spawnSync(cmd, ["--version"], { stdio: "ignore" });
-		return !r.error && r.status === 0;
-	} catch {
-		return false;
-	}
-}
-
-/**
- * Locate ripgrep the same way pi does: pi's managed bin dir (<agentDir>/bin/rg) first,
- * then `rg` on PATH, then (best effort) pi's own `ensureTool` downloader. That module is not
- * part of pi's public exports, so it is loaded by file path; failures fall through to a clear error.
- */
-export async function resolveRgPath(): Promise<string> {
-	if (cachedRgPath) return cachedRgPath;
-	const exe = process.platform === "win32" ? "rg.exe" : "rg";
-	try {
-		const local = join(getAgentDir(), "bin", exe);
-		if (existsSync(local)) return (cachedRgPath = local);
-	} catch {
-		// ignore
-	}
-	if (commandWorks("rg")) return (cachedRgPath = "rg");
-	try {
-		const require = createRequire(import.meta.url);
-		const entry = require.resolve("@earendil-works/pi-coding-agent");
-		const managerPath = join(dirname(entry), "utils", "tools-manager.js");
-		if (existsSync(managerPath)) {
-			const mod: any = await import(pathToFileURL(managerPath).href);
-			const p = await mod.ensureTool?.("rg", true);
-			if (typeof p === "string" && p) return (cachedRgPath = p);
-		}
-	} catch {
-		// ignore
-	}
-	throw new Error(
-		"ripgrep (rg) is not installed or not on PATH. Install ripgrep (https://github.com/BurntSushi/ripgrep) to use Grep.",
-	);
-}
-
-// ---------------------------------------------------------------------------
 // shared helpers (also used by Glob)
 // ---------------------------------------------------------------------------
 
@@ -193,23 +142,28 @@ export function displayPath(cwd: string, abs: string): string {
  * Claude Code's "Did you mean" hint for a missing path: when the path lies in cwd's parent
  * (but not in cwd) and the same relative path exists inside cwd, suggest that.
  */
-export function suggestUnderCwd(cwd: string, abs: string): string | undefined {
+export async function suggestUnderCwd(fs: HostFileSystem, cwd: string, abs: string): Promise<string | undefined> {
 	const parent = dirname(cwd);
 	let p = abs;
 	try {
-		p = join(realpathSync(dirname(abs)), basename(abs));
+		p = join(await fs.realpath(dirname(abs)), basename(abs));
 	} catch {
 		// keep lexical path
 	}
 	const parentPrefix = parent === sep ? sep : parent + sep;
 	if (!p.startsWith(parentPrefix) || p.startsWith(cwd + sep) || p === cwd) return undefined;
 	const candidate = join(cwd, relative(parent, p));
-	return existsSync(candidate) ? candidate : undefined;
+	try {
+		await fs.stat(candidate);
+		return candidate;
+	} catch {
+		return undefined;
+	}
 }
 
 /** Message for a path that does not exist, as Claude Code words it. */
-export function missingPathMessage(kind: "Path" | "Directory", raw: string, abs: string, cwd: string): string {
-	const hint = suggestUnderCwd(cwd, abs);
+export async function missingPathMessage(fs: HostFileSystem, kind: "Path" | "Directory", raw: string, abs: string, cwd: string): Promise<string> {
+	const hint = await suggestUnderCwd(fs, cwd, abs);
 	return `${kind} does not exist: ${raw}. ${CWD_NOTE} ${cwd}.${hint ? ` Did you mean ${hint}?` : ""}`;
 }
 
@@ -236,70 +190,20 @@ function rgTimeoutMs(): number {
 }
 
 /**
- * Run rg and collect its output the way Claude Code does: exit 1 = no matches; exit 2 with output =
- * partial errors (results kept); 20 MB stdout cap and 20 s timeout keep the complete lines read so far.
+ * Run rg (through the host) and collect its output the way Claude Code does: exit 1 = no matches;
+ * exit 2 with output = partial errors (results kept); 20 MB stdout cap and 20 s timeout keep the
+ * complete lines read so far.
  */
-export async function runRipgrep(args: string[], cwd: string, signal: AbortSignal | undefined): Promise<RgRun> {
-	const rgPath = await resolveRgPath();
-	const run = await new Promise<{ stdout: string; stderr: string; code: number | null; timedOut: boolean; capped: boolean }>(
-		(resolvePromise, reject) => {
-			if (signal?.aborted) {
-				reject(new Error("Operation aborted"));
-				return;
-			}
-			const child = spawn(rgPath, args, { cwd, stdio: ["ignore", "pipe", "pipe"] });
-			const chunks: Buffer[] = [];
-			let bytes = 0;
-			let capped = false;
-			let timedOut = false;
-			let stderr = "";
-			let settled = false;
-			const timer = setTimeout(() => {
-				timedOut = true;
-				child.kill("SIGTERM");
-				setTimeout(() => child.kill("SIGKILL"), 5000).unref();
-			}, rgTimeoutMs());
-			const onAbort = () => {
-				child.kill("SIGKILL");
-				if (!settled) {
-					settled = true;
-					clearTimeout(timer);
-					reject(new Error("Operation aborted"));
-				}
-			};
-			signal?.addEventListener("abort", onAbort, { once: true });
-			child.stdout.on("data", (d: Buffer) => {
-				if (capped) return;
-				if (bytes + d.length > rgOutputCapBytes) {
-					chunks.push(d.subarray(0, rgOutputCapBytes - bytes));
-					bytes = rgOutputCapBytes;
-					capped = true;
-					child.kill("SIGKILL");
-					return;
-				}
-				chunks.push(d);
-				bytes += d.length;
-			});
-			child.stderr.on("data", (d: Buffer) => {
-				if (stderr.length < 64 * 1024) stderr += d.toString("utf8");
-			});
-			child.on("error", (err) => {
-				clearTimeout(timer);
-				signal?.removeEventListener("abort", onAbort);
-				if (!settled) {
-					settled = true;
-					reject(new Error(`Failed to run ripgrep: ${err.message}`));
-				}
-			});
-			child.on("close", (code) => {
-				clearTimeout(timer);
-				signal?.removeEventListener("abort", onAbort);
-				if (settled) return;
-				settled = true;
-				resolvePromise({ stdout: Buffer.concat(chunks).toString("utf8"), stderr, code, timedOut, capped });
-			});
-		},
-	);
+export async function runRipgrep(host: ClaudeCodeHost, args: string[], cwd: string, signal: AbortSignal | undefined): Promise<RgRun> {
+	if (signal?.aborted) throw new Error("Operation aborted");
+	let result;
+	try {
+		result = await host.search.ripgrep(args, { cwd, signal, timeoutMs: rgTimeoutMs(), maxOutputBytes: rgOutputCapBytes });
+	} catch (err) {
+		if (signal?.aborted) throw new Error("Operation aborted");
+		throw err;
+	}
+	const run = { stdout: result.stdout, stderr: result.stderr, code: result.exitCode as number | null, timedOut: result.timedOut === true, capped: result.truncated === true };
 
 	const abnormal = run.code !== 0 && run.code !== 1 && run.code !== 2;
 	const cut = run.capped || run.timedOut || abnormal;
@@ -609,6 +513,7 @@ export interface SearchOptions {
 }
 
 export async function executeGrep(
+	host: ClaudeCodeHost,
 	params: GrepParams,
 	cwd: string,
 	signal?: AbortSignal,
@@ -621,12 +526,12 @@ export async function executeGrep(
 	const limit = params.head_limit ?? undefined;
 	const offset = params.offset ?? 0;
 
-	const searchAbs = params.path ? resolvePath(cwd, params.path, { trim: !options.exactPaths }) : cwd;
+	const searchAbs = params.path ? resolvePath(cwd, params.path, { homeDir: host.homeDir, trim: !options.exactPaths }) : cwd;
 	let isDirectory: boolean;
 	try {
-		isDirectory = statSync(searchAbs).isDirectory();
+		isDirectory = (await host.fs.stat(searchAbs)).isDirectory;
 	} catch {
-		if (params.path) throw new Error(missingPathMessage("Path", params.path, searchAbs, cwd));
+		if (params.path) throw new Error(await missingPathMessage(host.fs, "Path", params.path, searchAbs, cwd));
 		const empty = emptyDetails(mode);
 		return { text: formatGrep(empty), details: empty };
 	}
@@ -635,7 +540,7 @@ export async function executeGrep(
 	const target = isDirectory ? "." : searchAbs;
 	const spawnCwd = isDirectory ? searchAbs : dirname(searchAbs);
 	const toAbs = (p: string) => (isDirectory ? join(searchAbs, p.startsWith("./") ? p.slice(2) : p) : p);
-	const run = await runRipgrep(buildRgArgs(params, target), spawnCwd, signal);
+	const run = await runRipgrep(host, buildRgArgs(params, target), spawnCwd, signal);
 
 	let details: GrepDetails;
 	let found: number;
@@ -700,7 +605,7 @@ export async function executeGrep(
 	} else {
 		const files = splitNullOutput(run.lines, "files_with_matches").map(toAbs);
 		found = files.length;
-		const stats = await Promise.allSettled(files.map((f) => stat(f)));
+		const stats = await Promise.allSettled(files.map((f) => host.fs.stat(f)));
 		const sorted = files
 			.map((f, i) => {
 				const s = stats[i];
@@ -757,7 +662,7 @@ export function registerGrep(pi: ExtensionAPI, cc: CCContext): void {
 		promptSnippet: "Search file contents with ripgrep (regex; glob/type filters; content, files_with_matches, count modes)",
 		parameters: grepSchema,
 		async execute(_toolCallId, params, signal, _onUpdate, ctx) {
-			const { text, details } = await executeGrep(params, ctx.cwd, signal, {
+			const { text, details } = await executeGrep(cc.host, params, ctx.cwd, signal, {
 				surfacePathErrors: isFixed(cc, "searchPermissionErrors"),
 				exactPaths: isFixed(cc, "pathTrim"),
 			});

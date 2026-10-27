@@ -65,7 +65,7 @@ describe("Write", () => {
 	it("refuses a file whose last read was a truncated view", async () => {
 		const p = join(dir, "t.txt");
 		writeFileSync(p, "old");
-		cc.fileState.recordRead(p, "old", { truncated: true });
+		await cc.fileState.recordRead(p, "old", { truncated: true });
 		await expect(call("Write", { file_path: p, content: "new" })).rejects.toThrow(/has not been read yet/);
 	});
 

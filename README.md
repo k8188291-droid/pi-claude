@@ -75,12 +75,14 @@ const { session } = await createAgentSession({ cwd, modelRuntime, resourceLoader
 
 | 選項 | 預設 | 說明 |
 |---|---|---|
+| `host` | `createLocalHost()`（本機） | 工具使用的檔案系統、shell 與搜尋（`ClaudeCodeHost`，見 `src/host/types.ts`）；所有工具、背景輸出與 spill 檔都經由它，subagent 共用同一個 host。host 的 `supportsWorktrees` 為 `false` 時，`isolation: "worktree"` 回報不支援 |
 | `onAskUserQuestion` | — | AskUserQuestion 的 host callback；未提供時（且無 UI）工具回錯誤讓模型自行判斷 |
 | `onEvent` | — | host 事件通知 |
 | `outputSpill` | 依工具（見上） | `false` 關閉；`maxChars` 會覆蓋所有工具的門檻；可設 `dir`、`exclude` |
 | `agents` | — | 自訂 subagent，覆蓋同名內建／磁碟定義 |
 | `loadAgentsFromDisk` | `true` | 讀 `~/.claude/agents`、`<cwd>/.claude/agents` |
 | `subagents` | `true` | 是否提供 `Agent` |
+| `subagentResourceLoader` | `DefaultResourceLoader` | 進階：自行建立 subagent session 的 resource loader（`(options) => ResourceLoader`，`options` 即 `DefaultResourceLoader` 會收到的參數，須照用其中的 extension 與 system prompt）。`DefaultResourceLoader` 會讀實體磁碟上的設定、`~/.pi/agent` 與 context 檔，非本機 host 時改用此選項 |
 | `subagentExtensions` | — | 額外裝進每個 subagent session 的 extension（例如你的自訂工具或 MCP） |
 | `deferredTools` | `[]` | 以 pi 原生 `exposure: "deferred"` 註冊的本套件工具；有任何延遲載入工具（含你自己或 MCP 的）時會自動啟用 `tool_search` |
 | `modelRuntime` | 由 `createClaudeCodeSession` 帶入 | subagent 使用的 ModelRuntime（憑證與模型目錄） |
@@ -122,7 +124,7 @@ const { session } = await createAgentSession({ cwd, modelRuntime, resourceLoader
 - Read 的 token 數用估算（字元數 ÷ 4），Claude Code 會向 API 精算。
 - pi 送出工具 schema 時會拿掉 `additionalProperties: false`。
 - Bash 不載入使用者 shell profile（alias / function 不可用）。
-- 背景輸出、大輸出寫檔都放在私有目錄 `<tmpdir>/pi-cc-<uid>/`（目錄 0700、檔案 0600）。
+- 背景輸出、大輸出寫檔都放在 host 的私有目錄（`tmpDir`；本機為 `<tmpdir>/pi-cc-<uid>/`，目錄 0700、檔案 0600）。
 - Subagent 使用記憶體內預設設定與 `getAgentDir()`；憑證與模型目錄共用父 session 的 ModelRuntime。不支援接續已完成的 agent（Claude Code 改用 SendMessage）。
 - 工作清單的提醒是暫時注入（只出現在該次 LLM 呼叫），不寫入 session。
 

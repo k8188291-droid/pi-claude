@@ -1,6 +1,7 @@
 import { mkdirSync, utimesSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { beforeAll, describe, expect, it } from "vitest";
+import { createLocalHost } from "../src/host/local.js";
 import { createCCContext } from "../src/shared/context.js";
 import { buildRgArgs, executeGrep, formatGrep, parseRgJson, registerGrep, splitGlobs, splitNullOutput } from "../src/tools/grep.js";
 import { captureTools, createTestSession, fakeCtx, fauxAssistantMessage, fauxToolCall, resultText, tempDir } from "./helpers.js";
@@ -368,7 +369,7 @@ describe("Grep count ordering", () => {
 	it("sorts count output by path so results and paging are deterministic", async () => {
 		const dir = tempDir();
 		for (const n of ["zeta", "alpha", "mid", "beta", "omega"]) writeFileSync(join(dir, `${n}.txt`), "x\nx\n");
-		const r = await executeGrep({ pattern: "x", output_mode: "count" } as any, dir);
+		const r = await executeGrep(createLocalHost(), { pattern: "x", output_mode: "count" } as any, dir);
 		const files = r.text.split("\n").filter((l) => l.includes(".txt:")).map((l) => l.split(":")[0]);
 		expect(files).toEqual(["alpha.txt", "beta.txt", "mid.txt", "omega.txt", "zeta.txt"]);
 	});

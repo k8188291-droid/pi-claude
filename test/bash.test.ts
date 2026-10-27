@@ -306,7 +306,7 @@ describe("Bash foreground", () => {
 		const h = setup();
 		const file = join(h.cwd, "f.txt");
 		writeFileSync(file, "a\n");
-		h.cc.fileState.recordRead(file, "a\n");
+		await h.cc.fileState.recordRead(file, "a\n");
 		expect(await runText(h, { command: "sleep 1; sed --in-place 's/a/b/' f.txt" })).toBe(
 			"[This command modified 1 file you've previously read: f.txt. Call Read before editing.]",
 		);

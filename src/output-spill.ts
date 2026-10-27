@@ -1,11 +1,8 @@
 import { randomBytes } from "node:crypto";
-import { createReadStream, createWriteStream } from "node:fs";
-import { chmod, mkdir, open, stat, writeFile } from "node:fs/promises";
-import { pipeline } from "node:stream/promises";
-import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
-import { ensurePrivateDir, privateTempRoot } from "./shared/background.js";
+import type { ClaudeCodeHost, HostFileSystem } from "./host/types.js";
+import { asBuffer, ensurePrivateDir } from "./shared/background.js";
 import type { CCContext } from "./shared/context.js";
 
 /**
@@ -18,9 +15,10 @@ import type { CCContext } from "./shared/context.js";
  * - Results containing images are never persisted.
  * - The inline replacement is `<persisted-output>` + size + path + a 2KB preview cut at a line break.
  * - A successful result with no text at all becomes "(<Tool> completed with no output)".
- * - Spill files are private: the default directory is <os.tmpdir()>/pi-cc-<uid>/<session>/tool-results
- *   (every level created 0700, the per-user root must be a real directory owned by the user, like
- *   Claude Code's `$TMPDIR/claude-<uid>`), and files are written 0600.
+ * - Spill files are private: the default directory is <host.tmpDir>/<session>/tool-results, locally
+ *   <os.tmpdir()>/pi-cc-<uid>/<session>/tool-results (every level created 0700, the per-user root
+ *   must be a real directory owned by the user, like Claude Code's `$TMPDIR/claude-<uid>`), and
+ *   files are written 0600. Everything goes through the session's host filesystem.
  * - A tool whose text is only part of its output can name a file holding the complete output in
  *   `details.fullOutputPath` (see FullOutputDetails); that file is copied as the spill file, so the
  *   spill file is complete even when the inline text was cut.
@@ -98,27 +96,35 @@ export interface FullOutputDetails {
 }
 
 /**
- * Default spill directory: <base>/pi-cc-<uid>/<session>/tool-results. The per-user root comes from
- * `privateTempRoot()` (shared with background task output: 0700, refuses symlinked or foreign-owned
- * roots); the session and tool-results levels are private (0700) too.
+ * Default spill directory: <host.tmpDir>/<session>/tool-results. The per-user root is the host's
+ * private `tmpDir` (shared with background task output; the local host makes it 0700 and refuses
+ * symlinked or foreign-owned roots); the session and tool-results levels are private (0700) too.
  */
-export async function defaultSpillDir(sessionId: string, base: string = tmpdir()): Promise<string> {
-	const sessionDir = join(privateTempRoot(base), sanitize(sessionId));
-	ensurePrivateDir(sessionDir);
+export async function defaultSpillDir(host: Pick<ClaudeCodeHost, "fs" | "tmpDir">, sessionId: string): Promise<string> {
+	const sessionDir = join(host.tmpDir, sanitize(sessionId));
+	await ensurePrivateDir(host.fs, sessionDir);
 	const dir = join(sessionDir, "tool-results");
-	ensurePrivateDir(dir);
+	await ensurePrivateDir(host.fs, dir);
 	return dir;
 }
 
 /** First `maxChars` characters of a file (UTF-8). */
-async function readHead(path: string, maxChars: number): Promise<string> {
-	const fh = await open(path, "r");
-	try {
-		const buf = Buffer.alloc(Math.max(4, maxChars * 4));
-		const { bytesRead } = await fh.read(buf, 0, buf.length, 0);
-		return buf.subarray(0, bytesRead).toString("utf8").slice(0, maxChars);
-	} finally {
-		await fh.close();
+async function readHead(fs: HostFileSystem, path: string, maxChars: number): Promise<string> {
+	return asBuffer(await fs.readRange(path, 0, Math.max(4, maxChars * 4)))
+		.toString("utf8")
+		.slice(0, maxChars);
+}
+
+const COPY_CHUNK_BYTES = 1024 * 1024;
+
+/** Copy `from` to a new private (0600) file `to` in chunks (bounded memory). */
+async function copyFile(fs: HostFileSystem, from: string, to: string): Promise<void> {
+	await fs.writeFile(to, new Uint8Array(0), { mode: 0o600 });
+	for (let pos = 0; ; ) {
+		const chunk = await fs.readRange(from, pos, COPY_CHUNK_BYTES);
+		if (chunk.length === 0) break;
+		pos += chunk.length;
+		await fs.appendFile(to, chunk);
 	}
 }
 
@@ -128,11 +134,12 @@ export function registerOutputSpill(pi: ExtensionAPI, cc: CCContext): void {
 	const previewChars = Math.max(0, opts?.previewChars ?? DEFAULT_PREVIEW_CHARS);
 	const excluded = new Set([...ALWAYS_EXCLUDED, ...(opts?.exclude ?? [])]);
 	const fallbackId = randomBytes(8).toString("hex");
+	const fs = cc.host.fs;
 
 	/** Create (if needed) and return the spill directory. */
 	const spillDir = async (ctx: ExtensionContext): Promise<string> => {
 		if (opts?.dir) {
-			await mkdir(opts.dir, { recursive: true, mode: 0o700 });
+			await fs.mkdir(opts.dir, { recursive: true, mode: 0o700 });
 			return opts.dir;
 		}
 		let sessionId: string | undefined;
@@ -141,7 +148,7 @@ export function registerOutputSpill(pi: ExtensionAPI, cc: CCContext): void {
 		} catch {
 			sessionId = undefined;
 		}
-		return defaultSpillDir(sessionId || fallbackId);
+		return defaultSpillDir(cc.host, sessionId || fallbackId);
 	};
 
 	pi.on("tool_result", async (event, ctx) => {
@@ -173,11 +180,11 @@ export function registerOutputSpill(pi: ExtensionAPI, cc: CCContext): void {
 			if (fullOutputPath) {
 				// the tool's complete output (its text may be cut); fall back to the text on any failure
 				try {
-					const st = await stat(fullOutputPath);
-					if (st.isFile()) {
-						await pipeline(createReadStream(fullOutputPath), createWriteStream(path, { mode: 0o600 }));
-						size = (await stat(path)).size;
-						head = await readHead(path, previewChars + 1);
+					const st = await fs.stat(fullOutputPath);
+					if (st.isFile) {
+						await copyFile(fs, fullOutputPath, path);
+						size = (await fs.stat(path)).size;
+						head = await readHead(fs, path, previewChars + 1);
 						copied = true;
 					}
 				} catch {
@@ -187,9 +194,9 @@ export function registerOutputSpill(pi: ExtensionAPI, cc: CCContext): void {
 			if (!copied) {
 				size = fullText.length;
 				head = fullText;
-				await writeFile(path, fullText, { encoding: "utf8", mode: 0o600 });
+				await fs.writeFile(path, fullText, { mode: 0o600 });
 			}
-			await chmod(path, 0o600);
+			await fs.chmod(path, 0o600);
 		} catch {
 			// Claude Code keeps the original result when it cannot be persisted.
 			return undefined;

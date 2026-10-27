@@ -9,11 +9,11 @@ const nb = (cells: unknown[], minor = 5) => JSON.stringify({ cells, metadata: { 
 const code = (id: string | undefined, source: string | string[]) => ({ cell_type: "code", ...(id ? { id } : {}), metadata: {}, source, outputs: [{ output_type: "stream", text: ["x"] }], execution_count: 2 });
 const md = (id: string | undefined, source: string) => ({ cell_type: "markdown", ...(id ? { id } : {}), metadata: {}, source });
 
-function setup(files: Record<string, string>, read: string[] = Object.keys(files)) {
+async function setup(files: Record<string, string>, read: string[] = Object.keys(files)) {
 	const cwd = tempDir();
 	const cc = createCCContext({});
 	for (const [name, content] of Object.entries(files)) writeFileSync(join(cwd, name), content);
-	for (const name of read) cc.fileState.recordRead(join(cwd, name), readFileSync(join(cwd, name)));
+	for (const name of read) await cc.fileState.recordRead(join(cwd, name), readFileSync(join(cwd, name)));
 	const { tools } = captureTools((pi) => registerNotebookEdit(pi, cc));
 	const tool = tools.get("NotebookEdit")!;
 	const run = async (params: Record<string, unknown>) => {
@@ -25,8 +25,8 @@ function setup(files: Record<string, string>, read: string[] = Object.keys(files
 }
 
 describe("NotebookEdit", () => {
-	it("declares Claude Code's schema", () => {
-		const { tool } = setup({});
+	it("declares Claude Code's schema", async () => {
+		const { tool } = await setup({});
 		const p = tool.parameters as any;
 		expect(Object.keys(p.properties)).toEqual(["notebook_path", "cell_id", "new_source", "cell_type", "edit_mode"]);
 		expect(p.required).toEqual(["notebook_path", "new_source"]);
@@ -34,7 +34,7 @@ describe("NotebookEdit", () => {
 	});
 
 	it("replaces, changes cell type, deletes; writes JSON with 1-space indent", async () => {
-		const { run, file } = setup({ "a.ipynb": nb([code("aa", "print(1)"), md("bb", "# H"), code("cc", "z")]) });
+		const { run, file } = await setup({ "a.ipynb": nb([code("aa", "print(1)"), md("bb", "# H"), code("cc", "z")]) });
 		expect(await run({ notebook_path: "a.ipynb", cell_id: "aa", new_source: "## md", cell_type: "markdown" })).toBe("Updated cell aa with ## md");
 		expect(await run({ notebook_path: "a.ipynb", cell_id: "bb", new_source: "y = 2", cell_type: "code" })).toBe("Updated cell bb with y = 2");
 		expect(await run({ notebook_path: "a.ipynb", cell_id: "cc", new_source: "", edit_mode: "delete" })).toBe("Deleted cell cc");
@@ -57,7 +57,7 @@ describe("NotebookEdit", () => {
 	});
 
 	it("cell-N ids, inserts in an nbformat 4.4 notebook, CRLF preserved", async () => {
-		const { run, file } = setup({ "o.ipynb": nb([code(undefined, ["a\n", "b"]), md(undefined, "# T")], 4), "c.ipynb": nb([code("k", "v")]).replace(/,/g, ",\r\n") });
+		const { run, file } = await setup({ "o.ipynb": nb([code(undefined, ["a\n", "b"]), md(undefined, "# T")], 4), "c.ipynb": nb([code("k", "v")]).replace(/,/g, ",\r\n") });
 		expect(await run({ notebook_path: "o.ipynb", new_source: "import os", cell_type: "code", edit_mode: "insert" })).toBe("Inserted cell undefined with import os");
 		expect(await run({ notebook_path: "o.ipynb", cell_id: "cell-1", new_source: "note", cell_type: "markdown", edit_mode: "insert" })).toBe("Inserted cell undefined with note");
 		expect(JSON.parse(file("o.ipynb")).cells.map((c: any) => c.source)).toEqual(["import os", ["a\n", "b"], "note", "# T"]);
@@ -67,7 +67,7 @@ describe("NotebookEdit", () => {
 	});
 
 	it("inserted cells in nbformat >= 4.5 get a random 8-char id", async () => {
-		const { run, file } = setup({ "a.ipynb": nb([code("aa", "x")]) });
+		const { run, file } = await setup({ "a.ipynb": nb([code("aa", "x")]) });
 		const text = await run({ notebook_path: "a.ipynb", cell_id: "aa", new_source: "y", cell_type: "code", edit_mode: "insert" });
 		const id = JSON.parse(file("a.ipynb")).cells[1].id;
 		expect(id).toMatch(/^[0-9a-f]{8}$/);
@@ -84,19 +84,19 @@ describe("NotebookEdit", () => {
 		["invalid notebook", { notebook_path: "bad.ipynb", cell_id: "x", new_source: "x" }, NOTEBOOK_MESSAGES.invalidNotebook],
 		["invalid JSON", { notebook_path: "j.ipynb", cell_id: "x", new_source: "x" }, NOTEBOOK_MESSAGES.invalidJson],
 	])("rejects: %s", async (_name, params, message) => {
-		const { run } = setup({ "a.ipynb": nb([code("aa", "x")]), "u.ipynb": nb([code("u", "x")]), "n.txt": "x", "bad.ipynb": "{}", "j.ipynb": "{x" }, ["a.ipynb", "n.txt", "bad.ipynb", "j.ipynb"]);
+		const { run } = await setup({ "a.ipynb": nb([code("aa", "x")]), "u.ipynb": nb([code("u", "x")]), "n.txt": "x", "bad.ipynb": "{}", "j.ipynb": "{x" }, ["a.ipynb", "n.txt", "bad.ipynb", "j.ipynb"]);
 		await expect(run(params)).rejects.toThrow(message);
 	});
 
 	it("refuses a notebook whose content changed since it was read", async () => {
-		const { run, cwd } = setup({ "a.ipynb": nb([code("aa", "x")]) });
+		const { run, cwd } = await setup({ "a.ipynb": nb([code("aa", "x")]) });
 		await new Promise((r) => setTimeout(r, 20));
 		writeFileSync(join(cwd, "a.ipynb"), nb([code("aa", "changed")]));
 		await expect(run({ notebook_path: "a.ipynb", cell_id: "aa", new_source: "y" })).rejects.toThrow(NOTEBOOK_MESSAGES.modified);
 	});
 
-	it("validation errors use Claude Code's wording", () => {
-		const { tool } = setup({});
+	it("validation errors use Claude Code's wording", async () => {
+		const { tool } = await setup({});
 		expect(() => tool.prepareArguments!({ notebook_path: "/x.ipynb", cell_id: "a" })).toThrow(
 			"InputValidationError: NotebookEdit failed due to the following issue:\nThe required parameter `new_source` is missing",
 		);

@@ -1,7 +1,8 @@
-import { closeSync, existsSync, readdirSync, rmSync, statSync } from "node:fs";
+import { existsSync, readdirSync, rmSync, statSync } from "node:fs";
 import { dirname } from "node:path";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { afterEach, describe, expect, it } from "vitest";
+import { createLocalHost } from "../src/host/local.js";
 import { BackgroundTaskRegistry, type BackgroundTask } from "../src/shared/background.js";
 import { NotificationQueue } from "../src/shared/notifications.js";
 import { tempDir } from "./helpers.js";
@@ -14,7 +15,7 @@ afterEach(() => {
 function registry(): BackgroundTaskRegistry {
 	const base = tempDir("pi-cc-bgreg-");
 	bases.push(base);
-	return new BackgroundTaskRegistry(() => "sess/1", base);
+	return new BackgroundTaskRegistry(() => "sess/1", createLocalHost({ tmpBase: base }));
 }
 
 function task(id: string, stop: () => void | Promise<void> = () => {}): BackgroundTask {
@@ -59,17 +60,16 @@ describe("BackgroundTaskRegistry", () => {
 		expect(r.list()).toEqual([]);
 	});
 
-	it.runIf(process.getuid !== undefined)("creates private output files and recreates missing directories", () => {
+	it.runIf(process.getuid !== undefined)("creates private output files and recreates missing directories", async () => {
 		const r = registry();
-		const { path, fd } = r.createOutputFile("b1");
+		const { path } = await r.createOutputFile("b1");
 		expect(statSync(path).mode & 0o777).toBe(0o600);
 		expect(path).toContain(`/pi-cc-${process.getuid!()}/sess_1/tasks/b1.output`);
 		rmSync(dirname(dirname(path)), { recursive: true });
 		expect(existsSync(dirname(path))).toBe(false);
-		const again = r.createOutputFile("b2");
+		const again = await r.createOutputFile("b2");
 		expect(readdirSync(dirname(again.path))).toEqual(["b2.output"]);
 		expect(statSync(dirname(again.path)).mode & 0o777).toBe(0o700);
-		for (const f of [fd, again.fd]) closeSync(f);
 	});
 });
 

@@ -116,7 +116,7 @@ describe("Edit", () => {
 
 	it("omits the note after a partial read", async () => {
 		const p = await fileRead("p.txt", "one\ntwo\nthree\n");
-		cc.fileState.recordRead(p, readFileSync(p), { partial: true, limit: 1 });
+		await cc.fileState.recordRead(p, readFileSync(p), { partial: true, limit: 1 });
 		expect(resultText(await edit({ file_path: p, old_string: "three", new_string: "3" }))).toBe(`The file ${p} has been updated successfully.`);
 	});
 

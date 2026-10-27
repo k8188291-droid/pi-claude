@@ -1,8 +1,9 @@
-import fs, { chmodSync, existsSync, mkdirSync, readFileSync, readdirSync, readlinkSync, realpathSync, rmSync, statSync } from "node:fs";
-import { syncBuiltinESMExports } from "node:module";
+import fs, { chmodSync, existsSync, mkdirSync, readFileSync, readdirSync, realpathSync, rmSync, statSync } from "node:fs";
 import { dirname, join } from "node:path";
 import type { ExtensionAPI, ToolDefinition } from "@earendil-works/pi-coding-agent";
 import { afterEach, describe, expect, it } from "vitest";
+import { createLocalHost } from "../src/host/local.js";
+import type { ClaudeCodeHost } from "../src/host/types.js";
 import { createCCContext, type CCContext } from "../src/shared/context.js";
 import type { ClaudeCodeHostEvent, ClaudeCodeToolsOptions } from "../src/shared/types.js";
 import { registerBash } from "../src/tools/bash.js";
@@ -96,7 +97,7 @@ describe("#9 large foreground output is never lost", () => {
 		const h = setup();
 		expect(resultText(await h.run("Bash", { command: "echo hi" }))).toBe("hi");
 		await expect(h.run("Bash", { command: "echo bad; exit 3" })).rejects.toThrow("Exit code 3\nbad");
-		expect(readdirSync(h.cc.tasks.outputDir())).toEqual([]);
+		expect(readdirSync(await h.cc.tasks.outputDir())).toEqual([]);
 	});
 });
 
@@ -149,37 +150,24 @@ describe("#12 background output file failures", () => {
 		expect(resultText(await h.run("Bash", { command: "echo fine" }))).toBe("fine");
 	});
 
-	it.runIf(existsSync("/proc/self/fd"))("closes the output file descriptor when writing to it fails", async () => {
-		const h = setup();
-		const r = await h.run("Bash", { command: "sleep 0.4; echo hi", run_in_background: true });
+	it("stops writing the output file after a write to it fails", async () => {
+		const local = createLocalHost();
+		let appends = 0;
+		const host: ClaudeCodeHost = Object.assign(Object.create(local) as ClaudeCodeHost, {
+			fs: {
+				...local.fs,
+				async appendFile() {
+					appends++;
+					throw Object.assign(new Error("ENOSPC: no space left on device, write"), { code: "ENOSPC" });
+				},
+			},
+		});
+		const h = setup({ host });
+		const r = await h.run("Bash", { command: "echo one; sleep 0.4; echo hi", run_in_background: true });
 		const path = pathOf(resultText(r));
-		const openOnFile = () =>
-			readdirSync("/proc/self/fd").filter((fd) => {
-				try {
-					return readlinkSync(`/proc/self/fd/${fd}`) === path;
-				} catch {
-					return false;
-				}
-			}).length;
-		expect(openOnFile()).toBe(1);
-		const orig = fs.writeSync;
-		(fs as any).writeSync = (fd: number, ...rest: any[]) => {
-			if (fd > 2) {
-				const e: NodeJS.ErrnoException = new Error("ENOSPC: no space left on device, write");
-				e.code = "ENOSPC";
-				throw e;
-			}
-			return (orig as any)(fd, ...rest);
-		};
-		syncBuiltinESMExports();
-		try {
-			await waitFor(() => h.events.some((e) => e.type === "background_shell_exited"));
-		} finally {
-			(fs as any).writeSync = orig;
-			syncBuiltinESMExports();
-		}
-		expect(openOnFile()).toBe(0);
-		// the patched writeSync really was hit: nothing reached the file
+		await waitFor(() => h.events.some((e) => e.type === "background_shell_exited"));
+		// the first failed write marks the file incomplete: nothing else (not even the exit line) is tried
+		expect(appends).toBe(1);
 		expect(readFileSync(path, "utf8")).toBe("");
 		await waitFor(() => h.messages.length > 0);
 		expect(h.messages[0].message.content).toContain("<status>completed</status>");
@@ -306,7 +294,7 @@ describe("quirk orphanProcesses (#11)", () => {
 
 describe("output directory ownership", () => {
 	it.runIf(uid !== undefined)("tightens an existing root to 0700 and refuses a symlinked root", async () => {
-		const { privateTempRoot } = await import("../src/shared/background.js");
+		const { privateTempRoot } = await import("../src/host/local.js");
 		const base = tempDir("pi-cc-root-");
 		try {
 			const root = join(base, `pi-cc-${uid}`);
@@ -325,7 +313,7 @@ describe("output directory ownership", () => {
 	});
 
 	it.runIf(uid === 0)("refuses a root owned by another user", async () => {
-		const { privateTempRoot } = await import("../src/shared/background.js");
+		const { privateTempRoot } = await import("../src/host/local.js");
 		const base = tempDir("pi-cc-root-");
 		try {
 			const root = join(base, `pi-cc-${uid}`);

@@ -1,16 +1,16 @@
-import { execFile } from "node:child_process";
-import { createReadStream, existsSync } from "node:fs";
-import { mkdtemp, open, readdir, readFile, realpath, rm, stat } from "node:fs/promises";
-import { tmpdir } from "node:os";
-import { basename, dirname, extname, join, relative, sep } from "node:path";
 import { isUtf8 } from "node:buffer";
+import { randomBytes } from "node:crypto";
+import { basename, dirname, extname, join, relative, sep } from "node:path";
 import type { StringDecoder } from "node:string_decoder";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import type { ImageContent, TextContent } from "@earendil-works/pi-ai";
 import type { AgentToolResult, ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
+import { HostCommandError, runHostCommand } from "../host/exec.js";
+import type { ClaudeCodeHost, HostFileSystem } from "../host/types.js";
+import { asBuffer } from "../shared/background.js";
 import type { CCContext } from "../shared/context.js";
-import { decoderFor, hashFileTextAsync, TextHasher } from "../shared/file-state.js";
+import { decoderFor, hashFileText, TextHasher } from "../shared/file-state.js";
 import { resolveToolPath } from "../shared/paths.js";
 import { isFixed } from "../shared/quirks.js";
 
@@ -396,6 +396,7 @@ export function selectLines(text: string, offset: number, limit: number | undefi
  * file's text hash for the file-state record is computed on the way (#6a).
  */
 async function streamLines(
+	fs: HostFileSystem,
 	absPath: string,
 	offset: number,
 	limit: number | undefined,
@@ -421,29 +422,28 @@ async function streamLines(
 		}
 		selected.push(line);
 	};
-	const stream = createReadStream(absPath, { highWaterMark: STREAM_CHUNK_BYTES, signal });
-	try {
-		for await (const chunk of stream as AsyncIterable<Buffer>) {
-			decoder ??= decoderFor(chunk);
-			let s = decoder.write(chunk);
-			hasher.update(s);
-			if (first && s !== "") {
-				first = false;
-				if (s.charCodeAt(0) === 0xfeff) s = s.slice(1);
-			}
-			total += Buffer.byteLength(s);
-			if (maxBytes !== undefined && total > maxBytes) throw new FileTooLargeError(total, maxBytes);
-			s = partial + s;
-			let pos = 0;
-			for (let nl = s.indexOf("\n", pos); nl !== -1; nl = s.indexOf("\n", pos)) {
-				if (index >= offset && index < end) take(s.slice(pos, nl));
-				index++;
-				pos = nl + 1;
-			}
-			partial = s.slice(pos);
+	for (let filePos = 0; ; ) {
+		if (signal?.aborted) throw Object.assign(new Error("The operation was aborted"), { name: "AbortError", code: "ABORT_ERR" });
+		const chunk = asBuffer(await fs.readRange(absPath, filePos, STREAM_CHUNK_BYTES, { signal }));
+		if (chunk.length === 0) break;
+		filePos += chunk.length;
+		decoder ??= decoderFor(chunk);
+		let s = decoder.write(chunk);
+		hasher.update(s);
+		if (first && s !== "") {
+			first = false;
+			if (s.charCodeAt(0) === 0xfeff) s = s.slice(1);
 		}
-	} finally {
-		stream.destroy();
+		total += Buffer.byteLength(s);
+		if (maxBytes !== undefined && total > maxBytes) throw new FileTooLargeError(total, maxBytes);
+		s = partial + s;
+		let pos = 0;
+		for (let nl = s.indexOf("\n", pos); nl !== -1; nl = s.indexOf("\n", pos)) {
+			if (index >= offset && index < end) take(s.slice(pos, nl));
+			index++;
+			pos = nl + 1;
+		}
+		partial = s.slice(pos);
 	}
 	const rest = decoder?.end() ?? "";
 	hasher.update(rest);
@@ -454,6 +454,7 @@ async function streamLines(
 }
 
 async function readTextRange(
+	fs: HostFileSystem,
 	absPath: string,
 	size: number,
 	offset: number,
@@ -464,9 +465,9 @@ async function readTextRange(
 	raceAbort = false,
 ): Promise<TextRange> {
 	if (maxSelectedBytes !== undefined && size <= maxSelectedBytes) maxSelectedBytes = undefined;
-	if (size >= STREAM_THRESHOLD_BYTES) return streamLines(absPath, offset, limit, maxBytes, maxSelectedBytes, signal);
+	if (size >= STREAM_THRESHOLD_BYTES) return streamLines(fs, absPath, offset, limit, maxBytes, maxSelectedBytes, signal);
 	if (maxBytes !== undefined && size > maxBytes) throw new FileTooLargeError(size, maxBytes);
-	const read = readFile(absPath, { signal });
+	const read = fs.readFile(absPath, { signal }).then(asBuffer);
 	const buf = raceAbort ? await abortable(read, signal) : await read;
 	if (maxBytes !== undefined && buf.length > maxBytes) throw new FileTooLargeError(buf.length, maxBytes);
 	const { text, notText } = decodeText(buf);
@@ -525,6 +526,7 @@ async function readTextFile(
 	let range: TextRange;
 	try {
 		range = await readTextRange(
+			cc.host.fs,
 			absPath,
 			size,
 			startIndex,
@@ -570,7 +572,7 @@ async function readTextFile(
 	const partial = banner !== undefined || startIndex > 0 || numLines < range.totalLines;
 	try {
 		// A streamed file was hashed while streaming: never load it whole just to record it (#6a).
-		cc.fileState.recordRead(absPath, range.raw ?? { hash: range.hash! }, { partial, truncated: banner !== undefined, offset, limit: recordedLimit });
+		await cc.fileState.recordRead(absPath, range.raw ?? { hash: range.hash! }, { partial, truncated: banner !== undefined, offset, limit: recordedLimit });
 	} catch {
 		// the file vanished between reading and recording: nothing to track
 	}
@@ -656,8 +658,8 @@ function loadPiImageResize(): Promise<PiImageResizeModule> {
 		for (const start of starts) {
 			let dir = start;
 			for (let i = 0; i < 10; i++) {
-				const p = join(dir, "node_modules", "@earendil-works", "pi-coding-agent", "dist", "utils", "image-resize.js");
-				if (existsSync(p)) candidates.push(pathToFileURL(p).href);
+				// a missing candidate fails to import and the next one is tried
+				candidates.push(pathToFileURL(join(dir, "node_modules", "@earendil-works", "pi-coding-agent", "dist", "utils", "image-resize.js")).href);
 				const parent = dirname(dir);
 				if (parent === dir) break;
 				dir = parent;
@@ -701,13 +703,13 @@ export async function prepareImage(buffer: Buffer, mimeType: string): Promise<{ 
 	return { note: "[Image omitted: could not be resized below the inline image size limit.]" };
 }
 
-async function readImage(absPath: string, size: number, signal?: AbortSignal): Promise<AgentToolResult<ReadToolDetails>> {
+async function readImage(fs: HostFileSystem, absPath: string, size: number, signal?: AbortSignal): Promise<AgentToolResult<ReadToolDetails>> {
 	if (size > MAX_IMAGE_FILE_BYTES) {
 		throw new Error(
 			`File is too large to read as an image (the limit is ${formatBytes(MAX_IMAGE_FILE_BYTES)}): ${absPath}. If it is an image, resize it or export a smaller copy, then read that.`,
 		);
 	}
-	const buffer = signal ? await abortable(readFile(absPath, { signal }), signal) : await readFile(absPath);
+	const buffer = asBuffer(signal ? await abortable(fs.readFile(absPath, { signal }), signal) : await fs.readFile(absPath));
 	if (buffer.length === 0) throw new Error(`Image file is empty: ${absPath}`);
 	const mime = sniffImageMimeType(buffer);
 	if (!mime) {
@@ -727,16 +729,12 @@ async function readImage(absPath: string, size: number, signal?: AbortSignal): P
 // PDF support (poppler-utils: pdfinfo / pdftoppm / pdftotext)
 // ---------------------------------------------------------------------------------------------
 
-function run(cmd: string, args: string[], signal?: AbortSignal): Promise<{ stdout: string; stderr: string }> {
-	return new Promise((resolve, reject) => {
-		execFile(cmd, args, { signal, maxBuffer: 64 * 1024 * 1024, encoding: "utf8", timeout: 120000 }, (err, stdout, stderr) => {
-			if (err) {
-				(err as any).stderr = stderr;
-				reject(err);
-			} else resolve({ stdout, stderr });
-		});
-	});
+/** Run a poppler-utils program on the host (execFile semantics: 64 MB output, 2 minute timeout). */
+function run(host: ClaudeCodeHost, absPath: string, cmd: string, args: string[], signal?: AbortSignal): Promise<{ stdout: string; stderr: string }> {
+	return runHostCommand(host, [cmd, ...args], { cwd: dirname(absPath), signal, maxBuffer: 64 * 1024 * 1024, timeoutMs: 120000 });
 }
+
+const isAbort = (err: unknown) => err instanceof HostCommandError && err.reason === "abort";
 
 /** Parse "3" or "1-5" ("4-" is open-ended: lastPage = Infinity). Returns null when invalid. */
 export function parsePageRange(pages: string): { firstPage: number; lastPage: number } | null {
@@ -759,13 +757,13 @@ export function validatePages(pages: string): string | undefined {
 	return undefined;
 }
 
-async function pdfPageCount(absPath: string, signal?: AbortSignal): Promise<number | undefined> {
+async function pdfPageCount(host: ClaudeCodeHost, absPath: string, signal?: AbortSignal): Promise<number | undefined> {
 	try {
-		const { stdout } = await run("pdfinfo", [absPath], signal);
+		const { stdout } = await run(host, absPath, "pdfinfo", [absPath], signal);
 		const m = /^Pages:\s+(\d+)/m.exec(stdout);
 		return m ? Number(m[1]) : undefined;
 	} catch (err: any) {
-		if (err?.name === "AbortError") throw new Error("Operation aborted");
+		if (isAbort(err)) throw new Error("Operation aborted");
 		return undefined;
 	}
 }
@@ -774,20 +772,28 @@ const PDFTOPPM_MISSING =
 	"pdftoppm is not installed. Install poppler-utils (e.g. `brew install poppler` or `apt-get install poppler-utils`) to enable PDF page rendering.";
 
 /** Render pages as JPEGs (pdftoppm -jpeg -r 100) and return them in page order. */
-async function renderPdfPages(absPath: string, size: number, range: { firstPage: number; lastPage: number } | undefined, signal?: AbortSignal): Promise<Buffer[]> {
+async function renderPdfPages(
+	host: ClaudeCodeHost,
+	absPath: string,
+	size: number,
+	range: { firstPage: number; lastPage: number } | undefined,
+	signal?: AbortSignal,
+): Promise<Buffer[]> {
 	if (size === 0) throw new Error(`PDF file is empty: ${absPath}`);
 	if (size > PDF_MAX_EXTRACT_BYTES) throw new Error(`PDF file exceeds maximum allowed size for text extraction (${formatBytes(PDF_MAX_EXTRACT_BYTES)}).`);
-	const tmp = await mkdtemp(join(tmpdir(), "pi-cc-pdf-"));
+	const fs = host.fs;
+	const tmp = join(host.tmpDir, `pi-cc-pdf-${randomBytes(6).toString("hex")}`);
+	await fs.mkdir(tmp, { mode: 0o700 });
 	try {
 		const args = ["-jpeg", "-r", "100"];
 		if (range?.firstPage) args.push("-f", String(range.firstPage));
 		if (range?.lastPage && range.lastPage !== Infinity) args.push("-l", String(range.lastPage));
 		args.push(absPath, join(tmp, "page"));
 		try {
-			await run("pdftoppm", args, signal);
+			await run(host, absPath, "pdftoppm", args, signal);
 		} catch (err: any) {
-			if (err?.code === "ENOENT") throw new Error(PDFTOPPM_MISSING);
-			if (err?.name === "AbortError" || signal?.aborted) throw new Error("Operation aborted");
+			if (err instanceof HostCommandError && err.notFound) throw new Error(PDFTOPPM_MISSING);
+			if (isAbort(err) || signal?.aborted) throw new Error("Operation aborted");
 			const stderr = String(err?.stderr ?? "");
 			if (/password/i.test(stderr)) throw new Error("PDF is password-protected. Please provide an unprotected version.");
 			const wrong = /Wrong page range given.*last page \((\d+)\)/i.exec(stderr);
@@ -809,11 +815,11 @@ async function renderPdfPages(absPath: string, size: number, range: { firstPage:
 			}
 			throw new Error(`pdftoppm failed: ${stderr.trim() || err?.message || String(err)}`);
 		}
-		const files = (await readdir(tmp)).filter((f) => f.endsWith(".jpg")).sort();
+		const files = (await fs.readdir(tmp)).map((e) => e.name).filter((f) => f.endsWith(".jpg")).sort();
 		if (files.length === 0) throw new Error("pdftoppm produced no output pages. The PDF may be invalid.");
-		return await Promise.all(files.map((f) => readFile(join(tmp, f))));
+		return await Promise.all(files.map(async (f) => asBuffer(await fs.readFile(join(tmp, f)))));
 	} finally {
-		await rm(tmp, { recursive: true, force: true }).catch(() => {});
+		await fs.rm(tmp, { recursive: true, force: true }).catch(() => {});
 	}
 }
 
@@ -827,18 +833,18 @@ async function pageImages(jpegs: Buffer[], firstPage: number): Promise<Content[]
 	return out;
 }
 
-async function readPdf(absPath: string, size: number, pages: string | undefined, signal?: AbortSignal): Promise<AgentToolResult<ReadToolDetails>> {
+async function readPdf(host: ClaudeCodeHost, absPath: string, size: number, pages: string | undefined, signal?: AbortSignal): Promise<AgentToolResult<ReadToolDetails>> {
 	if (pages !== undefined) {
 		const error = validatePages(pages);
 		if (error) throw new Error(error);
 		const range = parsePageRange(pages)!;
-		const jpegs = await renderPdfPages(absPath, size, range, signal);
+		const jpegs = await renderPdfPages(host, absPath, size, range, signal);
 		const content: Content[] = [{ type: "text", text: `PDF pages extracted: ${jpegs.length} page(s) from ${absPath} (${formatBytes(size)})` }];
 		content.push(...(await pageImages(jpegs, range.firstPage)));
 		return { content, details: { filePath: absPath, kind: "pdf", pages: [range.firstPage, range.firstPage + jpegs.length - 1] } };
 	}
 
-	const totalPages = await pdfPageCount(absPath, signal);
+	const totalPages = await pdfPageCount(host, absPath, signal);
 	if (totalPages !== undefined && totalPages > PDF_MAX_PAGES_WITHOUT_RANGE) {
 		throw new Error(
 			`This PDF has ${totalPages} pages, which is too many to read at once. Use the pages parameter to read specific page ranges (e.g., pages: "1-5"). Maximum ${PDF_MAX_PAGES_PER_REQUEST} pages per request.`,
@@ -846,23 +852,17 @@ async function readPdf(absPath: string, size: number, pages: string | undefined,
 	}
 	if (size === 0) throw new Error(`PDF file is empty: ${absPath}`);
 	if (size > PDF_MAX_WHOLE_BYTES) throw new Error(`PDF file exceeds maximum allowed size of ${formatBytes(PDF_MAX_WHOLE_BYTES)}.`);
-	const fh = await open(absPath, "r");
-	try {
-		const head = Buffer.alloc(5);
-		await fh.read(head, 0, 5, 0);
-		if (!head.toString("ascii").startsWith("%PDF-")) throw new Error(`File is not a valid PDF (missing %PDF- header): ${absPath}`);
-	} finally {
-		await fh.close();
-	}
+	const head = asBuffer(await host.fs.readRange(absPath, 0, 5));
+	if (!head.toString("ascii").startsWith("%PDF-")) throw new Error(`File is not a valid PDF (missing %PDF- header): ${absPath}`);
 	// Claude Code attaches the PDF itself as a document block; pi tool results carry text and images
 	// only, so the pages are attached as rendered images (falling back to extracted text).
 	const content: Content[] = [{ type: "text", text: `PDF file read: ${absPath} (${formatBytes(size)})` }];
 	try {
-		content.push(...(await pageImages(await renderPdfPages(absPath, size, undefined, signal), 1)));
+		content.push(...(await pageImages(await renderPdfPages(host, absPath, size, undefined, signal), 1)));
 	} catch (err: any) {
 		if (signal?.aborted) throw new Error("Operation aborted");
 		try {
-			const { stdout } = await run("pdftotext", ["-layout", "-enc", "UTF-8", absPath, "-"], signal);
+			const { stdout } = await run(host, absPath, "pdftotext", ["-layout", "-enc", "UTF-8", absPath, "-"], signal);
 			const pageTexts = stdout.split("\f");
 			if (pageTexts.length > 1 && pageTexts[pageTexts.length - 1].trim() === "") pageTexts.pop();
 			content.push({ type: "text", text: pageTexts.map((t, i) => `<page number="${i + 1}">\n${t.replace(/\s+$/, "")}\n</page>`).join("\n") });
@@ -964,11 +964,11 @@ function jscJsonError(err: unknown): string {
 	return msg;
 }
 
-async function readNotebook(absPath: string, size: number, signal?: AbortSignal): Promise<{ result: AgentToolResult<ReadToolDetails>; raw: Buffer }> {
+async function readNotebook(fs: HostFileSystem, absPath: string, size: number, signal?: AbortSignal): Promise<{ result: AgentToolResult<ReadToolDetails>; raw: Buffer }> {
 	if (size > NOTEBOOK_MAX_FILE_BYTES) {
 		throw new Error(`Notebook file exceeds the maximum size this tool can read (${formatBytes(NOTEBOOK_MAX_FILE_BYTES)}). ${NOTEBOOK_JQ_HINT}`);
 	}
-	const raw = signal ? await abortable(readFile(absPath, { signal }), signal) : await readFile(absPath);
+	const raw = asBuffer(signal ? await abortable(fs.readFile(absPath, { signal }), signal) : await fs.readFile(absPath));
 	let nb: any;
 	try {
 		nb = JSON.parse(raw.toString("utf8"));
@@ -1047,11 +1047,11 @@ function isBlockingDevice(p: string): boolean {
 }
 
 /** A sibling with the same name but another (or no) extension. */
-async function findSimilarFile(absPath: string): Promise<string | undefined> {
+async function findSimilarFile(fs: HostFileSystem, absPath: string): Promise<string | undefined> {
 	const dir = dirname(absPath);
 	const stem = basename(absPath, extname(absPath));
 	try {
-		const entries = await readdir(dir);
+		const entries = (await fs.readdir(dir)).map((e) => e.name);
 		return entries.find((name) => /^(\.[\p{L}\p{N}_+~#-]{1,32})?$/u.test(extname(name).normalize("NFC")) && basename(name, extname(name)) === stem && join(dir, name) !== absPath);
 	} catch {
 		return undefined;
@@ -1059,11 +1059,11 @@ async function findSimilarFile(absPath: string): Promise<string | undefined> {
 }
 
 /** A path under cwd's parent but outside cwd whose cwd-relative twin exists. */
-async function findUnderCwd(absPath: string, cwd: string): Promise<string | undefined> {
+async function findUnderCwd(fs: HostFileSystem, absPath: string, cwd: string): Promise<string | undefined> {
 	const parent = dirname(cwd);
 	let p = absPath;
 	try {
-		p = join(await realpath(dirname(absPath)), basename(absPath));
+		p = join(await fs.realpath(dirname(absPath)), basename(absPath));
 	} catch {
 		// keep as is
 	}
@@ -1071,17 +1071,17 @@ async function findUnderCwd(absPath: string, cwd: string): Promise<string | unde
 	if (!p.startsWith(prefix) || p.startsWith(cwd + sep) || p === cwd) return undefined;
 	const candidate = join(cwd, relative(parent, p));
 	try {
-		await stat(candidate);
+		await fs.stat(candidate);
 		return candidate;
 	} catch {
 		return undefined;
 	}
 }
 
-async function missingFileError(absPath: string, cwd: string): Promise<Error> {
+async function missingFileError(fs: HostFileSystem, absPath: string, cwd: string): Promise<Error> {
 	let msg = `File does not exist. Note: your current working directory is ${cwd}.`;
-	const inCwd = await findUnderCwd(absPath, cwd);
-	const similar = inCwd ? undefined : await findSimilarFile(absPath);
+	const inCwd = await findUnderCwd(fs, absPath, cwd);
+	const similar = inCwd ? undefined : await findSimilarFile(fs, absPath);
 	if (inCwd) msg += ` Did you mean ${inCwd}?`;
 	else if (similar) msg += ` Did you mean ${similar}?`;
 	return new Error(msg);
@@ -1112,6 +1112,7 @@ export function registerRead(pi: ExtensionAPI, cc: CCContext): void {
 			const params = rawParams as ReadParams;
 			if (typeof params.file_path !== "string") throw new Error("file_path is required.");
 			const cwd = ctx?.cwd ?? process.cwd();
+			const fs = cc.host.fs;
 
 			// validateInput (same order as Claude Code)
 			if (params.pages !== undefined) {
@@ -1143,9 +1144,9 @@ export function registerRead(pi: ExtensionAPI, cc: CCContext): void {
 			const rec = cc.fileState.get(absPath);
 			if (rec && rec.source === "read" && !rec.truncated && !rec.contentNotInModelContext && rec.offset !== undefined && rec.offset === offset && rec.limit === limit) {
 				try {
-					const st = await stat(absPath);
+					const st = await fs.stat(absPath);
 					// #5 fixed: an unchanged mtime is not enough, the content must match too.
-					if (Math.floor(st.mtimeMs) === rec.timestamp && (!contentCheck || (st.isFile() && (await hashFileTextAsync(absPath)) === rec.hash))) {
+					if (Math.floor(st.mtimeMs) === rec.timestamp && (!contentCheck || (st.isFile && (await hashFileText(fs, absPath)) === rec.hash))) {
 						return { content: [{ type: "text", text: WASTED_CALL_MESSAGE }], details: { filePath: absPath, kind: "file_unchanged" } };
 					}
 				} catch {
@@ -1155,30 +1156,31 @@ export function registerRead(pi: ExtensionAPI, cc: CCContext): void {
 
 			let st;
 			try {
-				st = await stat(absPath);
+				st = await fs.stat(absPath);
 			} catch (err: any) {
 				if (err?.code !== "ENOENT" && err?.code !== "ENOTDIR") throw err;
 				const alt = alternateScreenshotPath(absPath);
-				if (alt && existsSync(alt)) {
+				const altStat = alt ? await fs.stat(alt).catch(() => undefined) : undefined;
+				if (alt && altStat) {
 					absPath = alt;
-					st = await stat(absPath);
+					st = altStat;
 				} else {
-					throw await missingFileError(absPath, cwd);
+					throw await missingFileError(fs, absPath, cwd);
 				}
 			}
-			if (st.isDirectory()) throw new Error(`EISDIR: illegal operation on a directory, read '${absPath}'`);
+			if (st.isDirectory) throw new Error(`EISDIR: illegal operation on a directory, read '${absPath}'`);
 			throwIfAborted(signal);
 			// #7a fixed: refuse FIFOs, sockets and devices before dispatching on the extension (Claude
 			// Code reads a FIFO named like an image or PDF, blocking until a writer shows up).
-			if (fixSpecialFiles && !st.isFile()) {
+			if (fixSpecialFiles && !st.isFile) {
 				throw new Error(isNotebook ? "Notebook path is not a regular file (device, FIFO, or socket)." : `${absPath} is not a regular file.`);
 			}
 
 			if (isNotebook) {
-				if (!st.isFile()) throw new Error("Notebook path is not a regular file (device, FIFO, or socket).");
-				const { result, raw } = await readNotebook(absPath, st.size, readSignal);
+				if (!st.isFile) throw new Error("Notebook path is not a regular file (device, FIFO, or socket).");
+				const { result, raw } = await readNotebook(fs, absPath, st.size, readSignal);
 				try {
-					cc.fileState.recordRead(absPath, raw, { offset, limit });
+					await cc.fileState.recordRead(absPath, raw, { offset, limit });
 				} catch {
 					// vanished meanwhile
 				}
@@ -1186,19 +1188,12 @@ export function registerRead(pi: ExtensionAPI, cc: CCContext): void {
 			}
 
 			let looksLikeImage = IMAGE_EXTENSIONS.has(ext);
-			if (!looksLikeImage && ext === "" && st.isFile()) {
-				const fh = await open(absPath, "r");
-				try {
-					const head = Buffer.alloc(16);
-					const { bytesRead } = await fh.read(head, 0, 16, 0);
-					looksLikeImage = sniffImageMimeType(head.subarray(0, bytesRead)) !== undefined;
-				} finally {
-					await fh.close();
-				}
+			if (!looksLikeImage && ext === "" && st.isFile) {
+				looksLikeImage = sniffImageMimeType(asBuffer(await fs.readRange(absPath, 0, 16))) !== undefined;
 			}
-			if (looksLikeImage) return readImage(absPath, st.size, readSignal);
-			if (ext === "pdf") return readPdf(absPath, st.size, params.pages, signal);
-			if (!st.isFile()) throw new Error(`${absPath} is not a regular file.`);
+			if (looksLikeImage) return readImage(fs, absPath, st.size, readSignal);
+			if (ext === "pdf") return readPdf(cc.host, absPath, st.size, params.pages, signal);
+			if (!st.isFile) throw new Error(`${absPath} is not a regular file.`);
 			return readTextFile(cc, ctx, absPath, st.size, { offset, limit, allowLarge: params.allow_large === true }, signal);
 		},
 	});

@@ -1,7 +1,6 @@
 import { randomBytes } from "node:crypto";
-import { chmodSync, lstatSync, mkdirSync, openSync } from "node:fs";
-import { tmpdir, userInfo } from "node:os";
 import { join } from "node:path";
+import type { ClaudeCodeHost, HostFileSystem } from "../host/types.js";
 
 /** Background task kinds, as Claude Code reports them in TaskStop results. */
 export type BackgroundTaskType = "local_bash" | "local_agent";
@@ -32,42 +31,21 @@ export function newTaskId(type: BackgroundTaskType): string {
 	return "b" + s;
 }
 
-function currentUid(): number | undefined {
-	return typeof process.getuid === "function" ? process.getuid() : undefined;
+/** Bytes of a host file as a Buffer (no copy). */
+export function asBuffer(data: Uint8Array): Buffer {
+	return Buffer.isBuffer(data) ? data : Buffer.from(data.buffer, data.byteOffset, data.byteLength);
 }
 
 /**
- * Create `dir` (and missing parents) with mode 0700. An existing `dir` must be a real directory
- * owned by the current user; it is chmod-ed back to 0700 if it is more open.
+ * Create `dir` (and missing parents) on the host with mode 0700. An existing `dir` must be a real
+ * directory; it is chmod-ed back to 0700 if it is more open. (The host's `tmpDir` itself is checked
+ * by the host: the local one also refuses a root owned by another user.)
  */
-export function ensurePrivateDir(dir: string): void {
-	mkdirSync(dir, { recursive: true, mode: 0o700 });
-	const st = lstatSync(dir);
-	if (st.isSymbolicLink() || !st.isDirectory()) throw new Error(`${dir} is not a directory`);
-	const uid = currentUid();
-	if (uid === undefined) return;
-	if (st.uid !== uid) throw new Error(`${dir} is not owned by the current user`);
-	if ((st.mode & 0o077) !== 0) chmodSync(dir, 0o700);
-}
-
-/**
- * Per-user private temp root, like Claude Code's `$TMPDIR/claude-<uid>` (mode 0700):
- * `<os.tmpdir()>/pi-cc-<uid>`. Created on demand.
- */
-export function privateTempRoot(base: string = tmpdir()): string {
-	const uid = currentUid();
-	let who: string;
-	if (uid !== undefined) who = String(uid);
-	else {
-		try {
-			who = userInfo().username.replace(/[^\w.-]/g, "_") || "user";
-		} catch {
-			who = "user";
-		}
-	}
-	const root = join(base, `pi-cc-${who}`);
-	ensurePrivateDir(root);
-	return root;
+export async function ensurePrivateDir(fs: HostFileSystem, dir: string): Promise<void> {
+	await fs.mkdir(dir, { recursive: true, mode: 0o700 });
+	const st = await fs.lstat(dir);
+	if (st.isSymbolicLink || !st.isDirectory) throw new Error(`${dir} is not a directory`);
+	if ((st.mode & 0o077) !== 0) await fs.chmod(dir, 0o700);
 }
 
 /**
@@ -82,8 +60,8 @@ export class BackgroundTaskRegistry {
 
 	constructor(
 		private sessionKey: () => string,
-		/** Base temp directory (tests). Default: os.tmpdir(). */
-		private baseTmp?: string,
+		/** Where output files live: `<host.tmpDir>/<session>/tasks`. */
+		private host: Pick<ClaudeCodeHost, "fs" | "tmpDir">,
 	) {}
 
 	add(task: BackgroundTask): BackgroundTask {
@@ -116,23 +94,25 @@ export class BackgroundTaskRegistry {
 	}
 
 	/**
-	 * Directory for task output files: <tmpdir>/pi-cc-<uid>/<session>/tasks, every level 0700.
-	 * (Re)created on every call, so a deleted directory is recreated like Claude Code does.
+	 * Directory for task output files: <host.tmpDir>/<session>/tasks (locally
+	 * <tmpdir>/pi-cc-<uid>/<session>/tasks), every level 0700. (Re)created on every call, so a
+	 * deleted directory is recreated like Claude Code does.
 	 */
-	outputDir(): string {
-		const dir = join(privateTempRoot(this.baseTmp), this.sessionKey().replace(/[^\w.-]/g, "_"), "tasks");
-		mkdirSync(dir, { recursive: true, mode: 0o700 });
+	async outputDir(): Promise<string> {
+		const dir = join(this.host.tmpDir, this.sessionKey().replace(/[^\w.-]/g, "_"), "tasks");
+		await this.host.fs.mkdir(dir, { recursive: true, mode: 0o700 });
 		return dir;
 	}
 
-	outputPath(id: string): string {
-		return join(this.outputDir(), `${id}.output`);
+	async outputPath(id: string): Promise<string> {
+		return join(await this.outputDir(), `${id}.output`);
 	}
 
-	/** Create (truncate) a task's output file with mode 0600 and return its path and open fd. */
-	createOutputFile(id: string, ext = ".output"): { path: string; fd: number } {
-		const path = join(this.outputDir(), `${id}${ext}`);
-		return { path, fd: openSync(path, "w", 0o600) };
+	/** Create (truncate) a task's output file with mode 0600 and return its path. */
+	async createOutputFile(id: string, ext = ".output"): Promise<{ path: string }> {
+		const path = join(await this.outputDir(), `${id}${ext}`);
+		await this.host.fs.writeFile(path, "", { mode: 0o600 });
+		return { path };
 	}
 
 	async stop(id: string): Promise<BackgroundTask> {
@@ -156,5 +136,60 @@ export class BackgroundTaskRegistry {
 					}
 				}),
 		);
+	}
+}
+
+/**
+ * Appends text to a host file in order, without blocking the caller: writes are queued and
+ * coalesced. After the first failed write the file is marked `failed` and nothing more is written.
+ */
+export class FileAppender {
+	private pending = "";
+	private writing: Promise<void> | undefined;
+	private closed = false;
+	/** A write failed: the file is incomplete. */
+	failed = false;
+
+	constructor(
+		private readonly fs: HostFileSystem,
+		readonly path: string,
+		/** Settles once the file exists (false: it could not be created, nothing is written). */
+		private readonly ready: Promise<boolean> = Promise.resolve(true),
+	) {}
+
+	write(text: string): void {
+		if (this.closed || this.failed || !text) return;
+		this.pending += text;
+		this.writing ??= this.drain();
+	}
+
+	private async drain(): Promise<void> {
+		if (!(await this.ready)) {
+			this.failed = true;
+			this.pending = "";
+		}
+		while (this.pending && !this.failed) {
+			const chunk = this.pending;
+			this.pending = "";
+			try {
+				await this.fs.appendFile(this.path, chunk);
+			} catch {
+				this.failed = true;
+				this.pending = "";
+			}
+		}
+		this.writing = undefined;
+	}
+
+	/** Resolves once everything written so far is in the file (or the file failed). */
+	async flush(): Promise<void> {
+		if (!(await this.ready)) this.failed = true;
+		while (this.writing) await this.writing;
+	}
+
+	/** Stop accepting writes and flush. Idempotent, never rejects. */
+	close(): Promise<void> {
+		this.closed = true;
+		return this.flush();
 	}
 }

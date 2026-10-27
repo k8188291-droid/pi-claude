@@ -1,4 +1,3 @@
-import { appendFileSync, writeFileSync } from "node:fs";
 import type { AssistantMessage, Model } from "@earendil-works/pi-ai";
 import {
 	type AgentSession,
@@ -13,7 +12,7 @@ import {
 import { Type } from "typebox";
 import { withDeferredExposure } from "../deferred-tools.js";
 import { createClaudeCodeSession } from "../sdk.js";
-import { type BackgroundTask, newTaskId } from "../shared/background.js";
+import { type BackgroundTask, FileAppender, newTaskId } from "../shared/background.js";
 import { type CCContext, createCCContext } from "../shared/context.js";
 import { formatTaskNotification } from "../shared/notifications.js";
 import { isFixed } from "../shared/quirks.js";
@@ -39,7 +38,7 @@ import {
 	validateAgentInput,
 	type WorktreeInfo,
 } from "./prompt.js";
-import { type AgentWorktree, createAgentWorktree, finishAgentWorktree, gitRootOf } from "./worktree.js";
+import { type AgentWorktree, createAgentWorktree, finishAgentWorktree, gitRootOf, WORKTREE_UNSUPPORTED } from "./worktree.js";
 
 export {
 	BUILT_IN_AGENTS,
@@ -262,13 +261,16 @@ export function registerAgent(pi: ExtensionAPI, cc: CCContext, internal: Registe
 	let lastListing: string | undefined;
 	const isSubagent = cc.options.isSubagent === true;
 
+	const host = cc.host;
 	const loadDefs = (cwd: string) =>
 		loadAgentDefinitions({
+			fs: host.fs,
+			homeDir: subagentInternals.homeDir ?? host.homeDir,
 			cwd,
 			agents: cc.options.agents,
 			loadAgentsFromDisk: cc.options.loadAgentsFromDisk,
-			homeDir: subagentInternals.homeDir,
 		});
+	const finishWorktree = (w: AgentWorktree) => finishAgentWorktree(host, w);
 
 	const emit = (event: ClaudeCodeHostEvent) => cc.emit(event);
 
@@ -367,6 +369,8 @@ export function registerAgent(pi: ExtensionAPI, cc: CCContext, internal: Registe
 
 		const childOptions: ClaudeCodeToolsOptions = {
 			...cc.options,
+			// subagents work on the parent's filesystem, shell and search
+			host,
 			isSubagent: true,
 			onAskUserQuestion: undefined,
 			sharedTaskStore: cc.taskStore,
@@ -418,6 +422,8 @@ export function registerAgent(pi: ExtensionAPI, cc: CCContext, internal: Registe
 			model,
 			thinkingLevel,
 			claudeCode: childOptions,
+			// a non-local host supplies its own loader: DefaultResourceLoader reads the real disk
+			resourceLoaderFactory: cc.options.subagentResourceLoader,
 			loader: {
 				// no disk-discovered pi extensions/templates/themes/skills in children; context files (AGENTS.md/CLAUDE.md) are kept
 				noExtensions: true,
@@ -450,22 +456,28 @@ export function registerAgent(pi: ExtensionAPI, cc: CCContext, internal: Registe
 		return session;
 	}
 
-	function startTranscript(run: AgentRun): () => void {
+	/**
+	 * Write the run's transcript to its output file; the returned stop function flushes it. Starts
+	 * synchronously (the file is created ahead of the queued appends), so the child's prompt is not
+	 * held up by it.
+	 */
+	function startTranscript(run: AgentRun): () => Promise<void> {
 		const file = run.outputFile;
-		if (!file) return () => {};
-		try {
-			writeFileSync(file, "", { mode: 0o600 });
-		} catch {
-			return () => {};
-		}
-		return run.session.subscribe((event) => {
+		if (!file) return async () => {};
+		const created = host.fs.writeFile(file, "", { mode: 0o600 }).then(
+			() => true,
+			() => false,
+		);
+		// queued in order; a failed create or append ends the transcript (it is best-effort)
+		const out = new FileAppender(host.fs, file, created);
+		const unsubscribe = run.session.subscribe((event) => {
 			if (event.type !== "message_end" || (event.message as { role?: string }).role === "system") return;
-			try {
-				appendFileSync(file, `${JSON.stringify({ type: (event.message as { role?: string }).role, agentId: run.agentId, timestamp: new Date().toISOString(), message: event.message })}\n`);
-			} catch {
-				// transcript is best-effort
-			}
+			out.write(`${JSON.stringify({ type: (event.message as { role?: string }).role, agentId: run.agentId, timestamp: new Date().toISOString(), message: event.message })}\n`);
 		});
+		return async () => {
+			unsubscribe();
+			await out.close();
+		};
 	}
 
 	async function runAgent(run: AgentRun, prompt: string, onUpdate: AgentToolUpdateCallback<AgentDetails> | undefined): Promise<RunResult> {
@@ -513,7 +525,7 @@ export function registerAgent(pi: ExtensionAPI, cc: CCContext, internal: Registe
 			return { text: assistantText(last), usage, totalTokens: lastCallTokens(newMessages) };
 		} finally {
 			unsubscribe();
-			stopTranscript();
+			await stopTranscript();
 			signal.removeEventListener("abort", onAbort);
 			run.running = false;
 			usage ??= computeSubagentUsage(session.messages.slice(startIndex), Date.now() - t0);
@@ -532,7 +544,7 @@ export function registerAgent(pi: ExtensionAPI, cc: CCContext, internal: Registe
 		if (run.task && run.task.status === "running") run.task.status = status;
 		const result = outcome.ok ? outcome.result.text : partialText(run);
 		runs.delete(run.agentId);
-		const worktree = run.worktree ? finishAgentWorktree(run.worktree) : undefined;
+		const worktree = run.worktree ? await finishWorktree(run.worktree) : undefined;
 		const silent = run.killedBy === "shutdown" || shuttingDown;
 		if (!silent) {
 			const error = outcome.ok ? undefined : outcome.error instanceof Error ? outcome.error.message : String(outcome.error);
@@ -581,12 +593,12 @@ export function registerAgent(pi: ExtensionAPI, cc: CCContext, internal: Registe
 		if (invalid) throw new Error(invalid);
 
 		const requested = params.subagent_type?.trim() || undefined;
-		const fork = requested === FORK_AGENT_TYPE && !loadDefs(ctx.cwd).has(FORK_AGENT_TYPE);
+		const fork = requested === FORK_AGENT_TYPE && !(await loadDefs(ctx.cwd)).has(FORK_AGENT_TYPE);
 		if (fork && internal.inFork) throw new Error("Fork is not available inside a forked worker. Complete your task directly using your tools.");
 		if (fork && params.isolation === "remote") {
 			throw new Error('Fork cannot use isolation: "remote" — a remote session cannot inherit the conversation context. Omit isolation (or use "worktree"), or spawn a named agent type for remote work.');
 		}
-		const def = fork ? FORK_DEFINITION : resolveAgentType(loadDefs(ctx.cwd), requested);
+		const def = fork ? FORK_DEFINITION : resolveAgentType(await loadDefs(ctx.cwd), requested);
 
 		const resolved = fork
 			? ({ ok: true, model: ctx.model } as const)
@@ -606,9 +618,13 @@ export function registerAgent(pi: ExtensionAPI, cc: CCContext, internal: Registe
 		if (params.isolation === "remote" && isFixed(cc, "remoteIsolationFallback")) {
 			throw new Error('isolation: "remote" is not available: remote agent sessions are not supported here, and the agent would silently run on this machine instead. Omit isolation to run it in the current directory, or use isolation: "worktree" for an isolated git worktree.');
 		}
-		const isolation = params.isolation === "remote" ? (gitRootOf(ctx.cwd) ? "worktree" : undefined) : params.isolation;
+		// A host without git worktrees (an in-memory host) cannot isolate an agent: say so instead of
+		// running it unisolated. "remote" falls back to running locally there, as outside a checkout.
+		if (params.isolation === "worktree" && !host.supportsWorktrees) throw new Error(WORKTREE_UNSUPPORTED);
+		const isolation =
+			params.isolation === "remote" ? (host.supportsWorktrees && (await gitRootOf(host, ctx.cwd)) ? "worktree" : undefined) : params.isolation;
 		const agentId = newTaskId("local_agent");
-		const worktree = isolation === "worktree" ? createAgentWorktree(ctx.cwd, agentId) : undefined;
+		const worktree = isolation === "worktree" ? await createAgentWorktree(host, ctx.cwd, agentId) : undefined;
 
 		let session: AgentSession;
 		try {
@@ -621,7 +637,7 @@ export function registerAgent(pi: ExtensionAPI, cc: CCContext, internal: Registe
 				fork,
 			});
 		} catch (err) {
-			if (worktree) finishAgentWorktree(worktree);
+			if (worktree) await finishWorktree(worktree);
 			throw err;
 		}
 		const run: AgentRun = {
@@ -638,8 +654,18 @@ export function registerAgent(pi: ExtensionAPI, cc: CCContext, internal: Registe
 			startIndex: session.messages.length,
 			worktree,
 		};
+		if (background) {
+			// before the abort/shutdown check below, so nothing can stop the session in between
+			try {
+				run.outputFile = await cc.tasks.outputPath(agentId);
+			} catch (err) {
+				if (worktree) await finishWorktree(worktree);
+				await disposeSession(session);
+				throw err;
+			}
+		}
 		if (signal?.aborted || shuttingDown) {
-			if (worktree) finishAgentWorktree(worktree);
+			if (worktree) await finishWorktree(worktree);
 			await disposeSession(session);
 			throw new SubagentAbortedError();
 		}
@@ -656,7 +682,6 @@ export function registerAgent(pi: ExtensionAPI, cc: CCContext, internal: Registe
 		runs.set(agentId, run);
 
 		if (background) {
-			run.outputFile = cc.tasks.outputPath(agentId);
 			run.task = cc.tasks.add({
 				id: agentId,
 				type: "local_agent",
@@ -672,7 +697,7 @@ export function registerAgent(pi: ExtensionAPI, cc: CCContext, internal: Registe
 				(error) => finishBackground(run, { ok: false, error }),
 			);
 			return {
-				content: [{ type: "text", text: asyncLaunchText(agentId, run.outputFile) }],
+				content: [{ type: "text", text: asyncLaunchText(agentId, run.outputFile!) }],
 				details: { ...baseDetails, status: "async_launched", outputFile: run.outputFile },
 			};
 		}
@@ -682,7 +707,7 @@ export function registerAgent(pi: ExtensionAPI, cc: CCContext, internal: Registe
 		let worktreeInfo: WorktreeInfo | undefined;
 		try {
 			const result = await runAgent(run, prompt, onUpdate);
-			worktreeInfo = worktree ? finishAgentWorktree(worktree) : undefined;
+			worktreeInfo = worktree ? await finishWorktree(worktree) : undefined;
 			return {
 				content: [
 					{
@@ -699,7 +724,7 @@ export function registerAgent(pi: ExtensionAPI, cc: CCContext, internal: Registe
 				details: { ...baseDetails, usage: result.usage, worktree: worktreeInfo },
 			};
 		} catch (err) {
-			if (worktree) finishAgentWorktree(worktree);
+			if (worktree) await finishWorktree(worktree);
 			throw err;
 		} finally {
 			signal?.removeEventListener("abort", forwardAbort);
@@ -726,10 +751,10 @@ export function registerAgent(pi: ExtensionAPI, cc: CCContext, internal: Registe
 	if (!isSubagent) registerUnknownToolErrors(pi);
 
 	// Claude Code lists the agent types in a system reminder (re-sent when the list changes).
-	pi.on("before_agent_start", (_event, ctx) => {
+	pi.on("before_agent_start", async (_event, ctx) => {
 		let listing: string;
 		try {
-			listing = formatAgentListingReminder(loadDefs(ctx.cwd), { disallowAll: isFixed(cc, "agentDisallowAll") });
+			listing = formatAgentListingReminder(await loadDefs(ctx.cwd), { disallowAll: isFixed(cc, "agentDisallowAll") });
 		} catch {
 			return undefined;
 		}
